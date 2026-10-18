@@ -395,12 +395,22 @@ void MetalRenderer::SwapBuffers(bool swapTV, bool swapDRC)
 }
 
 void MetalRenderer::HandleScreenshotRequest(LatteTextureView* texView, bool padView) {
-	const bool captureTwinpad = ShouldCaptureTwinpadFrame(padView);
 	const bool screenshotRequested = m_screenshot_requested || m_screenshot_state != ScreenshotState::None;
+	if (screenshotRequested)
+		CaptureFrameTexture(texView, padView, false, true);
+}
+
+void MetalRenderer::CaptureTwinpadFrameBackend(LatteTextureView* texView)
+{
+	CaptureFrameTexture(texView, true, true, false);
+}
+
+void MetalRenderer::CaptureFrameTexture(LatteTextureView* texView, bool padView, bool captureTwinpad, bool screenshotRequested)
+{
 	if (!captureTwinpad && !screenshotRequested)
 		return;
 
-	if (m_mainLayer.GetDrawable())
+	if (screenshotRequested && m_mainLayer.GetDrawable())
 	{
 		// we already took a pad view screenshow and want a main window screenshot
 		if (screenshotRequested && m_screenshot_state == ScreenshotState::Main && padView)
@@ -415,7 +425,7 @@ void MetalRenderer::HandleScreenshotRequest(LatteTextureView* texView, bool padV
 		else if (screenshotRequested)
 			m_screenshot_state = ScreenshotState::None;
 	}
-	else
+	else if (screenshotRequested)
 		m_screenshot_state = ScreenshotState::None;
 
 	auto texMtl = static_cast<LatteTextureMtl*>(texView->baseTexture);

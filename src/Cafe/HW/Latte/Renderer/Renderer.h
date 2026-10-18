@@ -73,8 +73,10 @@ public:
 	void CancelScreenshotRequest();
 	void SetTwinpadCaptureEnabled(bool enabled) { m_twinpadCaptureEnabled.store(enabled); }
 	bool IsTwinpadCaptureEnabled() const { return m_twinpadCaptureEnabled.load(); }
-	bool ShouldCaptureTwinpadFrame(bool padView) const;
+	bool ShouldCaptureTwinpadFrame() const;
+	void CaptureTwinpadFrame(LatteTextureView* texView);
 	void PublishTwinpadFrame(const std::vector<uint8>& rgb, int width, int height);
+	virtual void CaptureTwinpadFrameBackend(LatteTextureView* texView) = 0;
 
 	virtual void HandleScreenshotRequest(LatteTextureView* texView, bool padView){}
 

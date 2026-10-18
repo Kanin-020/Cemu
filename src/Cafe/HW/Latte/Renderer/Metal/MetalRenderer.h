@@ -177,6 +177,8 @@ public:
 	void SwapBuffers(bool swapTV, bool swapDRC) override;
 
 	void HandleScreenshotRequest(LatteTextureView* texView, bool padView) override;
+	void CaptureTwinpadFrameBackend(LatteTextureView* texView) override;
+	void CaptureFrameTexture(LatteTextureView* texView, bool padView, bool captureTwinpad, bool screenshotRequested);
 
 	void DrawBackbufferQuad(LatteTextureView* texView, RendererOutputShader* shader, bool useLinearTexFilter,
 									sint32 imageX, sint32 imageY, sint32 imageWidth, sint32 imageHeight,

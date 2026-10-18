@@ -2,6 +2,7 @@
 
 #include "input/emulated/EmulatedController.h"
 #include "Cafe/OS/libs/vpad/vpad.h"
+#include "Cafe/Twinpad/TwinpadClient.h"
 
 
 class VPADController : public EmulatedController
@@ -105,6 +106,9 @@ private:
 	uint8 m_parser = 0;
 
 	void update_touch(VPADStatus_t& status);
+	void update_touch(VPADStatus_t& status, const TwinpadInputState& input);
 	void update_motion(VPADStatus_t& status);
+	void update_motion(VPADStatus_t& status, const TwinpadInputState& input);
+	void apply_twinpad_input(VPADStatus_t& status, const TwinpadInputState& input);
 	glm::ivec2 m_last_touch_position{};
 };

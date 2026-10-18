@@ -536,22 +536,24 @@ void OpenGLRenderer::ClearColorbuffer(bool padView)
 
 void OpenGLRenderer::HandleScreenshotRequest(LatteTextureView* texView, bool padView)
 {
-	if(!m_screenshot_requested && m_screenshot_state == ScreenshotState::None)
+	const bool captureTwinpad = ShouldCaptureTwinpadFrame(padView);
+	const bool screenshotRequested = m_screenshot_requested || m_screenshot_state != ScreenshotState::None;
+	if (!captureTwinpad && !screenshotRequested)
 		return;
 
 	if (IsPadWindowActive())
 	{
 		// we already took a pad view screenshow and want a main window screenshot
-		if (m_screenshot_state == ScreenshotState::Main && padView)
+		if (screenshotRequested && m_screenshot_state == ScreenshotState::Main && padView)
 			return;
 
-		if (m_screenshot_state == ScreenshotState::Pad && !padView)
+		if (screenshotRequested && m_screenshot_state == ScreenshotState::Pad && !padView)
 			return;
 
 		// remember which screenshot is left to take
-		if (m_screenshot_state == ScreenshotState::None)
+		if (screenshotRequested && m_screenshot_state == ScreenshotState::None)
 			m_screenshot_state = padView ? ScreenshotState::Main : ScreenshotState::Pad;
-		else
+		else if (screenshotRequested)
 			m_screenshot_state = ScreenshotState::None;
 	}
 	else
@@ -598,7 +600,10 @@ void OpenGLRenderer::HandleScreenshotRequest(LatteTextureView* texView, bool pad
 		}
 	}
 
-	SaveScreenshot(rgb_data, screenshotWidth, screenshotHeight, !padView);
+	if (captureTwinpad)
+		PublishTwinpadFrame(rgb_data, screenshotWidth, screenshotHeight);
+	if (screenshotRequested)
+		SaveScreenshot(rgb_data, screenshotWidth, screenshotHeight, !padView);
 }
 
 void OpenGLRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutputShader* shader, bool useLinearTexFilter, sint32 imageX, sint32 imageY, sint32 imageWidth, sint32 imageHeight, bool padView, bool clearBackground)

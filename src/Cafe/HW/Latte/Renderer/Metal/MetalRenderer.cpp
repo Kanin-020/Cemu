@@ -395,22 +395,24 @@ void MetalRenderer::SwapBuffers(bool swapTV, bool swapDRC)
 }
 
 void MetalRenderer::HandleScreenshotRequest(LatteTextureView* texView, bool padView) {
-	if (!m_screenshot_requested && m_screenshot_state == ScreenshotState::None)
+	const bool captureTwinpad = ShouldCaptureTwinpadFrame(padView);
+	const bool screenshotRequested = m_screenshot_requested || m_screenshot_state != ScreenshotState::None;
+	if (!captureTwinpad && !screenshotRequested)
 		return;
 
 	if (m_mainLayer.GetDrawable())
 	{
 		// we already took a pad view screenshow and want a main window screenshot
-		if (m_screenshot_state == ScreenshotState::Main && padView)
+		if (screenshotRequested && m_screenshot_state == ScreenshotState::Main && padView)
 			return;
 
-		if (m_screenshot_state == ScreenshotState::Pad && !padView)
+		if (screenshotRequested && m_screenshot_state == ScreenshotState::Pad && !padView)
 			return;
 
 		// remember which screenshot is left to take
-		if (m_screenshot_state == ScreenshotState::None)
+		if (screenshotRequested && m_screenshot_state == ScreenshotState::None)
 			m_screenshot_state = padView ? ScreenshotState::Main : ScreenshotState::Pad;
-		else
+		else if (screenshotRequested)
 			m_screenshot_state = ScreenshotState::None;
 	}
 	else
@@ -440,19 +442,29 @@ void MetalRenderer::HandleScreenshotRequest(LatteTextureView* texView, bool padV
 	switch (pixelFormat)
 	{
 	case MTL::PixelFormatRGBA8Unorm:
-		for (auto ptr = buffer.memPtr; ptr < buffer.memPtr + size; ptr += 4)
+		for (int row = 0; row < height; ++row)
 		{
-			rgb_data.emplace_back(*ptr);
-			rgb_data.emplace_back(*(ptr + 1));
-			rgb_data.emplace_back(*(ptr + 2));
+			const auto* rowData = buffer.memPtr + row * bytesPerRow;
+			for (int column = 0; column < width; ++column)
+			{
+				const auto* pixel = rowData + column * 4;
+				rgb_data.emplace_back(pixel[0]);
+				rgb_data.emplace_back(pixel[1]);
+				rgb_data.emplace_back(pixel[2]);
+			}
 		}
 		break;
 	case MTL::PixelFormatRGBA8Unorm_sRGB:
-		for (auto ptr = buffer.memPtr; ptr < buffer.memPtr + size; ptr += 4)
+		for (int row = 0; row < height; ++row)
 		{
-			rgb_data.emplace_back(SRGBComponentToRGB(*ptr));
-			rgb_data.emplace_back(SRGBComponentToRGB(*(ptr + 1)));
-			rgb_data.emplace_back(SRGBComponentToRGB(*(ptr + 2)));
+			const auto* rowData = buffer.memPtr + row * bytesPerRow;
+			for (int column = 0; column < width; ++column)
+			{
+				const auto* pixel = rowData + column * 4;
+				rgb_data.emplace_back(SRGBComponentToRGB(pixel[0]));
+				rgb_data.emplace_back(SRGBComponentToRGB(pixel[1]));
+				rgb_data.emplace_back(SRGBComponentToRGB(pixel[2]));
+			}
 		}
 		break;
 	default:
@@ -462,7 +474,12 @@ void MetalRenderer::HandleScreenshotRequest(LatteTextureView* texView, bool padV
 	}
 
 	if (formatValid)
-		SaveScreenshot(rgb_data, width, height, !padView);
+	{
+		if (captureTwinpad)
+			PublishTwinpadFrame(rgb_data, width, height);
+		if (screenshotRequested)
+			SaveScreenshot(rgb_data, width, height, !padView);
+	}
 }
 
 void MetalRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutputShader* shader, bool useLinearTexFilter,

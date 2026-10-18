@@ -4,6 +4,7 @@
 #include "audio/IAudioAPI.h"
 //#include "ax.h"
 #include "config/CemuConfig.h"
+#include "Cafe/Twinpad/TwinpadClient.h"
 
 namespace snd_core
 {
@@ -321,6 +322,7 @@ namespace snd_core
 		{
 			if (g_padAudio)
 				g_padAudio->FeedBlock(tempDRCChannelData);
+			TwinpadClient::Instance().PublishAudioBlock(tempDRCChannelData, AX_SAMPLES_PER_3MS_48KHZ * AX_FRAMES_PER_GROUP, static_cast<uint8_t>(channels));
 
 			tempDRCAudioBlockCounter = 0;
 		}

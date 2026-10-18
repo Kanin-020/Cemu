@@ -1008,22 +1008,24 @@ bool VulkanRenderer::IsPadWindowActive()
 
 void VulkanRenderer::HandleScreenshotRequest(LatteTextureView* texView, bool padView)
 {
-	if (!m_screenshot_requested && m_screenshot_state == ScreenshotState::None)
+	const bool captureTwinpad = ShouldCaptureTwinpadFrame(padView);
+	const bool screenshotRequested = m_screenshot_requested || m_screenshot_state != ScreenshotState::None;
+	if (!captureTwinpad && !screenshotRequested)
 		return;
 
 	if (IsSwapchainInfoValid(false))
 	{
 		// we already took a pad view screenshow and want a main window screenshot
-		if (m_screenshot_state == ScreenshotState::Main && padView)
+		if (screenshotRequested && m_screenshot_state == ScreenshotState::Main && padView)
 			return;
 
-		if (m_screenshot_state == ScreenshotState::Pad && !padView)
+		if (screenshotRequested && m_screenshot_state == ScreenshotState::Pad && !padView)
 			return;
 
 		// remember which screenshot is left to take
-		if (m_screenshot_state == ScreenshotState::None)
+		if (screenshotRequested && m_screenshot_state == ScreenshotState::None)
 			m_screenshot_state = padView ? ScreenshotState::Main : ScreenshotState::Pad;
-		else
+		else if (screenshotRequested)
 			m_screenshot_state = ScreenshotState::None;
 	}
 	else
@@ -1274,7 +1276,12 @@ void VulkanRenderer::HandleScreenshotRequest(LatteTextureView* texView, bool pad
 		vkFreeMemory(m_logicalDevice, imageMemory, nullptr);
 
 	if (formatValid)
-		SaveScreenshot(rgb_data, width, height, !padView);
+	{
+		if (captureTwinpad)
+			PublishTwinpadFrame(rgb_data, width, height);
+		if (screenshotRequested)
+			SaveScreenshot(rgb_data, width, height, !padView);
+	}
 }
 
 static const float kQueuePriority = 1.0f;

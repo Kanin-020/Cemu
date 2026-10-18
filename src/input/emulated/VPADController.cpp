@@ -7,6 +7,7 @@
 #include "input/InputManager.h"
 #include "Cafe/HW/Latte/Core/Latte.h"
 #include "Cafe/CafeSystem.h"
+#include "util/math/quaternion.h"
 
 enum ControllerVPADMapping2 : uint32
 {
@@ -48,67 +49,69 @@ enum ControllerVPADMapping2 : uint32
 
 void VPADController::VPADRead(VPADStatus_t& status, const BtnRepeat& repeat)
 {
-	controllers_update_states();
+	const bool twinpadInput = player_index() == 0 && TwinpadClient::Instance().IsConnected();
+	const TwinpadInputState twinpadState = twinpadInput ? TwinpadClient::Instance().GetInputState() : TwinpadInputState{};
 	m_mic_active = false;
 	m_screen_active = false;
-	for (uint32 i = kButtonId_A; i < kButtonId_Max; ++i)
+	if (twinpadInput)
 	{
-		// axis will be aplied later
-		if (is_axis_mapping(i))
-			continue;
-
-		if (is_mapping_down(i))
-		{
-			const uint32 value = get_emulated_button_flag(i);
-			if (value == 0)
-			{
-				// special buttons
-				if (i == kButtonId_Mic)
-					m_mic_active = true;
-				else if (i == kButtonId_Screen)
-					m_screen_active = true;
-
-				continue;
-			}
-
-			status.hold |= value;
-		}
+		apply_twinpad_input(status, twinpadState);
 	}
+	else
+	{
+		controllers_update_states();
+		for (uint32 i = kButtonId_A; i < kButtonId_Max; ++i)
+		{
+			// axis will be applied later
+			if (is_axis_mapping(i))
+				continue;
 
-	m_homebutton_down |= is_home_down();
+			if (is_mapping_down(i))
+			{
+				const uint32 value = get_emulated_button_flag(i);
+				if (value == 0)
+				{
+					if (i == kButtonId_Mic)
+						m_mic_active = true;
+					else if (i == kButtonId_Screen)
+						m_screen_active = true;
+					continue;
+				}
+				status.hold |= value;
+			}
+		}
 
-	const auto axis = get_axis();
-	status.leftStick.x = axis.x;
-	status.leftStick.y = axis.y;
+		m_homebutton_down |= is_home_down();
+		const auto axis = get_axis();
+		status.leftStick.x = axis.x;
+		status.leftStick.y = axis.y;
 
-	constexpr float kAxisThreshold = 0.5f;
-	constexpr float kHoldAxisThreshold = 0.1f;
-	const uint32 last_hold = m_last_holdvalue;
+		constexpr float kAxisThreshold = 0.5f;
+		constexpr float kHoldAxisThreshold = 0.1f;
+		const uint32 last_hold = m_last_holdvalue;
+		if (axis.x <= -kAxisThreshold || (HAS_FLAG(last_hold, VPAD_STICK_L_LEFT) && axis.x <= -kHoldAxisThreshold))
+			status.hold |= VPAD_STICK_L_LEFT;
+		else if (axis.x >= kAxisThreshold || (HAS_FLAG(last_hold, VPAD_STICK_L_RIGHT) && axis.x >= kHoldAxisThreshold))
+			status.hold |= VPAD_STICK_L_RIGHT;
 
-	if (axis.x <= -kAxisThreshold || (HAS_FLAG(last_hold, VPAD_STICK_L_LEFT) && axis.x <= -kHoldAxisThreshold))
-		status.hold |= VPAD_STICK_L_LEFT;
-	else if (axis.x >= kAxisThreshold || (HAS_FLAG(last_hold, VPAD_STICK_L_RIGHT) && axis.x >= kHoldAxisThreshold))
-		status.hold |= VPAD_STICK_L_RIGHT;
+		if (axis.y <= -kAxisThreshold || (HAS_FLAG(last_hold, VPAD_STICK_L_DOWN) && axis.y <= -kHoldAxisThreshold))
+			status.hold |= VPAD_STICK_L_DOWN;
+		else if (axis.y >= kAxisThreshold || (HAS_FLAG(last_hold, VPAD_STICK_L_UP) && axis.y >= kHoldAxisThreshold))
+			status.hold |= VPAD_STICK_L_UP;
 
-	if (axis.y <= -kAxisThreshold || (HAS_FLAG(last_hold, VPAD_STICK_L_DOWN) && axis.y <= -kHoldAxisThreshold))
-		status.hold |= VPAD_STICK_L_DOWN;
-	else if (axis.y >= kAxisThreshold || (HAS_FLAG(last_hold, VPAD_STICK_L_UP) && axis.y >= kHoldAxisThreshold))
-		status.hold |= VPAD_STICK_L_UP;
+		const auto rotation = get_rotation();
+		status.rightStick.x = rotation.x;
+		status.rightStick.y = rotation.y;
+		if (rotation.x <= -kAxisThreshold || (HAS_FLAG(last_hold, VPAD_STICK_R_LEFT) && rotation.x <= -kHoldAxisThreshold))
+			status.hold |= VPAD_STICK_R_LEFT;
+		else if (rotation.x >= kAxisThreshold || (HAS_FLAG(last_hold, VPAD_STICK_R_RIGHT) && rotation.x >= kHoldAxisThreshold))
+			status.hold |= VPAD_STICK_R_RIGHT;
 
-	const auto rotation = get_rotation();
-	status.rightStick.x = rotation.x;
-	status.rightStick.y = rotation.y;
-
-	if (rotation.x <= -kAxisThreshold || (HAS_FLAG(last_hold, VPAD_STICK_R_LEFT) && rotation.x <= -kHoldAxisThreshold))
-		status.hold |= VPAD_STICK_R_LEFT;
-	else if (rotation.x >= kAxisThreshold || (HAS_FLAG(last_hold, VPAD_STICK_R_RIGHT) && rotation.x >=
-		kHoldAxisThreshold))
-		status.hold |= VPAD_STICK_R_RIGHT;
-
-	if (rotation.y <= -kAxisThreshold || (HAS_FLAG(last_hold, VPAD_STICK_R_DOWN) && rotation.y <= -kHoldAxisThreshold))
-		status.hold |= VPAD_STICK_R_DOWN;
-	else if (rotation.y >= kAxisThreshold || (HAS_FLAG(last_hold, VPAD_STICK_R_UP) && rotation.y >= kHoldAxisThreshold))
-		status.hold |= VPAD_STICK_R_UP;
+		if (rotation.y <= -kAxisThreshold || (HAS_FLAG(last_hold, VPAD_STICK_R_DOWN) && rotation.y <= -kHoldAxisThreshold))
+			status.hold |= VPAD_STICK_R_DOWN;
+		else if (rotation.y >= kAxisThreshold || (HAS_FLAG(last_hold, VPAD_STICK_R_UP) && rotation.y >= kHoldAxisThreshold))
+			status.hold |= VPAD_STICK_R_UP;
+	}
 
 	// button repeat
 	const auto now = std::chrono::high_resolution_clock::now();
@@ -136,14 +139,20 @@ void VPADController::VPADRead(VPADStatus_t& status, const BtnRepeat& repeat)
 	m_last_holdvalue = currentHold;
 
 	// touch
-	update_touch(status);
+	if (twinpadInput)
+		update_touch(status, twinpadState);
+	else
+		update_touch(status);
 
 	// motion
 	status.dir.x = {1, 0, 0};
 	status.dir.y = {0, 1, 0};
 	status.dir.z = {0, 0, 1};
 	status.accXY = {1.0f, 0.0f};
-	update_motion(status);
+	if (twinpadInput)
+		update_motion(status, twinpadState);
+	else
+		update_motion(status);
 }
 
 void VPADController::update()
@@ -182,6 +191,63 @@ void VPADController::update()
 		m_rumble_queue.pop();
 		m_parser = 0;
 	}
+}
+
+void VPADController::apply_twinpad_input(VPADStatus_t& status, const TwinpadInputState& input)
+{
+	static constexpr uint32_t buttonFlags[] = {
+		VPAD_A, VPAD_B, VPAD_X, VPAD_Y, VPAD_L, VPAD_R,
+		VPAD_STICK_L, VPAD_STICK_R, VPAD_PLUS, VPAD_MINUS,
+	};
+	for (size_t index = 0; index < std::size(buttonFlags); ++index)
+	{
+		if (input.buttons & (1u << index))
+			status.hold |= buttonFlags[index];
+	}
+	if (input.triggerL2 > 0) status.hold |= VPAD_ZL;
+	if (input.triggerR2 > 0) status.hold |= VPAD_ZR;
+	switch (input.dpad)
+	{
+	case 0: status.hold |= VPAD_UP; break;
+	case 1: status.hold |= VPAD_UP | VPAD_RIGHT; break;
+	case 2: status.hold |= VPAD_RIGHT; break;
+	case 3: status.hold |= VPAD_DOWN | VPAD_RIGHT; break;
+	case 4: status.hold |= VPAD_DOWN; break;
+	case 5: status.hold |= VPAD_DOWN | VPAD_LEFT; break;
+	case 6: status.hold |= VPAD_LEFT; break;
+	case 7: status.hold |= VPAD_UP | VPAD_LEFT; break;
+	default: break;
+	}
+	status.leftStick.x = static_cast<float>(input.stickLx) / 127.0f;
+	status.leftStick.y = -static_cast<float>(input.stickLy) / 127.0f;
+	status.rightStick.x = static_cast<float>(input.stickRx) / 127.0f;
+	status.rightStick.y = -static_cast<float>(input.stickRy) / 127.0f;
+	constexpr float kStickThreshold = 0.5f;
+	if (status.leftStick.x <= -kStickThreshold) status.hold |= VPAD_STICK_L_LEFT;
+	else if (status.leftStick.x >= kStickThreshold) status.hold |= VPAD_STICK_L_RIGHT;
+	if (status.leftStick.y <= -kStickThreshold) status.hold |= VPAD_STICK_L_DOWN;
+	else if (status.leftStick.y >= kStickThreshold) status.hold |= VPAD_STICK_L_UP;
+	if (status.rightStick.x <= -kStickThreshold) status.hold |= VPAD_STICK_R_LEFT;
+	else if (status.rightStick.x >= kStickThreshold) status.hold |= VPAD_STICK_R_RIGHT;
+	if (status.rightStick.y <= -kStickThreshold) status.hold |= VPAD_STICK_R_DOWN;
+	else if (status.rightStick.y >= kStickThreshold) status.hold |= VPAD_STICK_R_UP;
+	status.tpData.touch = input.touchPressed ? kTpTouchOn : kTpTouchOff;
+	status.tpData.validity = input.touchPressed ? kTpValid : kTpInvalid;
+	status.tpData.x = static_cast<uint16>(92.0f + (static_cast<float>(input.touchX) / 65535.0f) * 3883.0f);
+	status.tpData.y = static_cast<uint16>(4095.0f - 254.0f - (static_cast<float>(input.touchY) / 65535.0f) * 3694.0f);
+	status.tpProcessed1 = status.tpData;
+	status.tpProcessed2 = status.tpData;
+}
+
+void VPADController::update_touch(VPADStatus_t& status, const TwinpadInputState& input)
+{
+	status.tpData.touch = input.touchPressed ? kTpTouchOn : kTpTouchOff;
+	status.tpData.validity = input.touchPressed ? kTpValid : kTpInvalid;
+	status.tpData.x = static_cast<uint16>(92.0f + (static_cast<float>(input.touchX) / 65535.0f) * 3883.0f);
+	status.tpData.y = static_cast<uint16>(4095.0f - 254.0f - (static_cast<float>(input.touchY) / 65535.0f) * 3694.0f);
+	m_last_touch_position = {status.tpData.x, status.tpData.y};
+	status.tpProcessed1 = status.tpData;
+	status.tpProcessed2 = status.tpData;
 }
 
 void VPADController::update_touch(VPADStatus_t& status)
@@ -234,6 +300,25 @@ void VPADController::update_touch(VPADStatus_t& status)
 
 	status.tpProcessed1 = status.tpData;
 	status.tpProcessed2 = status.tpData;
+}
+
+void VPADController::update_motion(VPADStatus_t& status, const TwinpadInputState& input)
+{
+	if (input.gyroValid)
+	{
+		constexpr float kTurnScale = 32768.0f;
+		const float yaw = static_cast<float>(input.yaw) / kTurnScale;
+		const float pitch = static_cast<float>(input.pitch) / kTurnScale;
+		const float roll = static_cast<float>(input.roll) / kTurnScale;
+		Quaternionf orientation(pitch * 360.0f, yaw * 360.0f, roll * 360.0f);
+		const auto axes = orientation.GetTransposedRotationMatrix();
+		const auto x = std::get<0>(axes);
+		const auto y = std::get<1>(axes);
+		const auto z = std::get<2>(axes);
+		status.dir.x = {x.x, x.y, x.z};
+		status.dir.y = {y.x, y.y, y.z};
+		status.dir.z = {z.x, z.y, z.z};
+	}
 }
 
 void VPADController::update_motion(VPADStatus_t& status)

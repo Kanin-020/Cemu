@@ -79,6 +79,7 @@ struct wxCemuConfig
 	ConfigValue<bool> fullscreen{ false };
 	ConfigValue<bool> fullscreen_menubar{false};
 	ConfigValue<bool> feral_gamemode{false};
+	ConfigValue<bool> twinpad_auto_connect{false};
 
 	// max 15 entries
 	static constexpr size_t kMaxRecentEntries = 15;

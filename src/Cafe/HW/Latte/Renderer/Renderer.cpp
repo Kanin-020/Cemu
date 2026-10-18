@@ -1,4 +1,6 @@
 #include "Cafe/HW/Latte/Renderer/Renderer.h"
+#include "Cafe/Twinpad/TwinpadClient.h"
+#include <chrono>
 #include "WindowSystem.h"
 
 #include "config/CemuConfig.h"
@@ -119,6 +121,29 @@ void Renderer::CancelScreenshotRequest()
 {
 	m_screenshot_requested = false;
 	m_on_save_screenshot = {};
+}
+
+bool Renderer::ShouldCaptureTwinpadFrame(bool padView) const
+{
+	if (!padView || !m_twinpadCaptureEnabled.load() || !g_renderer || g_renderer.get() != this)
+		return false;
+	const uint64 now = static_cast<uint64>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+	const uint64 lastSent = TwinpadClient::Instance().GetLastFrameSentMs();
+	if (lastSent != 0 && now - lastSent < 200)
+		return false;
+	uint64 previous = m_twinpadLastCaptureMs.load();
+	if (now - previous < 200 || !m_twinpadLastCaptureMs.compare_exchange_strong(previous, now))
+		return false;
+	return true;
+}
+
+void Renderer::PublishTwinpadFrame(const std::vector<uint8>& rgb, int width, int height)
+{
+	if (m_twinpadCaptureEnabled.load() && width > 0 && height > 0
+		&& width <= std::numeric_limits<uint16_t>::max() && height <= std::numeric_limits<uint16_t>::max())
+	{
+		TwinpadClient::Instance().PublishGamePadFrame(rgb, static_cast<uint16_t>(width), static_cast<uint16_t>(height));
+	}
 }
 
 

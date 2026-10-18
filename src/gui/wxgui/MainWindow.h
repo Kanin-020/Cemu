@@ -15,6 +15,7 @@
 #include <future>
 #include "Cafe/HW/Espresso/Debugger/GDBStub.h"
 #include "Cafe/CafeSystem.h"
+#include "Cafe/Twinpad/TwinpadClient.h"
 
 class DebuggerWindow2;
 struct GameEntry;
@@ -101,6 +102,7 @@ public:
 	void OnInstallUpdate(wxCommandEvent& event);
 	void OnFileExit(wxCommandEvent& event);
 	void OnNFCMenu(wxCommandEvent& event);
+	void OnTwinpadMenu(wxCommandEvent& event);
 	void OnOptionsInput(wxCommandEvent& event);
 	void OnAccountSelect(wxCommandEvent& event);
 	void OnConsoleLanguage(wxCommandEvent& event);
@@ -236,6 +238,11 @@ private:
 	// nfc
 	wxMenu* m_nfcMenu{};
 	wxMenuItem* m_nfcMenuSeparator0{};
+
+	// Twinpad experimental integration
+	wxMenu* m_twinpadMenu{};
+	wxMenuItem* m_twinpadConnectItem{};
+	long m_twinpadServerPid{-1};
 
 	// debug
 	wxMenu* m_debugMenu{};

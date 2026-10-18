@@ -1,4 +1,5 @@
 #include "MainWindow.h"
+#include <wx/process.h>
 
 // subwindows
 #include "TitleManager.h"
@@ -128,6 +129,9 @@ enum
 	MAINFRAME_MENU_ID_NFC_TOUCH_NFC_FILE = 21000,
 	MAINFRAME_MENU_ID_NFC_RECENT_0,
 	MAINFRAME_MENU_ID_NFC_RECENT_LAST = MAINFRAME_MENU_ID_NFC_RECENT_0 + 15,
+	// Twinpad experimental integration
+	MAINFRAME_MENU_ID_TWINPAD_CONNECT = 21050,
+	MAINFRAME_MENU_ID_TWINPAD_SETTINGS,
 	// debug
 	MAINFRAME_MENU_ID_DEBUG_RENDER_UPSIDE_DOWN = 21100,
 	MAINFRAME_MENU_ID_DEBUG_VIEW_LOGGING_WINDOW,
@@ -211,6 +215,8 @@ EVT_MENU(MAINFRAME_MENU_ID_TIMER_SPEED_0125X, MainWindow::OnDebugSetting)
 // nfc menu
 EVT_MENU(MAINFRAME_MENU_ID_NFC_TOUCH_NFC_FILE, MainWindow::OnNFCMenu)
 EVT_MENU_RANGE(MAINFRAME_MENU_ID_NFC_RECENT_0 + 0, MAINFRAME_MENU_ID_NFC_RECENT_LAST, MainWindow::OnNFCMenu)
+EVT_MENU(MAINFRAME_MENU_ID_TWINPAD_CONNECT, MainWindow::OnTwinpadMenu)
+EVT_MENU(MAINFRAME_MENU_ID_TWINPAD_SETTINGS, MainWindow::OnTwinpadMenu)
 // debug -> logging menu
 EVT_MENU_RANGE(MAINFRAME_MENU_ID_DEBUG_LOGGING0 + 0, MAINFRAME_MENU_ID_DEBUG_LOGGING0 + 98, MainWindow::OnDebugLoggingToggleFlagGeneric)
 EVT_MENU(MAINFRAME_MENU_ID_DEBUG_ADVANCED_PPC_INFO, MainWindow::OnPPCInfoToggle)
@@ -392,6 +398,7 @@ MainWindow::~MainWindow()
 	}
 
 	m_timer->Stop();
+	TwinpadClient::Instance().Stop();
 
 	std::unique_lock lock(g_mutex);
 	g_mainFrame = nullptr;
@@ -438,6 +445,18 @@ wxString MainWindow::GetInitialWindowTitle()
 
 void MainWindow::OnClose(wxCloseEvent& event)
 {
+	if (m_twinpadServerPid > 0 && wxProcess::Exists(static_cast<int>(m_twinpadServerPid)))
+	{
+		const int answer = wxMessageBox(wxString::FromUTF8("¿Quieres detener el Servidor Twinpad iniciado por Cemu?"),
+			wxString::FromUTF8("Twinpad"), wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION, this);
+		if (answer == wxYES)
+			wxKill(m_twinpadServerPid, wxSIGTERM, nullptr, wxKILL_CHILDREN);
+		m_twinpadServerPid = -1;
+	}
+	TwinpadClient::Instance().Stop();
+	TwinpadClient::Instance().SetCaptureGamePad(false);
+	if (g_renderer)
+		g_renderer->SetTwinpadCaptureEnabled(false);
 	if (m_debugger_window)
 	{
 		m_debugger_window->CleanupForDestroy();
@@ -787,6 +806,105 @@ void MainWindow::OnNFCMenu(wxCommandEvent& event)
 			}
 		}
 	}
+}
+
+void MainWindow::OnTwinpadMenu(wxCommandEvent& event)
+{
+	auto& twinpad = TwinpadClient::Instance();
+	if (event.GetId() == MAINFRAME_MENU_ID_TWINPAD_CONNECT)
+	{
+		if (!CafeSystem::IsTitleRunning() || twinpad.IsConnectionRequested())
+			return;
+		TwinpadQr qr;
+		if (!TwinpadClient::GetCurrentQr(qr))
+		{
+			const long startedServerPid = wxExecute("twinpad-server", wxEXEC_ASYNC);
+			if (startedServerPid <= 0)
+			{
+				wxMessageBox(wxString::FromUTF8("No se pudo iniciar twinpad-server desde PATH."),
+					wxString::FromUTF8("Twinpad"), wxOK | wxICON_ERROR, this);
+				return;
+			}
+			m_twinpadServerPid = startedServerPid;
+			bool qrAvailable = false;
+			for (int attempt = 0; attempt < 30; ++attempt)
+			{
+				if (TwinpadClient::GetCurrentQr(qr))
+				{
+					qrAvailable = true;
+					break;
+				}
+				wxMilliSleep(100);
+			}
+			if (!qrAvailable)
+			{
+				if (wxProcess::Exists(static_cast<int>(m_twinpadServerPid)))
+					wxKill(m_twinpadServerPid, wxSIGTERM, nullptr, wxKILL_CHILDREN);
+				m_twinpadServerPid = -1;
+				wxMessageBox(wxString::FromUTF8("No se pudo obtener el QR vigente del Servidor Twinpad."),
+					wxString::FromUTF8("Twinpad"), wxOK | wxICON_ERROR, this);
+				return;
+			}
+		}
+		const size_t qrWidth = qr.modules.front().size();
+		const int moduleSize = std::max(3, 360 / static_cast<int>(qrWidth + 8));
+		const int quietZone = moduleSize * 4;
+		wxBitmap qrBitmap(static_cast<int>(qrWidth) * moduleSize + quietZone * 2,
+			static_cast<int>(qr.modules.size()) * moduleSize + quietZone * 2);
+		{
+			wxMemoryDC dc(qrBitmap);
+			dc.SetBackground(*wxWHITE_BRUSH);
+			dc.Clear();
+			dc.SetPen(*wxBLACK_PEN);
+			dc.SetBrush(*wxBLACK_BRUSH);
+			for (size_t y = 0; y < qr.modules.size(); ++y)
+				for (size_t x = 0; x < qrWidth; ++x)
+					if (qr.modules[y][x] == '1')
+						dc.DrawRectangle(quietZone + static_cast<int>(x) * moduleSize,
+							quietZone + static_cast<int>(y) * moduleSize, moduleSize, moduleSize);
+			dc.SelectObject(wxNullBitmap);
+		}
+		wxDialog qrDialog(this, wxID_ANY, wxString::FromUTF8("Escanea el QR de conexión"),
+			wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE);
+		auto* qrSizer = new wxBoxSizer(wxVERTICAL);
+		qrSizer->Add(new wxStaticBitmap(&qrDialog, wxID_ANY, qrBitmap), 0, wxALL | wxALIGN_CENTER, 12);
+		qrSizer->Add(new wxStaticText(&qrDialog, wxID_ANY, wxString::FromUTF8(qr.uri)), 0, wxLEFT | wxRIGHT | wxBOTTOM | wxALIGN_CENTER, 12);
+		qrSizer->Add(qrDialog.CreateStdDialogButtonSizer(wxOK), 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
+		qrDialog.SetSizerAndFit(qrSizer);
+		qrDialog.CentreOnParent();
+		if (qrDialog.ShowModal() != wxID_OK)
+			return;
+		twinpad.RequestConnection();
+		if (g_renderer)
+			g_renderer->SetTwinpadCaptureEnabled(true);
+		RecreateMenu();
+		return;
+	}
+
+	wxDialog settings(this, wxID_ANY, wxString::FromUTF8("Configuraciones"), wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE);
+	auto* sizer = new wxBoxSizer(wxVERTICAL);
+	auto* autoConnect = new wxCheckBox(&settings, wxID_ANY, wxString::FromUTF8("Conexión automática"));
+	autoConnect->SetValue(GetWxGUIConfig().twinpad_auto_connect);
+	sizer->Add(autoConnect, 0, wxALL, 12);
+	sizer->Add(settings.CreateStdDialogButtonSizer(wxOK | wxCANCEL), 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
+	settings.SetSizerAndFit(sizer);
+	settings.CentreOnParent();
+	if (settings.ShowModal() != wxID_OK)
+		return;
+
+	const bool wasAutoConnect = GetWxGUIConfig().twinpad_auto_connect;
+	const bool autoConnectEnabled = autoConnect->GetValue();
+	if (wasAutoConnect == autoConnectEnabled)
+		return;
+	GetWxGUIConfig().twinpad_auto_connect = autoConnectEnabled;
+	g_wxConfig.Save();
+	if (autoConnectEnabled && CafeSystem::IsTitleRunning() && !twinpad.IsConnectionRequested())
+	{
+		twinpad.SetTitleActive(true, true);
+		if (g_renderer)
+			g_renderer->SetTwinpadCaptureEnabled(true);
+	}
+	RecreateMenu();
 }
 
 void MainWindow::OnFileExit(wxCommandEvent& event)
@@ -1579,6 +1697,9 @@ void MainWindow::OnGesturePan(wxPanGestureEvent& event)
 
 void MainWindow::OnGameLoaded()
 {
+	TwinpadClient::Instance().SetTitleActive(true, GetWxGUIConfig().twinpad_auto_connect);
+	if (g_renderer)
+		g_renderer->SetTwinpadCaptureEnabled(TwinpadClient::Instance().IsCaptureEnabled());
 	if (m_debugger_window)
 		m_debugger_window->OnGameLoaded();
 }
@@ -2301,6 +2422,13 @@ void MainWindow::RecreateMenu()
 	nfcMenu->Append(MAINFRAME_MENU_ID_NFC_TOUCH_NFC_FILE, _("&Scan NFC tag/amiibo from file"))->Enable(false);
 	m_menuBar->Append(nfcMenu, _("&NFC"));
 	m_nfcMenuSeparator0 = nullptr;
+
+	m_twinpadMenu = new wxMenu();
+	m_twinpadConnectItem = m_twinpadMenu->Append(MAINFRAME_MENU_ID_TWINPAD_CONNECT, wxString::FromUTF8("Iniciar conexión"));
+	m_twinpadConnectItem->Enable(CafeSystem::IsTitleRunning() && !TwinpadClient::Instance().IsConnectionRequested());
+	m_twinpadMenu->Append(MAINFRAME_MENU_ID_TWINPAD_SETTINGS, wxString::FromUTF8("Configuraciones"));
+	m_menuBar->Append(m_twinpadMenu, _("&Twinpad"));
+
 	// debug->logging submenu
 	wxMenu* debugLoggingMenu = new wxMenu();
 
@@ -2436,6 +2564,10 @@ void MainWindow::UpdateChildWindowTitleRunningState()
 
 void MainWindow::RestoreSettingsAfterGameExited()
 {
+	TwinpadClient::Instance().SetTitleActive(false);
+	TwinpadClient::Instance().SetCaptureGamePad(false);
+	if (g_renderer)
+		g_renderer->SetTwinpadCaptureEnabled(false);
 	RecreateMenu();
 }
 

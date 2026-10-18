@@ -1,6 +1,8 @@
 add_library(CemuCafe
   Account/Account.cpp
   Account/AccountError.h
+  Twinpad/TwinpadClient.cpp
+  Twinpad/TwinpadClient.h
   Account/Account.h
   CafeSystem.cpp
   CafeSystem.h

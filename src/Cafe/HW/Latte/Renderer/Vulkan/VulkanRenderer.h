@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+
 #include "Cafe/HW/Latte/Renderer/Renderer.h"
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h"
 #include "Cafe/HW/Latte/Renderer/Vulkan/RendererShaderVk.h"
@@ -141,6 +143,7 @@ class VulkanRenderer : public Renderer
 {
 	friend class LatteQueryObjectVk;
 	friend class LatteTextureReadbackInfoVk;
+	friend void VulkanRenderer_twinpad_readback_test();
 	friend class PipelineCompiler;
 
 	using VSync = SwapchainInfoVk::VSync;
@@ -148,6 +151,8 @@ class VulkanRenderer : public Renderer
 	static const inline int UNIFORMVAR_RINGBUFFER_SIZE = 1024 * 1024 * 16; // 16MB
 
 	static const inline int TEXTURE_READBACK_SIZE = 32 * 1024 * 1024; // 32 MB
+	static const inline uint32 TWINPAD_READBACK_SIZE = 16 * 1024 * 1024;
+	static const inline size_t TWINPAD_READBACK_SLOT_COUNT = 3;
 
 	static const inline int OCCLUSION_QUERY_POOL_SIZE = 1024;
 
@@ -207,6 +212,7 @@ public:
 	void HandleScreenshotRequest(LatteTextureView* texView, bool padView) override;
 	void CaptureTwinpadFrameBackend(LatteTextureView* texView) override;
 	void CaptureFrameTexture(LatteTextureView* texView, bool padView, bool captureTwinpad, bool screenshotRequested);
+	void CaptureTwinpadFrameAsync(LatteTextureView* texView);
 
 	void QueryMemoryInfo();
 	void QueryAvailableFormats();
@@ -633,6 +639,28 @@ private:
 	VkDeviceMemory m_textureReadbackBufferMemory = VK_NULL_HANDLE;
 	uint8* m_textureReadbackBufferPtr = nullptr;
 	uint32 m_textureReadbackBufferWriteIndex = 0;
+
+	// Three independent readback buffers let GPU transfers overlap without blocking the render callback.
+	struct TwinpadReadbackSlot
+	{
+		VkBuffer buffer{ VK_NULL_HANDLE };
+		VkDeviceMemory memory{ VK_NULL_HANDLE };
+		uint8* data{};
+		uint64 commandBufferId{};
+		uint64 sequence{};
+		uint32 width{};
+		uint32 height{};
+		VkFormat format{ VK_FORMAT_UNDEFINED };
+		std::chrono::steady_clock::time_point queuedAt{};
+		bool pending{};
+	};
+	static size_t FindNewestCompletedTwinpadReadbackSlot(
+		const std::array<TwinpadReadbackSlot, TWINPAD_READBACK_SLOT_COUNT>& slots,
+		uint64 finishedCommandBufferCount);
+	std::array<TwinpadReadbackSlot, TWINPAD_READBACK_SLOT_COUNT> m_twinpadReadbackSlots{};
+	size_t m_twinpadReadbackSlotCount{};
+	size_t m_twinpadReadbackWriteIndex{};
+	uint64 m_twinpadReadbackSequence{};
 
 	// placeholder objects to simulate NULL buffers and textures
 	struct NullTexture

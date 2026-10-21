@@ -3,6 +3,7 @@ add_library(CemuCafe
   Account/AccountError.h
   Twinpad/TwinpadClient.cpp
   Twinpad/TwinpadClient.h
+  Twinpad/Base64UrlTest.cpp
   Account/Account.h
   CafeSystem.cpp
   CafeSystem.h
@@ -658,6 +659,7 @@ target_link_libraries(CemuCafe PRIVATE
   ih264d
   zstd::zstd
   ${glslang_target}
+  PkgConfig::OpenH264
   PUBLIC
   OpenSSL::SSL
 )

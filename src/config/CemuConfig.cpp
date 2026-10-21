@@ -202,24 +202,24 @@ XMLConfigParser CemuConfig::Load(XMLConfigParser& parser)
 	pad_channels = audio.get("PadChannels", kStereo);
 	input_channels = audio.get("InputChannels", kMono);
 	tv_volume = audio.get("TVVolume", 20);
-	pad_volume = audio.get("PadVolume", 0);
+	pad_volume = audio.get("PadVolume", 100);
 	input_volume = audio.get("InputVolume", 20);
 	portal_volume = audio.get("PortalVolume", 20);
 
-	const auto tv = audio.get("TVDevice", "");
+	const auto tv = audio.get("TVDevice", "default");
 	try
 	{
-		tv_device = boost::nowide::widen(tv);
+		tv_device = tv[0] == '\0' ? L"default" : boost::nowide::widen(tv);
 	}
 	catch (const std::exception&)
 	{
 		cemuLog_log(LogType::Force, "config load error: can't load tv device: {}", tv);
 	}
 
-	const auto pad = audio.get("PadDevice", "");
+	const auto pad = audio.get("PadDevice", "default");
 	try
 	{
-		pad_device = boost::nowide::widen(pad);
+		pad_device = pad[0] == '\0' ? L"default" : boost::nowide::widen(pad);
 	}
 	catch (const std::exception&)
 	{

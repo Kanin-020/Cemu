@@ -5,6 +5,7 @@
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanTextureReadback.h"
 #include "Cafe/HW/Latte/Renderer/Vulkan/CocoaSurface.h"
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.h"
+#include "Cafe/Twinpad/TwinpadClient.h"
 
 #include "Cafe/HW/Latte/Core/LatteBufferCache.h"
 #include "Cafe/HW/Latte/Core/LattePerformanceMonitor.h"
@@ -832,6 +833,24 @@ VulkanRenderer::VulkanRenderer() : Renderer(RendererAPI::Vulkan)
 	vkMapMemory(m_logicalDevice, m_textureReadbackBufferMemory, 0, VK_WHOLE_SIZE, 0, &bufferPtr);
 	m_textureReadbackBufferPtr = (uint8*)bufferPtr;
 
+	for (auto& slot : m_twinpadReadbackSlots)
+	{
+		const bool bufferCreated = memoryManager->CreateBuffer(TWINPAD_READBACK_SIZE, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+			slot.buffer, slot.memory)
+			|| memoryManager->CreateBuffer(TWINPAD_READBACK_SIZE, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+				slot.buffer, slot.memory);
+		if (!bufferCreated)
+			break;
+
+		void* twinpadBufferPtr = nullptr;
+		if (vkMapMemory(m_logicalDevice, slot.memory, 0, VK_WHOLE_SIZE, 0, &twinpadBufferPtr) != VK_SUCCESS)
+			break;
+		slot.data = static_cast<uint8*>(twinpadBufferPtr);
+		++m_twinpadReadbackSlotCount;
+	}
+
 	// transform feedback ringbuffer
 	VkBufferUsageFlags xfbRingBufferUsage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
 	memoryManager->CreateBuffer(LatteStreamout_GetRingBufferSize(), xfbRingBufferUsage, 0, m_xfbRingBuffer, m_xfbRingBufferMemory);
@@ -896,6 +915,12 @@ VulkanRenderer::~VulkanRenderer()
 
 	// delete buffers
 	memoryManager->DeleteBuffer(m_uniformVarBuffer, m_uniformVarBufferMemory);
+	for (auto& slot : m_twinpadReadbackSlots)
+	{
+		if (slot.data)
+			vkUnmapMemory(m_logicalDevice, slot.memory);
+		memoryManager->DeleteBuffer(slot.buffer, slot.memory);
+	}
 	memoryManager->DeleteBuffer(m_textureReadbackBuffer, m_textureReadbackBufferMemory);
 	memoryManager->DeleteBuffer(m_xfbRingBuffer, m_xfbRingBufferMemory);
 	memoryManager->DeleteBuffer(m_occlusionQueries.bufferQueryResults, m_occlusionQueries.memoryQueryResults);
@@ -1015,7 +1040,118 @@ void VulkanRenderer::HandleScreenshotRequest(LatteTextureView* texView, bool pad
 
 void VulkanRenderer::CaptureTwinpadFrameBackend(LatteTextureView* texView)
 {
-	CaptureFrameTexture(texView, true, true, false);
+	CaptureTwinpadFrameAsync(texView);
+}
+
+size_t VulkanRenderer::FindNewestCompletedTwinpadReadbackSlot(
+	const std::array<TwinpadReadbackSlot, TWINPAD_READBACK_SLOT_COUNT>& slots,
+	uint64 finishedCommandBufferCount)
+{
+	size_t newestIndex = slots.size();
+	for (size_t index = 0; index < slots.size(); ++index)
+	{
+		const auto& slot = slots[index];
+		if (slot.pending && slot.commandBufferId < finishedCommandBufferCount
+			&& (newestIndex == slots.size() || slot.sequence > slots[newestIndex].sequence))
+			newestIndex = index;
+	}
+	return newestIndex;
+}
+
+void VulkanRenderer::CaptureTwinpadFrameAsync(LatteTextureView* texView)
+{
+	if (!texView)
+		return;
+
+	auto& twinpad = TwinpadClient::Instance();
+	// Publish only the freshest completed transfer; never wait for the GPU.
+	const size_t newestCompletedIndex = FindNewestCompletedTwinpadReadbackSlot(
+		m_twinpadReadbackSlots, m_countCommandBufferFinished);
+	if (newestCompletedIndex != m_twinpadReadbackSlots.size())
+	{
+		auto& newestCompleted = m_twinpadReadbackSlots[newestCompletedIndex];
+		twinpad.RecordVideoEvent(TwinpadVideoMetricEvent::READBACK_COMPLETED);
+		twinpad.RecordVideoMetric(TwinpadVideoMetricStage::READBACK_READY,
+			std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - newestCompleted.queuedAt).count());
+		const auto readbackCopyStarted = std::chrono::steady_clock::now();
+		const uint32 completedBytesPerPixel = newestCompleted.format == VK_FORMAT_R8G8B8_UNORM
+			|| newestCompleted.format == VK_FORMAT_R8G8B8_SRGB ? 3 : 4;
+		std::vector<uint8> pixels(newestCompleted.data,
+			newestCompleted.data + static_cast<size_t>(newestCompleted.width)
+				* newestCompleted.height * completedBytesPerPixel);
+		TwinpadPixelFormat pixelFormat = TwinpadPixelFormat::Rgb8;
+		switch (newestCompleted.format)
+		{
+		case VK_FORMAT_R8G8B8_SRGB: pixelFormat = TwinpadPixelFormat::Rgb8Srgb; break;
+		case VK_FORMAT_R8G8B8A8_UNORM: pixelFormat = TwinpadPixelFormat::Rgba8; break;
+		case VK_FORMAT_R8G8B8A8_SRGB: pixelFormat = TwinpadPixelFormat::Rgba8Srgb; break;
+		case VK_FORMAT_R8G8B8_UNORM: break;
+		default: newestCompleted.pending = false; return;
+		}
+		twinpad.PublishGamePadFrame(std::move(pixels),
+			static_cast<uint16_t>(newestCompleted.width), static_cast<uint16_t>(newestCompleted.height), pixelFormat);
+		twinpad.RecordVideoMetric(TwinpadVideoMetricStage::READBACK_COPY,
+			std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - readbackCopyStarted).count());
+		for (auto& slot : m_twinpadReadbackSlots)
+		{
+			if (slot.pending && slot.sequence <= newestCompleted.sequence
+				&& HasCommandBufferFinished(slot.commandBufferId))
+				slot.pending = false;
+		}
+	}
+
+	if (m_twinpadReadbackSlotCount == 0)
+		return;
+	m_twinpadReadbackWriteIndex %= m_twinpadReadbackSlotCount;
+	auto& slot = m_twinpadReadbackSlots[m_twinpadReadbackWriteIndex];
+	if (slot.pending || !slot.data)
+	{
+		twinpad.RecordVideoEvent(TwinpadVideoMetricEvent::READBACK_SLOT_BUSY);
+		return;
+	}
+
+	const uint32 width = texView->baseTexture->GetMipWidth(texView->firstMip);
+	const uint32 height = texView->baseTexture->GetMipHeight(texView->firstMip);
+	const VkFormat format = ((LatteTextureViewVk*)texView)->GetFormat();
+	const uint32 bytesPerPixel = format == VK_FORMAT_R8G8B8_UNORM || format == VK_FORMAT_R8G8B8_SRGB ? 3
+		: format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_R8G8B8A8_SRGB ? 4 : 0;
+	const VkDeviceSize copySize = static_cast<VkDeviceSize>(width) * height * bytesPerPixel;
+	if (bytesPerPixel == 0 || copySize == 0 || copySize > TWINPAD_READBACK_SIZE
+		|| texView->firstMip != 0 || texView->baseTexture->dim == Latte::E_DIM::DIM_3D)
+		return;
+
+	auto* textureView = (LatteTextureViewVk*)texView;
+	auto* baseTexture = textureView->GetBaseImage();
+	auto* image = baseTexture->GetImageObj();
+	image->flagForCurrentCommandBuffer();
+	VkBufferImageCopy region{};
+	region.bufferRowLength = width;
+	region.bufferImageHeight = height;
+	region.imageSubresource.aspectMask = baseTexture->GetImageAspect();
+	region.imageSubresource.baseArrayLayer = textureView->firstSlice;
+	region.imageSubresource.layerCount = 1;
+	region.imageSubresource.mipLevel = textureView->firstMip;
+	region.imageExtent = {width, height, 1};
+
+	draw_endRenderPass();
+	barrier_image<ANY_TRANSFER | IMAGE_WRITE, TRANSFER_READ>(baseTexture, region.imageSubresource, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+	VkBufferImageCopy slotRegion = region;
+	slotRegion.bufferOffset = 0;
+	vkCmdCopyImageToBuffer(m_state.currentCommandBuffer, image->m_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		slot.buffer, 1, &slotRegion);
+	barrier_bufferRange<TRANSFER_WRITE, HOST_READ>(slot.buffer, 0, copySize);
+	barrier_image<TRANSFER_READ, ANY_TRANSFER | IMAGE_WRITE>(baseTexture, region.imageSubresource, baseTexture->GetDefaultLayout());
+	slot.commandBufferId = GetCurrentCommandBufferId();
+	slot.sequence = m_twinpadReadbackSequence++;
+	slot.width = width;
+	slot.height = height;
+	slot.format = format;
+	slot.queuedAt = std::chrono::steady_clock::now();
+	slot.pending = true;
+	twinpad.RecordVideoEvent(TwinpadVideoMetricEvent::READBACK_QUEUED);
+	m_twinpadReadbackWriteIndex = (m_twinpadReadbackWriteIndex + 1) % m_twinpadReadbackSlotCount;
+	RequestSubmitSoon();
+	RequestSubmitOnIdle();
 }
 
 void VulkanRenderer::CaptureFrameTexture(LatteTextureView* texView, bool padView, bool captureTwinpad, bool screenshotRequested)
@@ -1266,9 +1402,11 @@ void VulkanRenderer::CaptureFrameTexture(LatteTextureView* texView, bool padView
 		}
 		break;
 	case VK_FORMAT_R8G8B8_UNORM:
+		rgb_data.resize(size);
 		std::copy((uint8*)bufferPtr, (uint8*)bufferPtr + size, rgb_data.begin());
 		break;
 	case VK_FORMAT_R8G8B8_SRGB:
+		rgb_data.resize(size);
 		std::transform((uint8*)bufferPtr, (uint8*)bufferPtr + size, rgb_data.begin(), SRGBComponentToRGB);
 		break;
 	default:

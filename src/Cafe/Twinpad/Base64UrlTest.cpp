@@ -1,0 +1,175 @@
+#include "Common/precompiled.h"
+#include "Cafe/Twinpad/TwinpadClient.h"
+#include "Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h"
+
+#include <initializer_list>
+
+namespace
+{
+std::string Base64UrlReference(const uint8_t* data, size_t size)
+{
+	static constexpr char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+	std::string encoded;
+	for (size_t index = 0; index < size; index += 3)
+	{
+		const uint32_t block = (static_cast<uint32_t>(data[index]) << 16)
+			| (index + 1 < size ? static_cast<uint32_t>(data[index + 1]) << 8 : 0)
+			| (index + 2 < size ? static_cast<uint32_t>(data[index + 2]) : 0);
+		encoded.push_back(alphabet[(block >> 18) & 63]);
+		encoded.push_back(alphabet[(block >> 12) & 63]);
+		if (index + 1 < size)
+			encoded.push_back(alphabet[(block >> 6) & 63]);
+		if (index + 2 < size)
+			encoded.push_back(alphabet[block & 63]);
+	}
+	return encoded;
+}
+}
+
+void VulkanRenderer_twinpad_readback_test()
+{
+	// TEST-075 — verifies SPEC-003: completed Twinpad readbacks are chosen newest-first without waiting.
+	using Slot = VulkanRenderer::TwinpadReadbackSlot;
+	std::array<Slot, VulkanRenderer::TWINPAD_READBACK_SLOT_COUNT> slots{};
+	slots[0].pending = true;
+	slots[0].sequence = 8;
+	slots[0].commandBufferId = 10;
+	slots[1].pending = true;
+	slots[1].sequence = 9;
+	slots[1].commandBufferId = 12;
+	slots[2].pending = true;
+	slots[2].sequence = 7;
+	slots[2].commandBufferId = 9;
+	cemu_assert_debug(VulkanRenderer::FindNewestCompletedTwinpadReadbackSlot(slots, 11) == 0);
+	cemu_assert_debug(VulkanRenderer::FindNewestCompletedTwinpadReadbackSlot(slots, 13) == 1);
+	cemu_assert_debug(VulkanRenderer::FindNewestCompletedTwinpadReadbackSlot(slots, 9) == slots.size());
+	slots[1].pending = false;
+	slots[2].pending = false;
+	cemu_assert_debug(VulkanRenderer::FindNewestCompletedTwinpadReadbackSlot(slots, 13) == 0);
+}
+
+void TwinpadClient_base64url_test()
+{
+	const auto encode = [](std::initializer_list<uint8_t> bytes) {
+		return TwinpadClient::Base64Url(bytes.begin(), bytes.size());
+	};
+	cemu_assert_debug(encode({}) == "");
+	cemu_assert_debug(encode({0x66}) == "Zg");
+	cemu_assert_debug(encode({0x66, 0x6f}) == "Zm8");
+	cemu_assert_debug(encode({0x66, 0x6f, 0x6f}) == "Zm9v");
+	cemu_assert_debug(encode({0xfb, 0xff}) == "-_8");
+
+	std::vector<uint8_t> frame(1280 * 720 * 3);
+	for (size_t index = 0; index < frame.size(); ++index)
+		frame[index] = static_cast<uint8_t>((index * 37 + index / 19) % 256);
+	const auto encoded = TwinpadClient::Base64Url(frame.data(), frame.size());
+	cemu_assert_debug(encoded == Base64UrlReference(frame.data(), frame.size()));
+	cemu_assert_debug(encoded.size() == (frame.size() * 4 + 2) / 3);
+	cemu_assert_debug(encoded.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_") == std::string::npos);
+}
+
+namespace
+{
+struct H264ParameterSets
+{
+	bool sps{};
+	bool pps{};
+	bool idr{};
+	bool constrainedBaselineLevel42{};
+};
+
+H264ParameterSets InspectAnnexB(const std::vector<uint8_t>& bytes)
+{
+	H264ParameterSets result;
+	auto findStartCode = [&bytes](size_t from, size_t& prefixSize) {
+		for (size_t index = from; index + 3 <= bytes.size(); ++index)
+		{
+			if (bytes[index] != 0 || bytes[index + 1] != 0)
+				continue;
+			if (bytes[index + 2] == 1)
+			{
+				prefixSize = 3;
+				return index;
+			}
+			if (index + 4 <= bytes.size() && bytes[index + 2] == 0 && bytes[index + 3] == 1)
+			{
+				prefixSize = 4;
+				return index;
+			}
+		}
+		return bytes.size();
+	};
+
+	size_t prefixSize = 0;
+	size_t start = findStartCode(0, prefixSize);
+	while (start < bytes.size())
+	{
+		const size_t nal = start + prefixSize;
+		size_t nextPrefixSize = 0;
+		const size_t next = findStartCode(nal + 1, nextPrefixSize);
+		if (nal < bytes.size())
+		{
+			const uint8_t type = bytes[nal] & 0x1f;
+			result.sps |= type == 7;
+			result.pps |= type == 8;
+			result.idr |= type == 5;
+			if (type == 7 && nal + 3 < bytes.size())
+			{
+				const uint8_t profileIdc = bytes[nal + 1];
+				const uint8_t constraints = bytes[nal + 2];
+				const uint8_t levelIdc = bytes[nal + 3];
+				result.constrainedBaselineLevel42 |= profileIdc == 66 && (constraints & 0x40) != 0 && levelIdc == 42;
+			}
+		}
+		start = next;
+		prefixSize = nextPrefixSize;
+	}
+	return result;
+}
+}
+
+void TwinpadClient_h264_encoder_test()
+{
+	// TEST-073 — verifies SPEC-003/006: real OpenH264 access units carry Annex B SPS/PPS and IDR metadata.
+	auto& client = TwinpadClient::Instance();
+	client.ResetVideoEncoder();
+	client.SetCaptureFps(30);
+	std::vector<uint8_t> frame(64 * 64 * 3);
+	for (size_t index = 0; index < frame.size(); ++index)
+		frame[index] = static_cast<uint8_t>((index * 37 + index / 19) % 256);
+
+	TwinpadEncodedFrame first;
+	const bool firstEncoded = client.EncodeGamePadFrame(frame, 64, 64, first);
+	cemu_assert_debug(firstEncoded);
+	if (firstEncoded)
+	{
+		const auto nals = InspectAnnexB(first.annexB);
+		cemu_assert_debug(first.idr);
+		cemu_assert_debug(nals.idr);
+		cemu_assert_debug(nals.sps);
+		cemu_assert_debug(nals.pps);
+		cemu_assert_debug(nals.constrainedBaselineLevel42);
+	}
+
+	std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	TwinpadEncodedFrame second;
+	const bool secondEncoded = client.EncodeGamePadFrame(frame, 64, 64, second);
+	cemu_assert_debug(secondEncoded);
+	if (secondEncoded)
+		cemu_assert_debug(second.timestampUs > first.timestampUs);
+
+	client.ResetVideoEncoder();
+	TwinpadEncodedFrame afterReset;
+	const bool resetEncoded = client.EncodeGamePadFrame(frame, 64, 64, afterReset);
+	cemu_assert_debug(resetEncoded);
+	if (resetEncoded)
+	{
+		const auto nals = InspectAnnexB(afterReset.annexB);
+		cemu_assert_debug(afterReset.idr);
+		cemu_assert_debug(nals.idr);
+		cemu_assert_debug(nals.sps);
+		cemu_assert_debug(nals.pps);
+		cemu_assert_debug(nals.constrainedBaselineLevel42);
+	}
+	client.ResetVideoEncoder();
+}

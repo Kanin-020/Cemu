@@ -39,7 +39,9 @@ namespace coreinit
 void PPCCore_switchToScheduler()
 {
 	cemu_assert_debug(__OSHasSchedulerLock() == false); // scheduler lock must not be hold past thread time slice
-	cemu_assert_debug(PPCInterpreter_getCurrentInstance()->coreInterruptMask != 0 || CafeSystem::GetForegroundTitleId() == 0x000500001019e600);
+	const uint64 titleId = CafeSystem::GetForegroundTitleId();
+	cemu_assert_debug(PPCInterpreter_getCurrentInstance()->coreInterruptMask != 0
+		|| titleId == 0x000500001019e500 || titleId == 0x000500001019e600);
 	__OSLockScheduler();
 	coreinit::__OSThreadSwitchToNext();
 	__OSUnlockScheduler();
@@ -48,7 +50,9 @@ void PPCCore_switchToScheduler()
 void PPCCore_switchToSchedulerWithLock()
 {
 	cemu_assert_debug(__OSHasSchedulerLock() == true); // scheduler lock must be hold
-	cemu_assert_debug(PPCInterpreter_getCurrentInstance()->coreInterruptMask != 0 || CafeSystem::GetForegroundTitleId() == 0x000500001019e600);
+	const uint64 titleId = CafeSystem::GetForegroundTitleId();
+	cemu_assert_debug(PPCInterpreter_getCurrentInstance()->coreInterruptMask != 0
+		|| titleId == 0x000500001019e500 || titleId == 0x000500001019e600);
 	coreinit::__OSThreadSwitchToNext();
 }
 

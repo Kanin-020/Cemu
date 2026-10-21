@@ -1190,7 +1190,7 @@ void GeneralSettings2::StoreConfig()
 
 	config.tv_device.clear();
 	const auto tv_device = m_tv_device->GetSelection();
-	if (tv_device != wxNOT_FOUND && tv_device != 0 && m_tv_device->HasClientObjectData())
+	if (tv_device != wxNOT_FOUND && m_tv_device->HasClientObjectData())
 	{
 		const auto* device_description = (wxDeviceDescription*)m_tv_device->GetClientObject(tv_device);
 		if(device_description)
@@ -1199,7 +1199,7 @@ void GeneralSettings2::StoreConfig()
 
 	config.pad_device.clear();
 	const auto pad_device = m_pad_device->GetSelection();
-	if (pad_device != wxNOT_FOUND && pad_device != 0 && m_pad_device->HasClientObjectData())
+	if (pad_device != wxNOT_FOUND && m_pad_device->HasClientObjectData())
 	{
 		const auto* device_description = (wxDeviceDescription*)m_pad_device->GetClientObject(pad_device);
 		if (device_description)
@@ -2010,7 +2010,7 @@ void GeneralSettings2::ApplyConfig()
 		}
 	}
 	else
-		m_tv_device->SetSelection(0);
+		m_tv_device->SetSelection(m_tv_device->GetCount() > 1 ? 1 : 0);
 
 	SendSliderEvent(m_pad_volume, config.pad_volume);
 	if (!config.pad_device.empty() && m_pad_device->HasClientObjectData())
@@ -2026,7 +2026,7 @@ void GeneralSettings2::ApplyConfig()
 		}
 	}
 	else
-		m_pad_device->SetSelection(0);
+		m_pad_device->SetSelection(m_pad_device->GetCount() > 1 ? 1 : 0);
 
 	SendSliderEvent(m_input_volume, config.input_volume);
 	if (!config.input_device.empty() && m_input_device->HasClientObjectData())

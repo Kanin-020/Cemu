@@ -2,11 +2,14 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <thread>
 #include <cerrno>
+#include <cstdio>
 #include <optional>
 #include <string_view>
 #include <rapidjson/document.h>
+#include <wels/codec_api.h>
 #include "Cafe/CafeSystem.h"
 
 #if BOOST_OS_WINDOWS
@@ -19,6 +22,7 @@ static void CloseSocket(SocketHandle socket) { if (socket >= 0) closesocket(sock
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <unistd.h>
 #include <fcntl.h>
 using SocketLength = socklen_t;
@@ -26,15 +30,55 @@ using SocketHandle = int;
 static void CloseSocket(SocketHandle socket) { if (socket >= 0) close(socket); }
 #endif
 
+#ifdef TWINPAD_E2E_TEST_HOOK
+#include <atomic>
+#include <string>
+#endif
+
+static bool WaitForSocketWritable(SocketHandle socket)
+{
+	for (;;)
+	{
+		fd_set writable;
+		FD_ZERO(&writable);
+		FD_SET(socket, &writable);
+		timeval timeout{2, 0};
+#if BOOST_OS_WINDOWS
+		const int ready = select(0, nullptr, &writable, nullptr, &timeout);
+		if (ready == SOCKET_ERROR && WSAGetLastError() == WSAEINTR)
+#else
+		const int ready = select(socket + 1, nullptr, &writable, nullptr, &timeout);
+		if (ready < 0 && errno == EINTR)
+#endif
+			continue;
+		return ready > 0;
+	}
+}
+
 namespace
 {
 constexpr uint16_t kGameIpcPort = 8421;
 constexpr uint16_t kAudioIpcPort = 8422;
 constexpr uint16_t kQrIpcPort = 8423;
+#ifdef TWINPAD_E2E_TEST_HOOK
+constexpr uint16_t kE2eCaptureIpcPort = 8424;
+constexpr size_t kE2eRequestLimit = 128;
+#endif
 constexpr size_t kMaxQrResponseBytes = 16 * 1024;
-constexpr uint64_t kCaptureIntervalMs = 200; // CR-004: 5 fps máximo por readback de screenshot.
 constexpr uint64_t kRetryIntervalMs = 2000;
+constexpr uint64_t kIdrIntervalMs = 2000;
+constexpr uint32_t kOpenH264Bitrate = 8'000'000;
+constexpr uint64_t kVideoMetricLogIntervalMs = 5'000;
+constexpr uint32_t kOpenH264SliceCount = 4;
+constexpr uint32_t kGyroLogReportInterval = 10;
 constexpr char kBase64Alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+uint8_t SrgbToRgb(uint8_t value)
+{
+	const float srgb = static_cast<float>(value) / 255.0f;
+	const float linear = srgb <= 0.04045f ? srgb / 12.92f : std::pow((srgb + 0.055f) / 1.055f, 2.4f);
+	return static_cast<uint8_t>(std::min(linear, 1.0f) * 255.0f);
+}
 
 std::optional<TwinpadInputState> ParseInputReport(const rapidjson::Value& document)
 {
@@ -113,6 +157,26 @@ TwinpadClient& TwinpadClient::Instance()
 TwinpadClient::~TwinpadClient()
 {
 	Stop();
+	ResetVideoEncoder();
+}
+
+void TwinpadClient::ResetVideoEncoder()
+{
+	std::scoped_lock encoderLock(m_encoderMutex);
+	if (m_videoEncoder)
+	{
+		auto* encoder = static_cast<ISVCEncoder*>(m_videoEncoder);
+		encoder->Uninitialize();
+		WelsDestroySVCEncoder(encoder);
+		m_videoEncoder = nullptr;
+	}
+	m_encoderWidth = 0;
+	m_encoderHeight = 0;
+	m_encoderFps = 0;
+	m_encoderFrameIndex = 0;
+	m_forceNextIdr = true;
+	m_lastIdrTimestampUs = 0;
+	m_encoderEpochUs = 0;
 }
 
 bool TwinpadClient::Start(bool captureGamePad)
@@ -193,6 +257,7 @@ void TwinpadClient::Stop()
 		m_audioSocket = -1;
 	}
 	m_connected.store(false);
+	ResetVideoEncoder();
 }
 
 void TwinpadClient::SetTitleActive(bool active, bool connectAutomatically)
@@ -238,6 +303,7 @@ void TwinpadClient::SetTitleActive(bool active, bool connectAutomatically)
 #endif
 			}
 		}
+		ResetVideoEncoder();
 	}
 }
 
@@ -313,28 +379,236 @@ bool TwinpadClient::SendLine(std::intptr_t socket, const std::string& line)
 	{
 #if BOOST_OS_WINDOWS
 		const int count = ::send(static_cast<SocketHandle>(socket), payload.data() + sent, static_cast<int>(payload.size() - sent), 0);
+		if (count == SOCKET_ERROR)
+		{
+			const int error = WSAGetLastError();
+			if (error == WSAEINTR)
+				continue;
+			if (error != WSAEWOULDBLOCK || !WaitForSocketWritable(static_cast<SocketHandle>(socket)))
+				return false;
+			continue;
+		}
 #else
 		const ssize_t count = ::send(static_cast<SocketHandle>(socket), payload.data() + sent, payload.size() - sent, MSG_NOSIGNAL);
+		if (count < 0)
+		{
+			if (errno == EINTR)
+				continue;
+			if ((errno != EAGAIN && errno != EWOULDBLOCK)
+				|| !WaitForSocketWritable(static_cast<SocketHandle>(socket)))
+				return false;
+			continue;
+		}
 #endif
-		if (count <= 0) return false;
+		if (count == 0) return false;
 		sent += static_cast<size_t>(count);
 	}
 	return true;
 }
 
+bool TwinpadClient::EncodeGamePadFrame(
+	const std::vector<uint8_t>& rgb,
+	uint16_t width,
+	uint16_t height,
+	TwinpadEncodedFrame& output)
+{
+	const auto pipelineStarted = std::chrono::steady_clock::now();
+	if (!width || !height || (width & 1) || (height & 1)
+		|| rgb.size() != static_cast<size_t>(width) * height * 3)
+		return false;
+
+	const uint8_t fps = std::clamp<uint8_t>(m_captureFps.load(), 1, 60);
+	const uint64_t nowUs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count());
+	std::scoped_lock lock(m_encoderMutex);
+	if (!m_videoEncoder || m_encoderWidth != width || m_encoderHeight != height || m_encoderFps != fps)
+	{
+		if (m_videoEncoder)
+		{
+			auto* oldEncoder = static_cast<ISVCEncoder*>(m_videoEncoder);
+			oldEncoder->Uninitialize();
+			WelsDestroySVCEncoder(oldEncoder);
+			m_videoEncoder = nullptr;
+		}
+
+		ISVCEncoder* encoder = nullptr;
+		if (WelsCreateSVCEncoder(&encoder) != 0 || !encoder)
+			return false;
+		SEncParamExt params{};
+		if (encoder->GetDefaultParams(&params) != 0)
+		{
+			WelsDestroySVCEncoder(encoder);
+			return false;
+		}
+		params.iUsageType = SCREEN_CONTENT_REAL_TIME;
+		params.iPicWidth = width;
+		params.iPicHeight = height;
+		params.iTargetBitrate = kOpenH264Bitrate;
+		params.iRCMode = RC_BITRATE_MODE;
+		params.fMaxFrameRate = static_cast<float>(fps);
+		params.iSpatialLayerNum = 1;
+		params.iTemporalLayerNum = 1;
+		params.uiIntraPeriod = fps * 2;
+		params.bEnableFrameSkip = false;
+		params.bEnableSceneChangeDetect = false;
+		params.eSpsPpsIdStrategy = CONSTANT_ID;
+		params.iEntropyCodingModeFlag = 0;
+		params.sSpatialLayers[0].iVideoWidth = width;
+		params.sSpatialLayers[0].iVideoHeight = height;
+		params.sSpatialLayers[0].fFrameRate = static_cast<float>(fps);
+		params.sSpatialLayers[0].iSpatialBitrate = kOpenH264Bitrate;
+		params.sSpatialLayers[0].iMaxSpatialBitrate = kOpenH264Bitrate;
+		params.sSpatialLayers[0].uiProfileIdc = PRO_BASELINE;
+		params.sSpatialLayers[0].uiLevelIdc = LEVEL_4_2;
+		params.sSpatialLayers[0].sSliceArgument.uiSliceMode = SM_FIXEDSLCNUM_SLICE;
+		params.sSpatialLayers[0].sSliceArgument.uiSliceNum = kOpenH264SliceCount;
+		if (encoder->InitializeExt(&params) != 0)
+		{
+			WelsDestroySVCEncoder(encoder);
+			return false;
+		}
+		int colorFormat = videoFormatI420;
+		if (encoder->SetOption(ENCODER_OPTION_DATAFORMAT, &colorFormat) != 0)
+		{
+			encoder->Uninitialize();
+			WelsDestroySVCEncoder(encoder);
+			return false;
+		}
+		m_videoEncoder = encoder;
+		m_encoderWidth = width;
+		m_encoderHeight = height;
+		m_encoderFps = fps;
+		m_encoderFrameIndex = 0;
+		m_forceNextIdr = true;
+		m_lastIdrTimestampUs = 0;
+		m_encoderEpochUs = nowUs;
+	}
+
+	const auto i420Started = std::chrono::steady_clock::now();
+	const size_t ySize = static_cast<size_t>(width) * height;
+	std::vector<uint8_t> i420(ySize * 3 / 2);
+	for (uint32_t row = 0; row < height; ++row)
+	{
+		for (uint32_t column = 0; column < width; ++column)
+		{
+			const size_t source = (static_cast<size_t>(row) * width + column) * 3;
+			const int red = rgb[source];
+			const int green = rgb[source + 1];
+			const int blue = rgb[source + 2];
+			i420[static_cast<size_t>(row) * width + column] = static_cast<uint8_t>(
+				((66 * red + 129 * green + 25 * blue + 128) >> 8) + 16);
+		}
+	}
+	uint8_t* uPlane = i420.data() + ySize;
+	uint8_t* vPlane = uPlane + ySize / 4;
+	for (uint32_t row = 0; row < height; row += 2)
+	{
+		for (uint32_t column = 0; column < width; column += 2)
+		{
+			int sumU = 0;
+			int sumV = 0;
+			for (uint32_t dy = 0; dy < 2; ++dy)
+			{
+				for (uint32_t dx = 0; dx < 2; ++dx)
+				{
+					const size_t source = (static_cast<size_t>(row + dy) * width + column + dx) * 3;
+					const int red = rgb[source];
+					const int green = rgb[source + 1];
+					const int blue = rgb[source + 2];
+					sumU += ((-38 * red - 74 * green + 112 * blue + 128) >> 8) + 128;
+					sumV += ((112 * red - 94 * green - 18 * blue + 128) >> 8) + 128;
+				}
+			}
+			const size_t chroma = static_cast<size_t>(row / 2) * (width / 2) + column / 2;
+			uPlane[chroma] = static_cast<uint8_t>(std::clamp(sumU / 4, 0, 255));
+			vPlane[chroma] = static_cast<uint8_t>(std::clamp(sumV / 4, 0, 255));
+		}
+	}
+
+	RecordVideoMetric(TwinpadVideoMetricStage::I420_CONVERT,
+		std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - i420Started).count());
+
+	SSourcePicture picture{};
+	picture.iColorFormat = videoFormatI420;
+	picture.iPicWidth = width;
+	picture.iPicHeight = height;
+	picture.iStride[0] = width;
+	picture.iStride[1] = width / 2;
+	picture.iStride[2] = width / 2;
+	picture.pData[0] = i420.data();
+	picture.pData[1] = uPlane;
+	picture.pData[2] = vPlane;
+	picture.uiTimeStamp = static_cast<long long>(m_encoderFrameIndex * 1000 / fps);
+	auto* encoder = static_cast<ISVCEncoder*>(m_videoEncoder);
+	if ((m_forceNextIdr || nowUs - m_lastIdrTimestampUs >= kIdrIntervalMs * 1000)
+		&& encoder->ForceIntraFrame(true) != 0)
+		return false;
+	SFrameBSInfo info{};
+	const auto openH264Started = std::chrono::steady_clock::now();
+	const int encodeResult = encoder->EncodeFrame(&picture, &info);
+	RecordVideoMetric(TwinpadVideoMetricStage::OPENH264,
+		std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - openH264Started).count());
+	if (encodeResult != 0 || info.eFrameType == videoFrameTypeSkip || info.eFrameType == videoFrameTypeInvalid)
+		return false;
+
+	output.annexB.clear();
+	for (int layerIndex = 0; layerIndex < info.iLayerNum; ++layerIndex)
+	{
+		const auto& layer = info.sLayerInfo[layerIndex];
+		const uint8_t* nalData = layer.pBsBuf;
+		for (int nalIndex = 0; nalIndex < layer.iNalCount; ++nalIndex)
+		{
+			const int nalLength = layer.pNalLengthInByte[nalIndex];
+			if (nalLength <= 0 || output.annexB.size() + static_cast<size_t>(nalLength) > 4 * 1024 * 1024)
+				return false;
+			output.annexB.insert(output.annexB.end(), nalData, nalData + nalLength);
+			nalData += nalLength;
+		}
+	}
+	if (output.annexB.empty())
+		return false;
+	output.timestampUs = nowUs >= m_encoderEpochUs ? nowUs - m_encoderEpochUs : 0;
+	output.idr = info.eFrameType == videoFrameTypeIDR;
+	if (m_forceNextIdr && !output.idr)
+		return false;
+	if (output.idr)
+	{
+		m_lastIdrTimestampUs = nowUs;
+		m_forceNextIdr = false;
+	}
+	++m_encoderFrameIndex;
+	RecordVideoMetric(TwinpadVideoMetricStage::ENCODE_PIPELINE,
+		std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - pipelineStarted).count());
+	return true;
+}
+
 std::string TwinpadClient::Base64Url(const uint8_t* data, size_t size)
 {
-	std::string result;
-	result.reserve((size * 4 + 2) / 3);
-	for (size_t i = 0; i < size; i += 3)
+	const size_t remainder = size % 3;
+	const size_t outputSize = size / 3 * 4 + (remainder ? remainder + 1 : 0);
+	std::string result(outputSize, '\0');
+	char* output = result.data();
+	size_t inputIndex = 0;
+	size_t outputIndex = 0;
+	while (inputIndex + 3 <= size)
 	{
-		const uint32_t block = (static_cast<uint32_t>(data[i]) << 16)
-			| ((i + 1 < size ? static_cast<uint32_t>(data[i + 1]) : 0) << 8)
-			| (i + 2 < size ? static_cast<uint32_t>(data[i + 2]) : 0);
-		result.push_back(kBase64Alphabet[(block >> 18) & 63]);
-		result.push_back(kBase64Alphabet[(block >> 12) & 63]);
-		if (i + 1 < size) result.push_back(kBase64Alphabet[(block >> 6) & 63]);
-		if (i + 2 < size) result.push_back(kBase64Alphabet[block & 63]);
+		const uint32_t block = (static_cast<uint32_t>(data[inputIndex]) << 16)
+			| (static_cast<uint32_t>(data[inputIndex + 1]) << 8)
+			| static_cast<uint32_t>(data[inputIndex + 2]);
+		output[outputIndex++] = kBase64Alphabet[(block >> 18) & 63];
+		output[outputIndex++] = kBase64Alphabet[(block >> 12) & 63];
+		output[outputIndex++] = kBase64Alphabet[(block >> 6) & 63];
+		output[outputIndex++] = kBase64Alphabet[block & 63];
+		inputIndex += 3;
+	}
+	if (remainder != 0)
+	{
+		const uint32_t block = (static_cast<uint32_t>(data[inputIndex]) << 16)
+			| (remainder == 2 ? static_cast<uint32_t>(data[inputIndex + 1]) << 8 : 0);
+		output[outputIndex++] = kBase64Alphabet[(block >> 18) & 63];
+		output[outputIndex++] = kBase64Alphabet[(block >> 12) & 63];
+		if (remainder == 2)
+			output[outputIndex] = kBase64Alphabet[(block >> 6) & 63];
 	}
 	return result;
 }
@@ -398,10 +672,12 @@ bool TwinpadClient::GetCurrentQr(TwinpadQr& qr)
 	rapidjson::Document document;
 	document.Parse(response.data(), lineEnd);
 	if (document.HasParseError() || !document.IsObject() || !document.HasMember("uri")
-		|| !document["uri"].IsString() || !document.HasMember("modules") || !document["modules"].IsArray())
+		|| !document["uri"].IsString() || !document.HasMember("modules") || !document["modules"].IsArray()
+		|| !document.HasMember("cemu_live") || !document["cemu_live"].IsBool())
 		return false;
 	TwinpadQr parsed;
 	parsed.uri = document["uri"].GetString();
+	parsed.cemuLive = document["cemu_live"].GetBool();
 	const auto& rows = document["modules"];
 	if (rows.Empty() || rows.Size() > 177) return false;
 	const rapidjson::SizeType width = rows[0].IsString() ? rows[0].GetStringLength() : 0;
@@ -424,14 +700,120 @@ TwinpadInputState TwinpadClient::GetInputState() const
 	return m_inputState;
 }
 
+#ifdef TWINPAD_E2E_TEST_HOOK
+namespace
+{
+void StartE2eInputProbe(std::string_view line)
+{
+	if (line.size() > kE2eRequestLimit || !line.starts_with("TEST-058 "))
+		return;
+	std::string request(line);
+	request.push_back('\n');
+	std::thread([request = std::move(request)] {
+		const SocketHandle listener = socket(AF_INET, SOCK_STREAM, 0);
+		if (listener < 0)
+			return;
+		int reuse = 1;
+		setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+		sockaddr_in address{};
+		address.sin_family = AF_INET;
+		address.sin_port = htons(kE2eCaptureIpcPort);
+		address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		if (bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 || listen(listener, 1) != 0)
+		{
+			CloseSocket(listener);
+			return;
+		}
+		fd_set readable;
+		FD_ZERO(&readable);
+		FD_SET(listener, &readable);
+		timeval timeout{10, 0};
+#if BOOST_OS_WINDOWS
+		const int ready = select(0, &readable, nullptr, nullptr, &timeout);
+#else
+		const int ready = select(listener + 1, &readable, nullptr, nullptr, &timeout);
+#endif
+		if (ready > 0)
+		{
+			const SocketHandle client = accept(listener, nullptr, nullptr);
+			if (client >= 0)
+			{
+				char input[kE2eRequestLimit + 1]{};
+#if BOOST_OS_WINDOWS
+				const int size = recv(client, input, static_cast<int>(sizeof(input) - 1), 0);
+#else
+				const ssize_t size = recv(client, input, sizeof(input) - 1, 0);
+#endif
+				if (size > 0 && std::string_view(input, static_cast<size_t>(size)) == request)
+				{
+					const auto state = TwinpadClient::Instance().GetInputState();
+					char response[256]{};
+					const int responseSize = std::snprintf(response, sizeof(response),
+						"{\"type\":\"test_probe\",\"seq\":%u,\"touch_x\":%u,\"touch_y\":%u,\"touch_pressed\":%s}\n",
+						state.seq, state.touchX, state.touchY, state.touchPressed ? "true" : "false");
+					const int32_t probeSeq = static_cast<int32_t>(gE2eInputProbeSeq.fetch_add(1));
+					const std::string probeReport = "{\"type\":\"input_report\",\"seq\":"
+						+ std::to_string(probeSeq) + ",\"stick_lx\":0,\"stick_ly\":0,\"stick_rx\":0,\"stick_ry\":0,"
+						+ "\"dpad\":8,\"buttons\":0,\"trigger_l2\":0,\"trigger_r2\":0,\"touch_x\":"
+						+ std::to_string(state.touchX) + ",\"touch_y\":" + std::to_string(state.touchY)
+						+ ",\"touch_pressed\":" + (state.touchPressed ? "true" : "false") + "}";
+					if (responseSize > 0 && SendLine(m_primarySocket, probeReport))
+						::send(client, response, static_cast<size_t>(responseSize), 0);
+				}
+				CloseSocket(client);
+			}
+		}
+		CloseSocket(listener);
+	}).detach();
+}
+}
+#endif
+
 void TwinpadClient::RequestConnection()
 {
 	if (!m_titleActive.load() || !CafeSystem::IsTitleRunning())
-		return;
-	m_connectionRequested.store(true);
-	m_captureGamePad.store(true);
+		return;		m_connectionRequested.store(true);
+		m_captureGamePad.store(true);
+
 	if (!m_running.load())
 		Start(true);
+}
+
+void TwinpadClient::CancelConnectionRequest()
+{
+	std::scoped_lock lifecycleLock(m_lifecycleMutex);
+	if (!m_titleActive.load())
+		return;
+	m_connectionRequested.store(false);
+	m_captureGamePad.store(false);		m_connected.store(false);
+
+	{
+		std::scoped_lock lock(m_primarySocketMutex);
+		if (m_primarySocket >= 0)
+		{
+#if BOOST_OS_WINDOWS
+			shutdown(static_cast<SocketHandle>(m_primarySocket), SD_BOTH);
+#else
+			shutdown(static_cast<SocketHandle>(m_primarySocket), SHUT_RDWR);
+#endif
+		}
+	}
+	{
+		std::scoped_lock lock(m_audioSocketMutex);
+		if (m_audioSocket >= 0)
+		{
+#if BOOST_OS_WINDOWS
+			shutdown(static_cast<SocketHandle>(m_audioSocket), SD_BOTH);
+#else
+			shutdown(static_cast<SocketHandle>(m_audioSocket), SHUT_RDWR);
+#endif
+		}
+	}
+	{
+		std::scoped_lock lock(m_inputMutex);
+		m_inputState = TwinpadInputState{};
+		m_hasInputSeq = false;
+	}
 }
 
 void TwinpadClient::InputLoop()
@@ -498,10 +880,12 @@ void TwinpadClient::InputLoop()
 				m_audioSocket = -1;
 			}
 			const bool connected = ConnectPrimary() && m_titleActive.load() && ConnectAudio();
-			if (connected && m_titleActive.load())
+			if (connected && m_titleActive.load() && m_connectionRequested.load())
 			{
 				m_frameNumber.store(0);
 				m_audioSequence.store(0);
+				ResetVideoEncoder();
+				m_lastFrameQueuedMs.store(0);
 				m_receiveBuffer.clear();
 				{
 					std::scoped_lock lock(m_inputMutex);
@@ -556,6 +940,18 @@ void TwinpadClient::InputLoop()
 		if (count > 0)
 		{
 			m_receiveBuffer.append(buffer, static_cast<size_t>(count));
+#ifdef TWINPAD_E2E_TEST_HOOK
+			const auto probeEnd = m_receiveBuffer.find("TEST-058 ");
+			if (probeEnd != std::string::npos)
+			{
+				const auto lineEnd = m_receiveBuffer.find('\n', probeEnd);
+				if (lineEnd != std::string::npos)
+				{
+					StartE2eInputProbe(std::string_view(m_receiveBuffer).substr(probeEnd, lineEnd - probeEnd));
+					m_receiveBuffer.erase(probeEnd, lineEnd - probeEnd + 1);
+				}
+			}
+#endif
 			if (m_receiveBuffer.size() > 64 * 1024 && m_receiveBuffer.find('\n') == std::string::npos)
 				m_receiveBuffer.clear();
 			size_t lineEnd = m_receiveBuffer.find('\n');
@@ -565,6 +961,12 @@ void TwinpadClient::InputLoop()
 				document.Parse(m_receiveBuffer.data(), lineEnd);
 				if (!document.HasParseError())
 				{
+					if (document.IsObject() && document.HasMember("type") && document["type"].IsString()
+						&& std::string_view(document["type"].GetString()) == "video_config"
+						&& document.HasMember("fps") && document["fps"].IsUint())
+					{
+						SetCaptureFps(static_cast<uint8_t>(std::clamp(document["fps"].GetUint(), 1u, 60u)));
+					}
 					const auto report = ParseInputReport(document);
 					if (report)
 					{
@@ -573,6 +975,10 @@ void TwinpadClient::InputLoop()
 						{
 							m_inputState = *report;
 							m_hasInputSeq = true;
+							if (report->gyroValid && report->seq % kGyroLogReportInterval == 0)
+								cemuLog_log(LogType::Force,
+									"[TwinpadGyro] seq={} yaw={} pitch={} roll={}",
+									report->seq, report->yaw, report->pitch, report->roll);
 						}
 					}
 				}
@@ -644,22 +1050,85 @@ void TwinpadClient::InputLoop()
 	}
 }
 
-void TwinpadClient::PublishGamePadFrame(const std::vector<uint8_t>& rgb, uint16_t width, uint16_t height)
+void TwinpadClient::RecordVideoMetric(TwinpadVideoMetricStage stage, uint64_t elapsedNanoseconds)
 {
+	const size_t index = static_cast<size_t>(stage);
+	m_videoMetricCounts[index].fetch_add(1, std::memory_order_relaxed);
+	m_videoMetricNanoseconds[index].fetch_add(elapsedNanoseconds, std::memory_order_relaxed);
+	uint64_t maximum = m_videoMetricMaxNanoseconds[index].load(std::memory_order_relaxed);
+	while (maximum < elapsedNanoseconds
+		&& !m_videoMetricMaxNanoseconds[index].compare_exchange_weak(maximum, elapsedNanoseconds, std::memory_order_relaxed))
+	{
+	}
+}
+
+void TwinpadClient::RecordVideoEvent(TwinpadVideoMetricEvent event)
+{
+	m_videoMetricEvents[static_cast<size_t>(event)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void TwinpadClient::FlushVideoMetricsIfDue()
+{
+	const uint64_t nowMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count());
+	uint64_t previousMs = m_lastVideoMetricLogMs.load(std::memory_order_relaxed);
+	if (nowMs - previousMs < kVideoMetricLogIntervalMs
+		|| !m_lastVideoMetricLogMs.compare_exchange_strong(previousMs, nowMs, std::memory_order_relaxed))
+		return;
+
+	static constexpr const char* stageNames[] = {
+		"readback_copy", "readback_ready", "pixel_convert", "i420_convert",
+		"openh264", "encode_pipeline", "base64_json", "ipc_send",
+	};
+	static constexpr const char* eventNames[] = {
+		"drc_callback", "capture_accepted", "readback_queued", "readback_completed",
+		"readback_slot_busy", "frame_queued", "frame_encoded", "frame_sent",
+	};
+	std::string summary = "[TwinpadPerf] window_ms=" + std::to_string(kVideoMetricLogIntervalMs);
+	for (size_t index = 0; index < m_videoMetricCounts.size(); ++index)
+	{
+		const uint64_t count = m_videoMetricCounts[index].exchange(0, std::memory_order_relaxed);
+		const uint64_t totalNs = m_videoMetricNanoseconds[index].exchange(0, std::memory_order_relaxed);
+		const uint64_t maxNs = m_videoMetricMaxNanoseconds[index].exchange(0, std::memory_order_relaxed);
+		if (count != 0)
+			summary += " " + std::string(stageNames[index]) + "_n=" + std::to_string(count)
+				+ "_avg_us=" + std::to_string(totalNs / count / 1000)
+				+ "_max_us=" + std::to_string(maxNs / 1000);
+	}
+	for (size_t index = 0; index < m_videoMetricEvents.size(); ++index)
+	{
+		const uint64_t count = m_videoMetricEvents[index].exchange(0, std::memory_order_relaxed);
+		if (count != 0)
+			summary += " " + std::string(eventNames[index]) + "=" + std::to_string(count);
+	}
+	cemuLog_log(LogType::Force, "{}", summary);
+}
+
+void TwinpadClient::PublishGamePadFrame(
+	std::vector<uint8_t>&& pixels,
+	uint16_t width,
+	uint16_t height,
+	TwinpadPixelFormat format)
+{
+	const size_t bytesPerPixel = format == TwinpadPixelFormat::Rgb8 || format == TwinpadPixelFormat::Rgb8Srgb ? 3 : 4;
 	if (!m_connected.load() || !m_captureGamePad.load() || !width || !height
-		|| rgb.size() != static_cast<size_t>(width) * height * 3)
+		|| pixels.size() != static_cast<size_t>(width) * height * bytesPerPixel)
 		return;
 	const uint64_t now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
-	uint64_t previous = m_lastFrameQueuedMs.load();
-	if (now - previous < kCaptureIntervalMs || !m_lastFrameQueuedMs.compare_exchange_strong(previous, now))
-		return;
+	const uint64_t interval = 1000 / std::max<uint8_t>(m_captureFps.load(), 1);
 	{
 		std::scoped_lock lock(m_frameQueueMutex);
-		m_pendingFrame = rgb;
+		const uint64_t previous = m_lastFrameQueuedMs.load();
+		if (now - previous < interval)
+			return;
+		m_lastFrameQueuedMs.store(now);
+		m_pendingFrame = std::move(pixels);
 		m_pendingFrameWidth = width;
 		m_pendingFrameHeight = height;
+		m_pendingFrameFormat = format;
 		m_hasPendingFrame = true;
 	}
+	RecordVideoEvent(TwinpadVideoMetricEvent::FRAME_QUEUED);
 	m_frameQueueChanged.notify_one();
 }
 
@@ -690,9 +1159,11 @@ void TwinpadClient::FrameLoop()
 {
 	while (m_running.load())
 	{
+		FlushVideoMetricsIfDue();
 		std::vector<uint8_t> frameData;
 		uint16_t width = 0;
 		uint16_t height = 0;
+		TwinpadPixelFormat format = TwinpadPixelFormat::Rgb8;
 		{
 			std::unique_lock lock(m_frameQueueMutex);
 
@@ -704,16 +1175,53 @@ void TwinpadClient::FrameLoop()
 				m_hasPendingFrame = false;
 				continue;
 			}
-			frameData = m_pendingFrame;
+			frameData = std::move(m_pendingFrame);
 			width = m_pendingFrameWidth;
 			height = m_pendingFrameHeight;
+			format = m_pendingFrameFormat;
 			m_hasPendingFrame = false;
 		}
 
+		const auto pixelConvertStarted = std::chrono::steady_clock::now();
+		if (format == TwinpadPixelFormat::Rgb8Srgb)
+		{
+			std::transform(frameData.begin(), frameData.end(), frameData.begin(), SrgbToRgb);
+		}
+		else if (format == TwinpadPixelFormat::Rgba8 || format == TwinpadPixelFormat::Rgba8Srgb)
+		{
+			const size_t pixelCount = static_cast<size_t>(width) * height;
+			std::vector<uint8_t> rgb(pixelCount * 3);
+			for (size_t pixel = 0; pixel < pixelCount; ++pixel)
+			{
+				const size_t source = pixel * 4;
+				const size_t destination = pixel * 3;
+				for (size_t channel = 0; channel < 3; ++channel)
+				{
+					const uint8_t value = frameData[source + channel];
+					rgb[destination + channel] = format == TwinpadPixelFormat::Rgba8Srgb ? SrgbToRgb(value) : value;
+				}
+			}
+			frameData = std::move(rgb);
+		}
+		RecordVideoMetric(TwinpadVideoMetricStage::PIXEL_CONVERT,
+			std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - pixelConvertStarted).count());
+		TwinpadEncodedFrame encodedFrame;
+		if (!EncodeGamePadFrame(frameData, width, height, encodedFrame))
+			continue;
+		RecordVideoEvent(TwinpadVideoMetricEvent::FRAME_ENCODED);
 		const uint64_t frame = m_frameNumber.fetch_add(1);
-		const std::string line = "{\"type\":\"game_frame\",\"gfn\":" + std::to_string(frame)
+		const auto base64JsonStarted = std::chrono::steady_clock::now();
+		const std::string encodedData = Base64Url(encodedFrame.annexB.data(), encodedFrame.annexB.size());
+		std::string line;
+		line.reserve(encodedData.size() + 192);
+		line = "{\"type\":\"game_frame\",\"gfn\":" + std::to_string(frame)
 			+ ",\"w\":" + std::to_string(width) + ",\"h\":" + std::to_string(height)
-			+ ",\"fmt\":\"rgb8\",\"data\":\"" + Base64Url(frameData.data(), frameData.size()) + "\"}";
+			+ ",\"fmt\":\"h264\",\"ts_capture_us\":" + std::to_string(encodedFrame.timestampUs)
+			+ ",\"idr\":" + (encodedFrame.idr ? "true" : "false")
+			+ ",\"data\":\"" + encodedData + "\"}";
+		RecordVideoMetric(TwinpadVideoMetricStage::BASE64_JSON,
+			std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - base64JsonStarted).count());
+		const auto ipcSendStarted = std::chrono::steady_clock::now();
 		std::scoped_lock lock(m_primarySocketMutex);
 		if (!m_connected.load() || m_primarySocket < 0)
 			continue;
@@ -723,6 +1231,9 @@ void TwinpadClient::FrameLoop()
 			m_connected.store(false);
 			continue;
 		}
+		RecordVideoMetric(TwinpadVideoMetricStage::IPC_SEND,
+			std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - ipcSendStarted).count());
+		RecordVideoEvent(TwinpadVideoMetricEvent::FRAME_SENT);
 		m_lastFrameSentMs.store(now);
 	}
 }

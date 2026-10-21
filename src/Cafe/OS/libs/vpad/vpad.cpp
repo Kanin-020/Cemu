@@ -231,7 +231,7 @@ namespace vpad
 
 		// default misc
 		status->batteryLevel = 0xC0; // full battery
-		status->slideVolume = status->slideVolume2 = (uint8)((g_padVolume * 0xFF) / 100);
+		status->slideVolume = status->slideVolume2 = 0xFF;
 
 		// default touch
 		status->tpData.validity = VPAD_TP_VALIDITY_INVALID_XY;

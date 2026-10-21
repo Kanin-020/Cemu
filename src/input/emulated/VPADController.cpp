@@ -310,6 +310,11 @@ void VPADController::update_motion(VPADStatus_t& status, const TwinpadInputState
 		const float yaw = static_cast<float>(input.yaw) / kTurnScale;
 		const float pitch = static_cast<float>(input.pitch) / kTurnScale;
 		const float roll = static_cast<float>(input.roll) / kTurnScale;
+		status.gyroOrientation = {yaw, pitch, roll};
+		status.acc = {0.0f, 0.0f, 1.0f};
+		status.accMagnitude = 1.0f;
+		status.accAcceleration = 0.0f;
+		status.accXY = {1.0f, 0.0f};
 		Quaternionf orientation(pitch * 360.0f, yaw * 360.0f, roll * 360.0f);
 		const auto axes = orientation.GetTransposedRotationMatrix();
 		const auto x = std::get<0>(axes);
@@ -318,6 +323,23 @@ void VPADController::update_motion(VPADStatus_t& status, const TwinpadInputState
 		status.dir.x = {x.x, x.y, x.z};
 		status.dir.y = {y.x, y.y, y.z};
 		status.dir.z = {z.x, z.y, z.z};
+
+		constexpr uint32_t kGyroLogReportInterval = 10;
+		static uint32_t lastLoggedGyroSeq{};
+		static bool hasLoggedGyroSeq{};
+		if (input.seq % kGyroLogReportInterval == 0 &&
+			(!hasLoggedGyroSeq || input.seq != lastLoggedGyroSeq))
+		{
+			cemuLog_log(LogType::Force,
+				"[TwinpadGyro] stage=VPAD seq={} input_yaw={} input_pitch={} input_roll={} mapped_yaw={:.6f} mapped_pitch={:.6f} mapped_roll={:.6f} dir_x=({:.4f},{:.4f},{:.4f}) dir_y=({:.4f},{:.4f},{:.4f}) dir_z=({:.4f},{:.4f},{:.4f})",
+				input.seq, input.yaw, input.pitch, input.roll,
+				status.gyroOrientation.x, status.gyroOrientation.y, status.gyroOrientation.z,
+				status.dir.x.x, status.dir.x.y, status.dir.x.z,
+				status.dir.y.x, status.dir.y.y, status.dir.y.z,
+				status.dir.z.x, status.dir.z.y, status.dir.z.z);
+			lastLoggedGyroSeq = input.seq;
+			hasLoggedGyroSeq = true;
+		}
 	}
 }
 

@@ -96,6 +96,7 @@ public:
 
 private:
 	void update_thread();
+	void update_twinpad_vpad();
 
 	std::thread m_update_thread;
 	std::atomic<bool> m_update_thread_shutdown{false};
@@ -105,6 +106,8 @@ private:
 	mutable std::shared_mutex m_mutex;
 	std::array<EmulatedControllerPtr, kMaxVPADControllers> m_vpad;
 	std::array<EmulatedControllerPtr, kMaxWPADControllers> m_wpad;
+	std::shared_ptr<VPADController> m_twinpadAutoVpad;
+	EmulatedControllerPtr m_twinpadPreviousVpad;
 
 	std::array<bool, kMaxController> m_is_gameprofile_set{};
 

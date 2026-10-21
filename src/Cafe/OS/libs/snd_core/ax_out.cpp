@@ -161,7 +161,9 @@ namespace snd_core
 	sint16* __AXDRCDMABuffers[3] = { __buf_AXDRCDMABuffers_0, __buf_AXDRCDMABuffers_1, __buf_AXDRCDMABuffers_2 };
 
 	sint16 tempDRCChannelData[AX_SAMPLES_MAX * 6 * AX_FRAMES_PER_GROUP] = {};
+	sint16 tempTwinpadDRCAudioData[AX_SAMPLES_PER_3MS_48KHZ * 2 * AX_FRAMES_PER_GROUP] = {};
 	sint32 tempDRCAudioBlockCounter = 0;
+	bool tempTwinpadDRCAudioBlockValid = true;
 
 	void AIInitDMA(sint16* sampleData, sint32 size)
 	{
@@ -301,20 +303,43 @@ namespace snd_core
 
 	void AIInitDRCDMA(sint16* sampleData, sint32 size)
 	{
-		sint32 sampleCount = size / sizeof(sint16); // sample count in total (summed up for all channels)
-
+		const sint32 sampleCount = size / sizeof(sint16);
 		if (sndGeneric.initParam.frameLength != 0)
-		{
 			cemu_assert(false);
-		}
 
 		std::shared_lock lock(g_audioMutex);
-
+		const uint32 sourceChannels = static_cast<uint32>(sampleCount / AX_SAMPLES_PER_3MS_48KHZ);
+		const bool validTwinpadSource = sampleCount % AX_SAMPLES_PER_3MS_48KHZ == 0
+			&& (sourceChannels == 1 || sourceChannels == 2 || sourceChannels == 6);
 		const uint32 channels = g_padAudio ? g_padAudio->GetChannels() : AX_DRC_CHANNEL_COUNT;
-		sint16* outputChannel = tempDRCChannelData + AX_SAMPLES_PER_3MS_48KHZ * tempDRCAudioBlockCounter * channels;
-		for (sint32 i = 0; i < sampleCount; ++i)
+		// Keep the buffer's interleaved stride identical to the configured local pad device.
+		// The Twinpad transport below independently normalizes its Android source to stereo.
+		sint16* localBlock = tempDRCChannelData
+			+ AX_SAMPLES_PER_3MS_48KHZ * tempDRCAudioBlockCounter * channels;
+		std::fill_n(localBlock, AX_SAMPLES_PER_3MS_48KHZ * channels, 0);
+
+		if (validTwinpadSource)
 		{
-			outputChannel[i] = _swapEndianS16(sampleData[i]);
+			const size_t twinpadFrameOffset = static_cast<size_t>(tempDRCAudioBlockCounter)
+				* AX_SAMPLES_PER_3MS_48KHZ * 2;
+			for (sint32 sample = 0; sample < AX_SAMPLES_PER_3MS_48KHZ; ++sample)
+			{
+				const size_t sourceOffset = static_cast<size_t>(sample) * sourceChannels;
+				const sint16 left = _swapEndianS16(sampleData[sourceOffset]);
+				const sint16 right = sourceChannels == 1 ? left : _swapEndianS16(sampleData[sourceOffset + 1]);
+				for (uint32 channel = 0; channel < channels; ++channel)
+				{
+					const uint32 sourceChannel = sourceChannels == 1 ? 0 : channel;
+					localBlock[static_cast<size_t>(sample) * channels + channel]
+						= sourceChannel < sourceChannels ? _swapEndianS16(sampleData[sourceOffset + sourceChannel]) : 0;
+				}
+				tempTwinpadDRCAudioData[twinpadFrameOffset + sample * 2] = left;
+				tempTwinpadDRCAudioData[twinpadFrameOffset + sample * 2 + 1] = right;
+			}
+		}
+		else
+		{
+			tempTwinpadDRCAudioBlockValid = false;
 		}
 
 		tempDRCAudioBlockCounter++;
@@ -322,9 +347,15 @@ namespace snd_core
 		{
 			if (g_padAudio)
 				g_padAudio->FeedBlock(tempDRCChannelData);
-			TwinpadClient::Instance().PublishAudioBlock(tempDRCChannelData, AX_SAMPLES_PER_3MS_48KHZ * AX_FRAMES_PER_GROUP, static_cast<uint8_t>(channels));
-
+			if (tempTwinpadDRCAudioBlockValid)
+			{
+				TwinpadClient::Instance().PublishAudioBlock(
+					tempTwinpadDRCAudioData,
+					AX_SAMPLES_PER_3MS_48KHZ * AX_FRAMES_PER_GROUP,
+					2);
+			}
 			tempDRCAudioBlockCounter = 0;
+			tempTwinpadDRCAudioBlockValid = true;
 		}
 	}
 

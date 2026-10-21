@@ -1010,7 +1010,15 @@ void LatteRenderTarget_itHLECopyColorBufferToScanBuffer(MPTR colorBufferPtr, uin
 
 	if (renderTarget & RENDER_TARGET_DRC)
 	{
-		g_renderer->CaptureTwinpadFrame(texView);
+		if (g_renderer->IsTwinpadCaptureEnabled())
+		{
+			// The visible PadView path performs this synchronization in
+			// LatteRenderTarget_copyToBackbuffer(). Twinpad captures the DRC
+			// even with that window closed, so prepare the texture here too.
+			LatteTexture_UpdateDataToLatest(texView->baseTexture);
+			LatteTC_MarkTextureStillInUse(texView->baseTexture);
+			g_renderer->CaptureTwinpadFrame(texView);
+		}
 		if (g_renderer->IsPadWindowActive())
 			LatteRenderTarget_copyToBackbuffer(texView, true);
 	}

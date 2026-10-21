@@ -846,6 +846,31 @@ void MainWindow::OnTwinpadMenu(wxCommandEvent& event)
 				return;
 			}
 		}
+		twinpad.RequestConnection();
+		if (g_renderer)
+			g_renderer->SetTwinpadCaptureEnabled(true);
+		if (!qr.cemuLive)
+		{
+			bool cemuAvailable = false;
+			for (int attempt = 0; attempt < 40; ++attempt)
+			{
+				if (TwinpadClient::GetCurrentQr(qr) && qr.cemuLive)
+				{
+					cemuAvailable = true;
+					break;
+				}
+				wxMilliSleep(50);
+			}
+			if (!cemuAvailable)
+			{
+				twinpad.CancelConnectionRequest();
+				if (g_renderer)
+					g_renderer->SetTwinpadCaptureEnabled(false);
+				wxMessageBox(wxString::FromUTF8("El servidor Twinpad no confirmó el adaptador Cemu."),
+					wxString::FromUTF8("Twinpad"), wxOK | wxICON_ERROR, this);
+				return;
+			}
+		}
 		const size_t qrWidth = qr.modules.front().size();
 		const int moduleSize = std::max(3, 360 / static_cast<int>(qrWidth + 8));
 		const int quietZone = moduleSize * 4;
@@ -873,10 +898,13 @@ void MainWindow::OnTwinpadMenu(wxCommandEvent& event)
 		qrDialog.SetSizerAndFit(qrSizer);
 		qrDialog.CentreOnParent();
 		if (qrDialog.ShowModal() != wxID_OK)
+		{
+			twinpad.CancelConnectionRequest();
+			if (g_renderer)
+				g_renderer->SetTwinpadCaptureEnabled(false);
+			RecreateMenu();
 			return;
-		twinpad.RequestConnection();
-		if (g_renderer)
-			g_renderer->SetTwinpadCaptureEnabled(true);
+		}
 		RecreateMenu();
 		return;
 	}

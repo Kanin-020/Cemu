@@ -4,7 +4,87 @@
 #include <boost/property_tree/ini_parser.hpp>
 #include <pugixml.hpp>
 #include "Cafe/GameProfile/GameProfile.h"
+#include "Cafe/Twinpad/TwinpadClient.h"
 #include "util/EventService.h"
+
+namespace
+{
+void UpdateTwinpadVpadSlot(
+	std::array<EmulatedControllerPtr, InputManager::kMaxVPADControllers>& vpads,
+	std::shared_ptr<VPADController>& twinpadVpad,
+	EmulatedControllerPtr& previousVpad,
+	bool twinpadConnected)
+{
+	if (twinpadConnected)
+	{
+		if (twinpadVpad && vpads[0] == twinpadVpad)
+			return;
+
+		if (twinpadVpad)
+		{
+			twinpadVpad.reset();
+			previousVpad.reset();
+		}
+
+		if (!vpads[0] || vpads[0]->player_index() != 0)
+		{
+			previousVpad = std::move(vpads[0]);
+			twinpadVpad = std::make_shared<VPADController>(0);
+			vpads[0] = twinpadVpad;
+		}
+
+		return;
+	}
+
+	if (twinpadVpad)
+	{
+		if (vpads[0] == twinpadVpad)
+			vpads[0] = std::move(previousVpad);
+		twinpadVpad.reset();
+		previousVpad.reset();
+	}
+}
+}
+
+// TEST-064 — verifies SPEC-006 (temporary Cemu Player 1 VPAD lifecycle).
+void InputManager_twinpad_vpad_test()
+{
+	std::array<EmulatedControllerPtr, InputManager::kMaxVPADControllers> vpads{};
+	std::shared_ptr<VPADController> twinpadVpad;
+	EmulatedControllerPtr previousVpad;
+	UpdateTwinpadVpadSlot(vpads, twinpadVpad, previousVpad, false);
+	cemu_assert_debug(!vpads[0] && !twinpadVpad);
+
+	UpdateTwinpadVpadSlot(vpads, twinpadVpad, previousVpad, true);
+	const auto generatedVpad = twinpadVpad;
+	cemu_assert_debug(generatedVpad && vpads[0] == generatedVpad && generatedVpad->player_index() == 0);
+	UpdateTwinpadVpadSlot(vpads, twinpadVpad, previousVpad, true);
+	cemu_assert_debug(twinpadVpad == generatedVpad && vpads[0] == generatedVpad);
+
+	UpdateTwinpadVpadSlot(vpads, twinpadVpad, previousVpad, false);
+	cemu_assert_debug(!vpads[0] && !twinpadVpad);
+
+	auto configuredVpad = std::make_shared<VPADController>(0);
+	vpads[0] = configuredVpad;
+	UpdateTwinpadVpadSlot(vpads, twinpadVpad, previousVpad, true);
+	cemu_assert_debug(vpads[0] == configuredVpad && !twinpadVpad);
+	UpdateTwinpadVpadSlot(vpads, twinpadVpad, previousVpad, false);
+	cemu_assert_debug(vpads[0] == configuredVpad);
+
+	auto otherPlayerVpad = std::make_shared<VPADController>(1);
+	vpads[0] = otherPlayerVpad;
+	UpdateTwinpadVpadSlot(vpads, twinpadVpad, previousVpad, true);
+	cemu_assert_debug(twinpadVpad && vpads[0] == twinpadVpad && previousVpad == otherPlayerVpad);
+	UpdateTwinpadVpadSlot(vpads, twinpadVpad, previousVpad, false);
+	cemu_assert_debug(vpads[0] == otherPlayerVpad && !twinpadVpad && !previousVpad);
+
+	vpads[0].reset();
+	UpdateTwinpadVpadSlot(vpads, twinpadVpad, previousVpad, true);
+	auto replacementVpad = std::make_shared<VPADController>(0);
+	vpads[0] = replacementVpad;
+	UpdateTwinpadVpadSlot(vpads, twinpadVpad, previousVpad, false);
+	cemu_assert_debug(vpads[0] == replacementVpad && !twinpadVpad);
+}
 
 InputManager::InputManager()
 {
@@ -442,6 +522,12 @@ void InputManager::save() noexcept
 
 bool InputManager::save(size_t player_index, std::string_view filename)
 {
+	{
+		std::shared_lock lock(m_mutex);
+		if (player_index == 0 && m_twinpadAutoVpad && m_vpad[0] == m_twinpadAutoVpad)
+			return true;
+	}
+
 	// dont overwrite files if set by gameprofile
 	if (m_is_gameprofile_set[player_index])
 		return true;
@@ -931,11 +1017,19 @@ std::optional<glm::ivec2> InputManager::get_right_down_mouse_info(bool* is_pad)
 	return {};
 }
 
+void InputManager::update_twinpad_vpad()
+{
+	const bool twinpadConnected = TwinpadClient::Instance().IsConnected();
+	std::unique_lock lock(m_mutex);
+	UpdateTwinpadVpadSlot(m_vpad, m_twinpadAutoVpad, m_twinpadPreviousVpad, twinpadConnected);
+}
+
 void InputManager::update_thread()
 {
 	SetThreadName("Input_update");
 	while (!m_update_thread_shutdown.load(std::memory_order::relaxed))
 	{
+		update_twinpad_vpad();
 		std::shared_lock lock(m_mutex);
 		for (auto& pad : m_vpad)
 		{
@@ -964,8 +1058,10 @@ void InputManager::Shutdown()
         m_update_thread.join();
     }
 
-    for (auto& pad : m_vpad) pad.reset();
+	for (auto& pad : m_vpad) pad.reset();
 	for (auto& pad : m_wpad) pad.reset();
+	m_twinpadAutoVpad.reset();
+	m_twinpadPreviousVpad.reset();
 
 	for (auto& providers : m_api_available)
 	{

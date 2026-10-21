@@ -128,19 +128,25 @@ bool Renderer::ShouldCaptureTwinpadFrame() const
 	if (!m_twinpadCaptureEnabled.load() || !g_renderer || g_renderer.get() != this)
 		return false;
 	const uint64 now = static_cast<uint64>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+	const uint64 interval = 1000 / std::max<uint8_t>(TwinpadClient::Instance().GetCaptureFps(), 1);
 	const uint64 lastSent = TwinpadClient::Instance().GetLastFrameSentMs();
-	if (now - lastSent < 200)
+	if (now - lastSent < interval)
 		return false;
 	uint64 previous = m_twinpadLastCaptureMs.load();
-	if (now - previous < 200 || !m_twinpadLastCaptureMs.compare_exchange_strong(previous, now))
+	if (now - previous < interval)
 		return false;
-	return true;
+	return m_twinpadLastCaptureMs.compare_exchange_strong(previous, now);
 }
 
 void Renderer::CaptureTwinpadFrame(LatteTextureView* texView)
 {
+	auto& twinpad = TwinpadClient::Instance();
+	twinpad.RecordVideoEvent(TwinpadVideoMetricEvent::DRC_CALLBACK);
 	if (texView && ShouldCaptureTwinpadFrame())
+	{
+		twinpad.RecordVideoEvent(TwinpadVideoMetricEvent::CAPTURE_ACCEPTED);
 		CaptureTwinpadFrameBackend(texView);
+	}
 }
 
 void Renderer::PublishTwinpadFrame(const std::vector<uint8>& rgb, int width, int height)
@@ -148,7 +154,8 @@ void Renderer::PublishTwinpadFrame(const std::vector<uint8>& rgb, int width, int
 	if (m_twinpadCaptureEnabled.load() && width > 0 && height > 0
 		&& width <= std::numeric_limits<uint16_t>::max() && height <= std::numeric_limits<uint16_t>::max())
 	{
-		TwinpadClient::Instance().PublishGamePadFrame(rgb, static_cast<uint16_t>(width), static_cast<uint16_t>(height));
+		TwinpadClient::Instance().PublishGamePadFrame(
+			std::vector<uint8>(rgb), static_cast<uint16_t>(width), static_cast<uint16_t>(height));
 	}
 }
 

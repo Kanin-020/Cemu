@@ -331,7 +331,7 @@ void VPADController::update_motion(VPADStatus_t& status, const TwinpadInputState
 			(!hasLoggedGyroSeq || input.seq != lastLoggedGyroSeq))
 		{
 			cemuLog_log(LogType::Force,
-				"[TwinpadGyro] stage=VPAD seq={} input_yaw={} input_pitch={} input_roll={} mapped_yaw={:.6f} mapped_pitch={:.6f} mapped_roll={:.6f} dir_x=({:.4f},{:.4f},{:.4f}) dir_y=({:.4f},{:.4f},{:.4f}) dir_z=({:.4f},{:.4f},{:.4f})",
+				"[TwinpadGyro] stage=vpad seq={} yaw={} pitch={} roll={} mapped_yaw={:.6f} mapped_pitch={:.6f} mapped_roll={:.6f} dir_x=({:.4f},{:.4f},{:.4f}) dir_y=({:.4f},{:.4f},{:.4f}) dir_z=({:.4f},{:.4f},{:.4f})",
 				input.seq, input.yaw, input.pitch, input.roll,
 				status.gyroOrientation.x, status.gyroOrientation.y, status.gyroOrientation.z,
 				status.dir.x.x, status.dir.x.y, status.dir.x.z,

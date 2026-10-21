@@ -977,8 +977,8 @@ void TwinpadClient::InputLoop()
 							m_hasInputSeq = true;
 							if (report->gyroValid && report->seq % kGyroLogReportInterval == 0)
 								cemuLog_log(LogType::Force,
-									"[TwinpadGyro] seq={} yaw={} pitch={} roll={}",
-									report->seq, report->yaw, report->pitch, report->roll);
+								"[TwinpadGyro] stage=cemu_rx seq={} yaw={} pitch={} roll={}",
+								report->seq, report->yaw, report->pitch, report->roll);
 						}
 					}
 				}

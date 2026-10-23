@@ -1058,6 +1058,35 @@ size_t VulkanRenderer::FindNewestCompletedTwinpadReadbackSlot(
 	return newestIndex;
 }
 
+size_t VulkanRenderer::FindOldestCompletedTwinpadReadbackSlot(
+	const std::array<TwinpadReadbackSlot, TWINPAD_READBACK_SLOT_COUNT>& slots,
+	uint64 finishedCommandBufferCount)
+{
+	size_t oldestIndex = slots.size();
+	for (size_t index = 0; index < slots.size(); ++index)
+	{
+		const auto& slot = slots[index];
+		if (slot.pending && slot.commandBufferId < finishedCommandBufferCount
+			&& (oldestIndex == slots.size() || slot.sequence < slots[oldestIndex].sequence))
+			oldestIndex = index;
+	}
+	return oldestIndex;
+}
+
+size_t VulkanRenderer::FindAvailableTwinpadReadbackSlot(
+	const std::array<TwinpadReadbackSlot, TWINPAD_READBACK_SLOT_COUNT>& slots,
+	size_t slotCount,
+	size_t preferredIndex)
+{
+	for (size_t offset = 0; offset < slotCount; ++offset)
+	{
+		const size_t index = (preferredIndex + offset) % slotCount;
+		if (!slots[index].pending && slots[index].data)
+			return index;
+	}
+	return slotCount;
+}
+
 void VulkanRenderer::CaptureTwinpadFrameAsync(LatteTextureView* texView)
 {
 	if (!texView)
@@ -1067,9 +1096,11 @@ void VulkanRenderer::CaptureTwinpadFrameAsync(LatteTextureView* texView)
 	// Publish only the freshest completed transfer; never wait for the GPU.
 	const size_t newestCompletedIndex = FindNewestCompletedTwinpadReadbackSlot(
 		m_twinpadReadbackSlots, m_countCommandBufferFinished);
+	uint64 newestCompletedSequence = 0;
 	if (newestCompletedIndex != m_twinpadReadbackSlots.size())
 	{
 		auto& newestCompleted = m_twinpadReadbackSlots[newestCompletedIndex];
+		newestCompletedSequence = newestCompleted.sequence;
 		twinpad.RecordVideoEvent(TwinpadVideoMetricEvent::READBACK_COMPLETED);
 		twinpad.RecordVideoMetric(TwinpadVideoMetricStage::READBACK_READY,
 			std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - newestCompleted.queuedAt).count());
@@ -1094,7 +1125,7 @@ void VulkanRenderer::CaptureTwinpadFrameAsync(LatteTextureView* texView)
 			std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - readbackCopyStarted).count());
 		for (auto& slot : m_twinpadReadbackSlots)
 		{
-			if (slot.pending && slot.sequence <= newestCompleted.sequence
+			if (slot.pending && slot.sequence <= newestCompletedSequence
 				&& HasCommandBufferFinished(slot.commandBufferId))
 				slot.pending = false;
 		}
@@ -1103,7 +1134,39 @@ void VulkanRenderer::CaptureTwinpadFrameAsync(LatteTextureView* texView)
 	if (m_twinpadReadbackSlotCount == 0)
 		return;
 	m_twinpadReadbackWriteIndex %= m_twinpadReadbackSlotCount;
-	auto& slot = m_twinpadReadbackSlots[m_twinpadReadbackWriteIndex];
+	size_t writeIndex = FindAvailableTwinpadReadbackSlot(
+		m_twinpadReadbackSlots, m_twinpadReadbackSlotCount, m_twinpadReadbackWriteIndex);
+	if (writeIndex == m_twinpadReadbackSlotCount)
+	{
+		writeIndex = FindOldestCompletedTwinpadReadbackSlot(
+			m_twinpadReadbackSlots, m_countCommandBufferFinished);
+		if (writeIndex == m_twinpadReadbackSlots.size())
+		{
+			twinpad.RecordVideoEvent(TwinpadVideoMetricEvent::READBACK_SLOT_BUSY);
+			return;
+		}
+		auto& staleCompleted = m_twinpadReadbackSlots[writeIndex];
+		if (staleCompleted.sequence > newestCompletedSequence)
+		{
+			twinpad.RecordVideoEvent(TwinpadVideoMetricEvent::READBACK_COMPLETED);
+			twinpad.RecordVideoMetric(TwinpadVideoMetricStage::READBACK_READY,
+				std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - staleCompleted.queuedAt).count());
+			const size_t completedBytesPerPixel = staleCompleted.format == VK_FORMAT_R8G8B8_UNORM
+				|| staleCompleted.format == VK_FORMAT_R8G8B8_SRGB ? 3 : 4;
+			std::vector<uint8> pixels(staleCompleted.data,
+				staleCompleted.data + static_cast<size_t>(staleCompleted.width) * staleCompleted.height * completedBytesPerPixel);
+			const TwinpadPixelFormat pixelFormat = staleCompleted.format == VK_FORMAT_R8G8B8_SRGB
+				? TwinpadPixelFormat::Rgb8Srgb
+				: staleCompleted.format == VK_FORMAT_R8G8B8A8_UNORM ? TwinpadPixelFormat::Rgba8
+				: staleCompleted.format == VK_FORMAT_R8G8B8A8_SRGB ? TwinpadPixelFormat::Rgba8Srgb
+				: TwinpadPixelFormat::Rgb8;
+			twinpad.PublishGamePadFrame(std::move(pixels),
+				static_cast<uint16_t>(staleCompleted.width), static_cast<uint16_t>(staleCompleted.height), pixelFormat);
+			staleCompleted.pending = false;
+		}
+	}
+	m_twinpadReadbackWriteIndex = writeIndex;
+	auto& slot = m_twinpadReadbackSlots[writeIndex];
 	if (slot.pending || !slot.data)
 	{
 		twinpad.RecordVideoEvent(TwinpadVideoMetricEvent::READBACK_SLOT_BUSY);

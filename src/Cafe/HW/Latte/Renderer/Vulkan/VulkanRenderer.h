@@ -657,6 +657,13 @@ private:
 	static size_t FindNewestCompletedTwinpadReadbackSlot(
 		const std::array<TwinpadReadbackSlot, TWINPAD_READBACK_SLOT_COUNT>& slots,
 		uint64 finishedCommandBufferCount);
+	static size_t FindAvailableTwinpadReadbackSlot(
+		const std::array<TwinpadReadbackSlot, TWINPAD_READBACK_SLOT_COUNT>& slots,
+		size_t slotCount,
+		size_t preferredIndex);
+	static size_t FindOldestCompletedTwinpadReadbackSlot(
+		const std::array<TwinpadReadbackSlot, TWINPAD_READBACK_SLOT_COUNT>& slots,
+		uint64 finishedCommandBufferCount);
 	std::array<TwinpadReadbackSlot, TWINPAD_READBACK_SLOT_COUNT> m_twinpadReadbackSlots{};
 	size_t m_twinpadReadbackSlotCount{};
 	size_t m_twinpadReadbackWriteIndex{};

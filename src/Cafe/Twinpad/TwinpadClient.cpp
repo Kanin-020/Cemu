@@ -11,6 +11,7 @@
 #include <rapidjson/document.h>
 #include <wels/codec_api.h>
 #include "Cafe/CafeSystem.h"
+#include "Cafe/HW/Latte/Renderer/Renderer.h"
 
 #if BOOST_OS_WINDOWS
 #include <winsock2.h>
@@ -75,9 +76,17 @@ constexpr char kBase64Alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqr
 
 uint8_t SrgbToRgb(uint8_t value)
 {
-	const float srgb = static_cast<float>(value) / 255.0f;
-	const float linear = srgb <= 0.04045f ? srgb / 12.92f : std::pow((srgb + 0.055f) / 1.055f, 2.4f);
-	return static_cast<uint8_t>(std::min(linear, 1.0f) * 255.0f);
+	static const std::array<uint8_t, 256> linearLookup = [] {
+		std::array<uint8_t, 256> lookup{};
+		for (size_t index = 0; index < lookup.size(); ++index)
+		{
+			const float srgb = static_cast<float>(index) / 255.0f;
+			const float linear = srgb <= 0.04045f ? srgb / 12.92f : std::pow((srgb + 0.055f) / 1.055f, 2.4f);
+			lookup[index] = static_cast<uint8_t>(std::min(linear, 1.0f) * 255.0f);
+		}
+		return lookup;
+	}();
+	return linearLookup[value];
 }
 
 std::optional<TwinpadInputState> ParseInputReport(const rapidjson::Value& document)
@@ -186,7 +195,7 @@ bool TwinpadClient::Start(bool captureGamePad)
 		return true;
 	m_captureGamePad.store(captureGamePad);
 	m_lastFrameSentMs.store(0);
-	m_lastFrameQueuedMs.store(0);
+	m_lastFrameQueuedUs.store(0);
 	m_audioThread = std::thread(&TwinpadClient::AudioLoop, this);
 	m_frameThread = std::thread(&TwinpadClient::FrameLoop, this);
 	m_inputThread = std::thread(&TwinpadClient::InputLoop, this);
@@ -441,6 +450,7 @@ bool TwinpadClient::EncodeGamePadFrame(
 			return false;
 		}
 		params.iUsageType = SCREEN_CONTENT_REAL_TIME;
+		params.iComplexityMode = LOW_COMPLEXITY;
 		params.iPicWidth = width;
 		params.iPicHeight = height;
 		params.iTargetBitrate = kOpenH264Bitrate;
@@ -462,6 +472,7 @@ bool TwinpadClient::EncodeGamePadFrame(
 		params.sSpatialLayers[0].uiLevelIdc = LEVEL_4_2;
 		params.sSpatialLayers[0].sSliceArgument.uiSliceMode = SM_FIXEDSLCNUM_SLICE;
 		params.sSpatialLayers[0].sSliceArgument.uiSliceNum = kOpenH264SliceCount;
+		params.iMultipleThreadIdc = static_cast<unsigned short>(kOpenH264SliceCount);
 		if (encoder->InitializeExt(&params) != 0)
 		{
 			WelsDestroySVCEncoder(encoder);
@@ -486,7 +497,8 @@ bool TwinpadClient::EncodeGamePadFrame(
 
 	const auto i420Started = std::chrono::steady_clock::now();
 	const size_t ySize = static_cast<size_t>(width) * height;
-	std::vector<uint8_t> i420(ySize * 3 / 2);
+	m_i420Buffer.resize(ySize * 3 / 2);
+	auto& i420 = m_i420Buffer;
 	for (uint32_t row = 0; row < height; ++row)
 	{
 		for (uint32_t column = 0; column < width; ++column)
@@ -895,7 +907,7 @@ void TwinpadClient::InputLoop()
 				m_frameNumber.store(0);
 				m_audioSequence.store(0);
 				ResetVideoEncoder();
-				m_lastFrameQueuedMs.store(0);
+				m_lastFrameQueuedUs.store(0);
 				m_receiveBuffer.clear();
 				{
 					std::scoped_lock lock(m_inputMutex);
@@ -1123,6 +1135,17 @@ void TwinpadClient::FlushVideoMetricsIfDue()
 	cemuLog_log(LogType::Force, "{}", summary);
 }
 
+void TwinpadClient::SetCaptureFps(uint8_t fps)
+{
+	fps = fps >= 1 && fps <= 60 ? fps : 30;
+	if (m_captureFps.exchange(fps) == fps)
+		return;
+	m_lastFrameQueuedUs.store(0);
+	if (g_renderer)
+		g_renderer->ResetTwinpadCapturePacing();
+	ResetVideoEncoder();
+}
+
 void TwinpadClient::PublishGamePadFrame(
 	std::vector<uint8_t>&& pixels,
 	uint16_t width,
@@ -1133,14 +1156,17 @@ void TwinpadClient::PublishGamePadFrame(
 	if (!m_connected.load() || !m_captureGamePad.load() || !width || !height
 		|| pixels.size() != static_cast<size_t>(width) * height * bytesPerPixel)
 		return;
-	const uint64_t now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
-	const uint64_t interval = 1000 / std::max<uint8_t>(m_captureFps.load(), 1);
+	constexpr uint64_t kMicrosecondsPerSecond = 1'000'000;
+	const uint64_t now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count());
+	const uint64_t fps = std::clamp<uint8_t>(m_captureFps.load(), 1, 60);
+	const uint64_t interval = kMicrosecondsPerSecond / fps;
 	{
 		std::scoped_lock lock(m_frameQueueMutex);
-		const uint64_t previous = m_lastFrameQueuedMs.load();
+		const uint64_t previous = m_lastFrameQueuedUs.load();
 		if (now - previous < interval)
 			return;
-		m_lastFrameQueuedMs.store(now);
+		m_lastFrameQueuedUs.store(now);
 		m_pendingFrame = std::move(pixels);
 		m_pendingFrameWidth = width;
 		m_pendingFrameHeight = height;

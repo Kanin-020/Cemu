@@ -123,19 +123,25 @@ void Renderer::CancelScreenshotRequest()
 	m_on_save_screenshot = {};
 }
 
-bool Renderer::ShouldCaptureTwinpadFrame() const
+bool Renderer::ShouldCaptureTwinpadFrame()
 {
 	if (!m_twinpadCaptureEnabled.load() || !g_renderer || g_renderer.get() != this)
 		return false;
-	const uint64 now = static_cast<uint64>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
-	const uint64 interval = 1000 / std::max<uint8_t>(TwinpadClient::Instance().GetCaptureFps(), 1);
-	const uint64 lastSent = TwinpadClient::Instance().GetLastFrameSentMs();
-	if (now - lastSent < interval)
-		return false;
-	uint64 previous = m_twinpadLastCaptureMs.load();
-	if (now - previous < interval)
-		return false;
-	return m_twinpadLastCaptureMs.compare_exchange_strong(previous, now);
+	constexpr uint64 kNanosecondsPerSecond = 1'000'000'000;
+	const uint64 now = static_cast<uint64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count());
+	const uint64 fps = std::clamp<uint8_t>(TwinpadClient::Instance().GetCaptureFps(), 1, 60);
+	const uint64 interval = kNanosecondsPerSecond / fps;
+	uint64 previous = m_twinpadLastCaptureNs.load(std::memory_order_relaxed);
+	if (previous == 0)
+		return m_twinpadLastCaptureNs.compare_exchange_strong(previous, now, std::memory_order_relaxed);
+	while (now - previous >= interval)
+	{
+		const uint64 next = previous + interval;
+		if (m_twinpadLastCaptureNs.compare_exchange_weak(previous, next, std::memory_order_relaxed))
+			return true;
+	}
+	return false;
 }
 
 void Renderer::CaptureTwinpadFrame(LatteTextureView* texView)

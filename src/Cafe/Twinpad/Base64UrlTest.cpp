@@ -46,6 +46,16 @@ void VulkanRenderer_twinpad_readback_test()
 	slots[1].pending = false;
 	slots[2].pending = false;
 	cemu_assert_debug(VulkanRenderer::FindNewestCompletedTwinpadReadbackSlot(slots, 13) == 0);
+
+	// A partially allocated ring may have no completed slot while every
+	// allocated slot is pending; callers must compare against slots.size().
+	slots[0].pending = true;
+	slots[0].commandBufferId = 13;
+	slots[1].pending = true;
+	slots[1].commandBufferId = 14;
+	const size_t noCompletedSlot = VulkanRenderer::FindOldestCompletedTwinpadReadbackSlot(slots, 13);
+	cemu_assert_debug(noCompletedSlot == slots.size());
+	cemu_assert_debug(noCompletedSlot != 2);
 }
 
 void TwinpadOrientationMapper_test()

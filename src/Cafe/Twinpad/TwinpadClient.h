@@ -137,7 +137,7 @@ public:
 		uint16_t width,
 		uint16_t height,
 		TwinpadPixelFormat format = TwinpadPixelFormat::Rgb8);
-	void SetCaptureFps(uint8_t fps) { m_captureFps.store(fps >= 1 && fps <= 60 ? fps : 30); }
+	void SetCaptureFps(uint8_t fps);
 	uint8_t GetCaptureFps() const { return m_captureFps.load(); }
 	bool EncodeGamePadFrame(const std::vector<uint8_t>& rgb, uint16_t width, uint16_t height, TwinpadEncodedFrame& output);
 	void ResetVideoEncoder();
@@ -168,7 +168,7 @@ private:
 	std::atomic<uint64_t> m_frameNumber{0};
 	std::atomic<uint64_t> m_audioSequence{0};
 	std::atomic<uint64_t> m_lastFrameSentMs{0};
-	std::atomic<uint64_t> m_lastFrameQueuedMs{0};
+	std::atomic<uint64_t> m_lastFrameQueuedUs{0};
 	std::atomic<uint64_t> m_lastCaptureMs{0};
 	std::atomic<uint8_t> m_captureFps{30};
 	mutable std::mutex m_inputMutex;
@@ -184,6 +184,7 @@ private:
 	std::mutex m_frameQueueMutex;
 	std::condition_variable m_frameQueueChanged;
 	std::vector<uint8_t> m_pendingFrame;
+	std::vector<uint8_t> m_i420Buffer;
 	uint16_t m_pendingFrameWidth{};
 	uint16_t m_pendingFrameHeight{};
 	TwinpadPixelFormat m_pendingFrameFormat{TwinpadPixelFormat::Rgb8};

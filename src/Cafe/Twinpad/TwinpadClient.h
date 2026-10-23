@@ -62,6 +62,49 @@ struct TwinpadInputState
 	int16_t yaw{}, pitch{}, roll{};
 };
 
+namespace TwinpadOrientationMapper
+{
+// Convert absolute Twinpad turns to the axis order used by Cemu's VPAD orientation.
+inline std::array<float, 3> ToCemuTurns(const TwinpadInputState& input)
+{
+	constexpr float kInt16Turns = 32768.0f;
+	constexpr float kCemuGyroSensitivity = 0.5f;
+	return {
+		static_cast<float>(input.pitch) / kInt16Turns * kCemuGyroSensitivity,
+		static_cast<float>(input.yaw) / kInt16Turns * kCemuGyroSensitivity,
+		static_cast<float>(input.roll) / kInt16Turns * kCemuGyroSensitivity,
+	};
+}
+
+// The monitor visualizes the raw screen-relative values received from Android,
+// independently of the axis remapping used by the VPAD.
+inline std::array<double, 3> ToMonitorRadians(const TwinpadInputState& input)
+{
+	constexpr double kInt16Turns = 32768.0;
+	constexpr double kTau = 6.283185307179586;
+	return {
+		static_cast<double>(input.yaw) / kInt16Turns * kTau,
+		static_cast<double>(input.pitch) / kInt16Turns * kTau,
+		static_cast<double>(input.roll) / kInt16Turns * kTau,
+	};
+}
+
+inline std::array<double, 2> ToMonitorEndPoint(const TwinpadInputState& input, size_t axis, double radius)
+{
+	const double radians = ToMonitorRadians(input)[axis];
+	return {std::cos(radians) * radius * 0.86, -std::sin(radians) * radius * 0.86};
+}
+
+inline bool RollPointsRight(const TwinpadInputState& input)
+{
+	constexpr int kNearZeroTurns = 2048;
+	if (std::abs(static_cast<int>(input.roll)) > kNearZeroTurns)
+		return true;
+	const auto endpoint = ToMonitorEndPoint(input, 2, 1.0);
+	return endpoint[0] > 0.0 && std::abs(endpoint[0]) >= std::abs(endpoint[1]);
+}
+}
+
 enum class TwinpadPixelFormat : uint8_t
 {
 	Rgb8,
@@ -75,6 +118,9 @@ class TwinpadClient
 public:
 	static TwinpadClient& Instance();
 	TwinpadInputState GetInputState() const;
+	TwinpadInputState GetGyroMonitorState() const;
+	void SetGyroMonitorEnabled(bool enabled) { m_gyroMonitorEnabled.store(enabled); }
+	bool IsGyroMonitorEnabled() const { return m_gyroMonitorEnabled.load(); }
 	static bool GetCurrentQr(TwinpadQr& qr);
 	bool Start(bool captureGamePad);
 	void Stop();
@@ -102,6 +148,7 @@ public:
 
 private:
 	friend void TwinpadClient_base64url_test();
+	friend void TwinpadGyroMonitor_test();
 	TwinpadClient() = default;
 	~TwinpadClient();
 	bool ConnectPrimary();
@@ -117,6 +164,7 @@ private:
 	std::atomic_bool m_running{false};
 	std::atomic_bool m_titleActive{false};
 	std::atomic_bool m_connectionRequested{false};
+	std::atomic_bool m_gyroMonitorEnabled{false};
 	std::atomic<uint64_t> m_frameNumber{0};
 	std::atomic<uint64_t> m_audioSequence{0};
 	std::atomic<uint64_t> m_lastFrameSentMs{0};
@@ -125,6 +173,8 @@ private:
 	std::atomic<uint8_t> m_captureFps{30};
 	mutable std::mutex m_inputMutex;
 	TwinpadInputState m_inputState{};
+	TwinpadInputState m_gyroMonitorState{};
+	bool m_hasGyroMonitorState{};
 	bool m_hasInputSeq{};
 	std::string m_receiveBuffer;
 	std::mutex m_lifecycleMutex;

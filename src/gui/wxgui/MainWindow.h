@@ -23,6 +23,7 @@ class DiscordPresence;
 class TitleManager;
 class GraphicPacksWindow2;
 class EmulatedUSBDeviceFrame;
+class TwinpadGyroMonitorFrame;
 class wxLaunchGameEvent;
 
 wxDECLARE_EVENT(wxEVT_LAUNCH_GAME, wxLaunchGameEvent);
@@ -103,6 +104,8 @@ public:
 	void OnFileExit(wxCommandEvent& event);
 	void OnNFCMenu(wxCommandEvent& event);
 	void OnTwinpadMenu(wxCommandEvent& event);
+	void OnGyroMonitorClose(wxCloseEvent& event);
+	void SetTwinpadGyroMonitorEnabled(bool enabled, bool persist = true);
 	void OnOptionsInput(wxCommandEvent& event);
 	void OnAccountSelect(wxCommandEvent& event);
 	void OnConsoleLanguage(wxCommandEvent& event);
@@ -171,6 +174,7 @@ private:
 	MemorySearcherTool* m_toolWindow = nullptr;
 	TitleManager* m_title_manager = nullptr;
 	EmulatedUSBDeviceFrame* m_usb_devices = nullptr;
+	TwinpadGyroMonitorFrame* m_gyroMonitorWindow = nullptr;
 	PadViewFrame* m_padView = nullptr;
 	GraphicPacksWindow2* m_graphic_pack_window = nullptr;
 
@@ -182,6 +186,7 @@ private:
 
 	bool m_menu_visible = false;
 	bool m_game_launched = false;
+	bool m_shuttingDown = false;
 
 	#ifdef ENABLE_DISCORD_RPC
 	std::unique_ptr<DiscordPresence> m_discord;

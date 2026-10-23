@@ -700,6 +700,12 @@ TwinpadInputState TwinpadClient::GetInputState() const
 	return m_inputState;
 }
 
+TwinpadInputState TwinpadClient::GetGyroMonitorState() const
+{
+	std::scoped_lock lock(m_inputMutex);
+	return m_hasGyroMonitorState ? m_gyroMonitorState : TwinpadInputState{};
+}
+
 #ifdef TWINPAD_E2E_TEST_HOOK
 namespace
 {
@@ -812,7 +818,9 @@ void TwinpadClient::CancelConnectionRequest()
 	{
 		std::scoped_lock lock(m_inputMutex);
 		m_inputState = TwinpadInputState{};
+		m_gyroMonitorState = TwinpadInputState{};
 		m_hasInputSeq = false;
+		m_hasGyroMonitorState = false;
 	}
 }
 
@@ -849,7 +857,9 @@ void TwinpadClient::InputLoop()
 				{
 					std::scoped_lock lock(m_inputMutex);
 					m_inputState = TwinpadInputState{};
+					m_gyroMonitorState = TwinpadInputState{};
 					m_hasInputSeq = false;
+					m_hasGyroMonitorState = false;
 				}
 			}
 			if (!m_titleActive.load() || !m_connectionRequested.load())
@@ -890,7 +900,9 @@ void TwinpadClient::InputLoop()
 				{
 					std::scoped_lock lock(m_inputMutex);
 					m_inputState = TwinpadInputState{};
+					m_gyroMonitorState = TwinpadInputState{};
 					m_hasInputSeq = false;
+					m_hasGyroMonitorState = false;
 				}
 				{
 					std::scoped_lock lock(m_audioQueueMutex);
@@ -974,11 +986,14 @@ void TwinpadClient::InputLoop()
 						if (!m_hasInputSeq || report->seq > m_inputState.seq)
 						{
 							m_inputState = *report;
+							m_gyroMonitorState = *report;
+							m_hasGyroMonitorState = report->gyroValid;
 							m_hasInputSeq = true;
+
 							if (report->gyroValid && report->seq % kGyroLogReportInterval == 0)
 								cemuLog_log(LogType::Force,
-								"[TwinpadGyro] stage=cemu_rx seq={} yaw={} pitch={} roll={}",
-								report->seq, report->yaw, report->pitch, report->roll);
+									"[TwinpadGyro] stage=cemu_rx seq={} yaw={} pitch={} roll={}",
+									report->seq, report->yaw, report->pitch, report->roll);
 						}
 					}
 				}
@@ -1009,7 +1024,9 @@ void TwinpadClient::InputLoop()
 			{
 				std::scoped_lock lock(m_inputMutex);
 				m_inputState = TwinpadInputState{};
+				m_gyroMonitorState = TwinpadInputState{};
 				m_hasInputSeq = false;
+				m_hasGyroMonitorState = false;
 			}
 			{
 				std::scoped_lock lock(m_audioQueueMutex);
@@ -1037,7 +1054,9 @@ void TwinpadClient::InputLoop()
 			{
 				std::scoped_lock lock(m_inputMutex);
 				m_inputState = TwinpadInputState{};
+				m_gyroMonitorState = TwinpadInputState{};
 				m_hasInputSeq = false;
+				m_hasGyroMonitorState = false;
 			}
 			{
 				std::scoped_lock lock(m_audioQueueMutex);

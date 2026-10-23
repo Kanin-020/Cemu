@@ -22,6 +22,7 @@
 #include "wxHelper.h"
 #include "helpers/wxHelpers.h"
 #include "PadViewFrame.h"
+#include "TwinpadGyroMonitorFrame.h"
 
 #if BOOST_OS_LINUX || BOOST_OS_MACOS || BOOST_OS_BSD
 #include "resource/embedded/resources.h"
@@ -371,6 +372,7 @@ MainWindow::MainWindow()
 	m_timer->Start(500);
 
 	LoadSettings();
+	SetTwinpadGyroMonitorEnabled(GetWxGUIConfig().twinpad_show_gyro_monitor);
 
 	#ifdef ENABLE_DISCORD_RPC
 	if (GetWxGUIConfig().use_discord_presence)
@@ -391,6 +393,11 @@ MainWindow::MainWindow()
 
 MainWindow::~MainWindow()
 {
+	if (m_gyroMonitorWindow)
+	{
+		m_gyroMonitorWindow->Destroy();
+		m_gyroMonitorWindow = nullptr;
+	}
 	if (m_padView)
 	{
 		m_padView->Destroy();
@@ -445,6 +452,7 @@ wxString MainWindow::GetInitialWindowTitle()
 
 void MainWindow::OnClose(wxCloseEvent& event)
 {
+	m_shuttingDown = true;
 	if (m_twinpadServerPid > 0 && wxProcess::Exists(static_cast<int>(m_twinpadServerPid)))
 	{
 		const int answer = wxMessageBox(wxString::FromUTF8("¿Quieres detener el Servidor Twinpad iniciado por Cemu?"),
@@ -454,9 +462,15 @@ void MainWindow::OnClose(wxCloseEvent& event)
 		m_twinpadServerPid = -1;
 	}
 	TwinpadClient::Instance().Stop();
+	TwinpadClient::Instance().SetGyroMonitorEnabled(false);
 	TwinpadClient::Instance().SetCaptureGamePad(false);
 	if (g_renderer)
 		g_renderer->SetTwinpadCaptureEnabled(false);
+	if (m_gyroMonitorWindow)
+	{
+		m_gyroMonitorWindow->Destroy();
+		m_gyroMonitorWindow = nullptr;
+	}
 	if (m_debugger_window)
 	{
 		m_debugger_window->CleanupForDestroy();
@@ -914,6 +928,9 @@ void MainWindow::OnTwinpadMenu(wxCommandEvent& event)
 	auto* autoConnect = new wxCheckBox(&settings, wxID_ANY, wxString::FromUTF8("Conexión automática"));
 	autoConnect->SetValue(GetWxGUIConfig().twinpad_auto_connect);
 	sizer->Add(autoConnect, 0, wxALL, 12);
+	auto* gyroMonitor = new wxCheckBox(&settings, wxID_ANY, wxString::FromUTF8("Monitor de giroscopio"));
+	gyroMonitor->SetValue(GetWxGUIConfig().twinpad_show_gyro_monitor);
+	sizer->Add(gyroMonitor, 0, wxLEFT | wxRIGHT | wxBOTTOM, 12);
 	sizer->Add(settings.CreateStdDialogButtonSizer(wxOK | wxCANCEL), 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
 	settings.SetSizerAndFit(sizer);
 	settings.CentreOnParent();
@@ -922,8 +939,13 @@ void MainWindow::OnTwinpadMenu(wxCommandEvent& event)
 
 	const bool wasAutoConnect = GetWxGUIConfig().twinpad_auto_connect;
 	const bool autoConnectEnabled = autoConnect->GetValue();
+	SetTwinpadGyroMonitorEnabled(gyroMonitor->GetValue());
+	g_wxConfig.Save();
 	if (wasAutoConnect == autoConnectEnabled)
+	{
+		RecreateMenu();
 		return;
+	}
 	GetWxGUIConfig().twinpad_auto_connect = autoConnectEnabled;
 	g_wxConfig.Save();
 	if (autoConnectEnabled && CafeSystem::IsTitleRunning() && !twinpad.IsConnectionRequested())
@@ -933,6 +955,45 @@ void MainWindow::OnTwinpadMenu(wxCommandEvent& event)
 			g_renderer->SetTwinpadCaptureEnabled(true);
 	}
 	RecreateMenu();
+}
+
+void MainWindow::SetTwinpadGyroMonitorEnabled(bool enabled, bool persist)
+{
+	GetWxGUIConfig().twinpad_show_gyro_monitor = enabled;
+	TwinpadClient::Instance().SetGyroMonitorEnabled(enabled);
+	if (enabled)
+	{
+		if (!m_gyroMonitorWindow)
+		{
+			m_gyroMonitorWindow = new TwinpadGyroMonitorFrame(this);
+			m_gyroMonitorWindow->Bind(wxEVT_CLOSE_WINDOW, &MainWindow::OnGyroMonitorClose, this);
+		}
+		m_gyroMonitorWindow->Show();
+		m_gyroMonitorWindow->Raise();
+		if (persist)
+			g_wxConfig.Save();
+		return;
+	}
+	if (m_gyroMonitorWindow)
+	{
+		auto* window = m_gyroMonitorWindow;
+		m_gyroMonitorWindow = nullptr;
+		window->Destroy();
+	}
+	if (persist)
+		g_wxConfig.Save();
+}
+
+void MainWindow::OnGyroMonitorClose(wxCloseEvent& event)
+{
+	m_gyroMonitorWindow = nullptr;
+	if (!m_shuttingDown)
+	{
+		GetWxGUIConfig().twinpad_show_gyro_monitor = false;
+		TwinpadClient::Instance().SetGyroMonitorEnabled(false);
+		g_wxConfig.Save();
+	}
+	event.Skip();
 }
 
 void MainWindow::OnFileExit(wxCommandEvent& event)

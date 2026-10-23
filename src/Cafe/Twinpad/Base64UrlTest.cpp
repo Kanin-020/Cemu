@@ -48,6 +48,36 @@ void VulkanRenderer_twinpad_readback_test()
 	cemu_assert_debug(VulkanRenderer::FindNewestCompletedTwinpadReadbackSlot(slots, 13) == 0);
 }
 
+void TwinpadOrientationMapper_test()
+{
+	// TEST-077 — verifies SPEC-004: absolute yaw/pitch/roll maps to the Cemu VPAD axis order.
+	TwinpadInputState input{};
+	input.yaw = 8192;
+	input.pitch = -4096;
+	input.roll = 16384;
+	const auto mapped = TwinpadOrientationMapper::ToCemuTurns(input);
+	cemu_assert_debug(std::abs(mapped[0] + 0.0625f) < 0.000001f);
+	cemu_assert_debug(std::abs(mapped[1] - 0.125f) < 0.000001f);
+	cemu_assert_debug(std::abs(mapped[2] - 0.25f) < 0.000001f);
+
+	input.yaw = std::numeric_limits<int16_t>::min();
+	input.pitch = std::numeric_limits<int16_t>::min();
+	input.roll = std::numeric_limits<int16_t>::min();
+	const auto extremes = TwinpadOrientationMapper::ToCemuTurns(input);
+	cemu_assert_debug(extremes[0] == -0.5f);
+	cemu_assert_debug(extremes[1] == -0.5f);
+	cemu_assert_debug(extremes[2] == -0.5f);
+
+	input = TwinpadInputState{};
+	input.yaw = 8192;
+	input.pitch = -4096;
+	input.roll = -262;
+	const auto halfSensitivity = TwinpadOrientationMapper::ToCemuTurns(input);
+	cemu_assert_debug(std::abs(halfSensitivity[0] + 0.0625f) < 0.000001f);
+	cemu_assert_debug(std::abs(halfSensitivity[1] - 0.125f) < 0.000001f);
+	cemu_assert_debug(std::abs(halfSensitivity[2] + (262.0f / 32768.0f * 0.5f)) < 0.000001f);
+}
+
 void TwinpadClient_base64url_test()
 {
 	const auto encode = [](std::initializer_list<uint8_t> bytes) {

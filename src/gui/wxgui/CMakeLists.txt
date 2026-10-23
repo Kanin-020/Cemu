@@ -98,6 +98,8 @@ add_library(CemuWxGui STATIC
   PadViewFrame.h
   TitleManager.cpp
   TitleManager.h
+  TwinpadGyroMonitorFrame.cpp
+  TwinpadGyroMonitorFrame.h
   wxCemuConfig.cpp
   wxCemuConfig.h
   EmulatedUSBDevices/EmulatedUSBDeviceFrame.cpp

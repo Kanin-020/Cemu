@@ -302,20 +302,23 @@ void VPADController::update_touch(VPADStatus_t& status)
 	status.tpProcessed2 = status.tpData;
 }
 
+glm::vec3 VPADController::map_twinpad_orientation(const TwinpadInputState& input)
+{
+	const auto orientationTurns = TwinpadOrientationMapper::ToCemuTurns(input);
+	return {orientationTurns[0], orientationTurns[1], orientationTurns[2]};
+}
+
 void VPADController::update_motion(VPADStatus_t& status, const TwinpadInputState& input)
 {
 	if (input.gyroValid)
 	{
-		constexpr float kTurnScale = 32768.0f;
-		const float yaw = static_cast<float>(input.yaw) / kTurnScale;
-		const float pitch = static_cast<float>(input.pitch) / kTurnScale;
-		const float roll = static_cast<float>(input.roll) / kTurnScale;
-		status.gyroOrientation = {yaw, pitch, roll};
+		const glm::vec3 orientationTurns = map_twinpad_orientation(input);
+		status.gyroOrientation = {-orientationTurns.x, orientationTurns.y, orientationTurns.z};
 		status.acc = {0.0f, 0.0f, 1.0f};
 		status.accMagnitude = 1.0f;
 		status.accAcceleration = 0.0f;
 		status.accXY = {1.0f, 0.0f};
-		Quaternionf orientation(pitch * 360.0f, yaw * 360.0f, roll * 360.0f);
+		Quaternionf orientation(orientationTurns.x * 360.0f, orientationTurns.y * 360.0f, orientationTurns.z * 360.0f);
 		const auto axes = orientation.GetTransposedRotationMatrix();
 		const auto x = std::get<0>(axes);
 		const auto y = std::get<1>(axes);

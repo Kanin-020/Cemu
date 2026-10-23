@@ -56,6 +56,7 @@ public:
 	Type type() const override { return VPAD; }
 
 	void VPADRead(VPADStatus_t& status, const BtnRepeat& repeat);
+	static glm::vec3 map_twinpad_orientation(const TwinpadInputState& input);
 
 	void update() override;
 

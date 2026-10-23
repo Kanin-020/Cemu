@@ -1,7 +1,7 @@
 {
   "name": "cemu",
   "version-string": "1.0",
-  "builtin-baseline": "f0fb3ddba5135b80982668de39dbaa139c00d281",
+  "builtin-baseline": "9849e070ad4c3383890fb1c80ae0c54325e2484a",
   "dependencies": [
     "pugixml",
     "zlib",
@@ -68,7 +68,19 @@
       ]
     },
     "libusb",
-    "openh264"
+    "openh264",
+    {
+      "name": "ffmpeg",
+      "default-features": false,
+      "features": ["avcodec", "amf", "nvcodec", "qsv", "vaapi"],
+      "platform": "windows | linux"
+    },
+    {
+      "name": "ffmpeg",
+      "default-features": false,
+      "features": ["avcodec"],
+      "platform": "!windows & !linux"
+    }
   ],
   "overrides": [
     {
@@ -81,7 +93,7 @@
     },
     {
       "name": "wxwidgets",
-      "version": "3.3.3"
+      "version": "3.3.1"
     }
   ]
 }

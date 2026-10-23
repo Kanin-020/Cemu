@@ -32,6 +32,7 @@ void wxCemuConfig::Load(XMLConfigParser& parser)
 	feral_gamemode = parser.get("feral_gamemode", false);
 	twinpad_auto_connect = parser.get("twinpad_auto_connect", false);
 	twinpad_show_gyro_monitor = parser.get("twinpad_show_gyro_monitor", false);
+	twinpad_hardware_acceleration = parser.get("twinpad_hardware_acceleration", false);
 	check_update = parser.get("check_update", check_update);
 	receive_untested_updates = parser.get("receive_untested_updates", receive_untested_updates);
 	save_screenshot = parser.get("save_screenshot", save_screenshot);
@@ -133,6 +134,7 @@ void wxCemuConfig::Save(XMLConfigParser& config)
 	config.set<bool>("feral_gamemode", feral_gamemode);
 	config.set<bool>("twinpad_auto_connect", twinpad_auto_connect);
 	config.set<bool>("twinpad_show_gyro_monitor", twinpad_show_gyro_monitor);
+	config.set<bool>("twinpad_hardware_acceleration", twinpad_hardware_acceleration);
 	config.set<bool>("check_update", check_update);
 	config.set<bool>("receive_untested_updates", receive_untested_updates);
 	config.set<bool>("save_screenshot", save_screenshot);

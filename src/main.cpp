@@ -164,6 +164,7 @@ void TwinpadOrientationMapper_test();
 void TwinpadGyroMonitor_test();
 void TwinpadClient_base64url_test();
 void TwinpadClient_h264_encoder_test();
+void TwinpadClient_hardware_encoder_test();
 void VulkanRenderer_twinpad_readback_test();
 
 void UnitTests()
@@ -178,6 +179,7 @@ void UnitTests()
 	TwinpadGyroMonitor_test();
 	TwinpadClient_base64url_test();
 	TwinpadClient_h264_encoder_test();
+	TwinpadClient_hardware_encoder_test();
 	VulkanRenderer_twinpad_readback_test();
 }
 

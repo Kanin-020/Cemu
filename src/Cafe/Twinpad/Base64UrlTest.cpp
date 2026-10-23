@@ -172,7 +172,9 @@ void TwinpadClient_h264_encoder_test()
 {
 	// TEST-073 — verifies SPEC-003/006: real OpenH264 access units carry Annex B SPS/PPS and IDR metadata.
 	auto& client = TwinpadClient::Instance();
+	client.SetHardwareAccelerationEnabled(false);
 	client.ResetVideoEncoder();
+	cemu_assert_debug(!client.IsHardwareAccelerationEnabled());
 	client.SetCaptureFps(30);
 	std::vector<uint8_t> frame(64 * 64 * 3);
 	for (size_t index = 0; index < frame.size(); ++index)
@@ -190,7 +192,7 @@ void TwinpadClient_h264_encoder_test()
 		cemu_assert_debug(nals.pps);
 		cemu_assert_debug(nals.constrainedBaselineLevel42);
 	}
-
+	cemu_assert_debug(!client.IsHardwareEncoderActive());
 	std::this_thread::sleep_for(std::chrono::milliseconds(1));
 	TwinpadEncodedFrame second;
 	const bool secondEncoded = client.EncodeGamePadFrame(frame, 64, 64, second);
@@ -211,5 +213,49 @@ void TwinpadClient_h264_encoder_test()
 		cemu_assert_debug(nals.pps);
 		cemu_assert_debug(nals.constrainedBaselineLevel42);
 	}
+
+	client.ResetVideoEncoder();
+	client.SetHardwareAccelerationEnabled(false);
+}
+
+void TwinpadClient_hardware_encoder_test()
+{
+	// TEST-082 — verifies CR-020: hardware encoding is opt-in and uses the same H.264 contract when available.
+	auto& client = TwinpadClient::Instance();
+	client.SetHardwareAccelerationEnabled(false);
+	client.ResetVideoEncoder();
+	cemu_assert_debug(!client.IsHardwareAccelerationEnabled());
+
+	std::vector<uint8_t> frame(64 * 64 * 3, 128);
+	TwinpadEncodedFrame software;
+	const bool softwareEncoded = client.EncodeGamePadFrame(frame, 64, 64, software);
+	cemu_assert_debug(softwareEncoded);
+	if (!softwareEncoded)
+	{
+		client.ResetVideoEncoder();
+		return;
+	}
+	cemu_assert_debug(!client.IsHardwareEncoderActive());
+
+	client.SetHardwareAccelerationEnabled(true);
+	cemu_assert_debug(client.IsHardwareAccelerationEnabled());
+	TwinpadEncodedFrame accelerated;
+	const bool acceleratedEncoded = client.EncodeGamePadFrame(frame, 64, 64, accelerated);
+	cemu_assert_debug(acceleratedEncoded);
+	if (acceleratedEncoded)
+	{
+		const auto nals = InspectAnnexB(accelerated.annexB);
+		cemu_assert_debug(accelerated.idr);
+		cemu_assert_debug(nals.idr);
+		cemu_assert_debug(nals.sps);
+		cemu_assert_debug(nals.pps);
+		cemu_assert_debug(nals.constrainedBaselineLevel42);
+	}
+
+	client.SetHardwareAccelerationEnabled(false);
+	TwinpadEncodedFrame disabled;
+	const bool disabledEncoded = client.EncodeGamePadFrame(frame, 64, 64, disabled);
+	cemu_assert_debug(disabledEncoded);
+	cemu_assert_debug(!client.IsHardwareEncoderActive());
 	client.ResetVideoEncoder();
 }

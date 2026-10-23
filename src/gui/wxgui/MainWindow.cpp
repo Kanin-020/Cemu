@@ -373,6 +373,7 @@ MainWindow::MainWindow()
 
 	LoadSettings();
 	SetTwinpadGyroMonitorEnabled(GetWxGUIConfig().twinpad_show_gyro_monitor);
+	TwinpadClient::Instance().SetHardwareAccelerationEnabled(GetWxGUIConfig().twinpad_hardware_acceleration);
 
 	#ifdef ENABLE_DISCORD_RPC
 	if (GetWxGUIConfig().use_discord_presence)
@@ -931,6 +932,12 @@ void MainWindow::OnTwinpadMenu(wxCommandEvent& event)
 	auto* gyroMonitor = new wxCheckBox(&settings, wxID_ANY, wxString::FromUTF8("Monitor de giroscopio"));
 	gyroMonitor->SetValue(GetWxGUIConfig().twinpad_show_gyro_monitor);
 	sizer->Add(gyroMonitor, 0, wxLEFT | wxRIGHT | wxBOTTOM, 12);
+	auto* hardwareAcceleration = new wxCheckBox(&settings, wxID_ANY,
+		wxString::FromUTF8("Aceleración por hardware (H.264)"));
+	hardwareAcceleration->SetValue(GetWxGUIConfig().twinpad_hardware_acceleration);
+	hardwareAcceleration->SetToolTip(wxString::FromUTF8(
+		"Usa el encoder H.264 de la GPU si está disponible; de lo contrario usa OpenH264 en CPU."));
+	sizer->Add(hardwareAcceleration, 0, wxLEFT | wxRIGHT | wxBOTTOM, 12);
 	sizer->Add(settings.CreateStdDialogButtonSizer(wxOK | wxCANCEL), 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
 	settings.SetSizerAndFit(sizer);
 	settings.CentreOnParent();
@@ -939,6 +946,8 @@ void MainWindow::OnTwinpadMenu(wxCommandEvent& event)
 
 	const bool wasAutoConnect = GetWxGUIConfig().twinpad_auto_connect;
 	const bool autoConnectEnabled = autoConnect->GetValue();
+	GetWxGUIConfig().twinpad_hardware_acceleration = hardwareAcceleration->GetValue();
+	TwinpadClient::Instance().SetHardwareAccelerationEnabled(hardwareAcceleration->GetValue());
 	SetTwinpadGyroMonitorEnabled(gyroMonitor->GetValue());
 	g_wxConfig.Save();
 	if (wasAutoConnect == autoConnectEnabled)

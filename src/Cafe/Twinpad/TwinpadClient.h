@@ -17,6 +17,7 @@ enum class TwinpadVideoMetricStage : uint8_t
 	READBACK_READY,
 	PIXEL_CONVERT,
 	I420_CONVERT,
+	HARDWARE_ENCODER,
 	OPENH264,
 	ENCODE_PIPELINE,
 	BASE64_JSON,
@@ -138,6 +139,9 @@ public:
 		uint16_t height,
 		TwinpadPixelFormat format = TwinpadPixelFormat::Rgb8);
 	void SetCaptureFps(uint8_t fps);
+	void SetHardwareAccelerationEnabled(bool enabled) { m_hardwareAccelerationEnabled.store(enabled); }
+	bool IsHardwareAccelerationEnabled() const { return m_hardwareAccelerationEnabled.load(); }
+	bool IsHardwareEncoderActive();
 	uint8_t GetCaptureFps() const { return m_captureFps.load(); }
 	bool EncodeGamePadFrame(const std::vector<uint8_t>& rgb, uint16_t width, uint16_t height, TwinpadEncodedFrame& output);
 	void ResetVideoEncoder();
@@ -148,6 +152,7 @@ public:
 
 private:
 	friend void TwinpadClient_base64url_test();
+	friend void TwinpadClient_hardware_encoder_test();
 	friend void TwinpadGyroMonitor_test();
 	TwinpadClient() = default;
 	~TwinpadClient();
@@ -171,6 +176,7 @@ private:
 	std::atomic<uint64_t> m_lastFrameQueuedUs{0};
 	std::atomic<uint64_t> m_lastCaptureMs{0};
 	std::atomic<uint8_t> m_captureFps{30};
+	std::atomic_bool m_hardwareAccelerationEnabled{false};
 	mutable std::mutex m_inputMutex;
 	TwinpadInputState m_inputState{};
 	TwinpadInputState m_gyroMonitorState{};
@@ -198,6 +204,9 @@ private:
 	std::thread m_inputThread;
 	std::mutex m_encoderMutex;
 	void* m_videoEncoder{};
+	void* m_hardwareVideoEncoder{};
+	bool m_encoderHardwareActive{};
+	bool m_encoderHardwarePreference{};
 	uint16_t m_encoderWidth{};
 	uint16_t m_encoderHeight{};
 	uint8_t m_encoderFps{};

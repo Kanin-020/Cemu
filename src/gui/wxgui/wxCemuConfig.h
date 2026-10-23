@@ -81,6 +81,7 @@ struct wxCemuConfig
 	ConfigValue<bool> feral_gamemode{false};
 	ConfigValue<bool> twinpad_auto_connect{false};
 	ConfigValue<bool> twinpad_show_gyro_monitor{false};
+	ConfigValue<bool> twinpad_hardware_acceleration{false};
 
 	// max 15 entries
 	static constexpr size_t kMaxRecentEntries = 15;

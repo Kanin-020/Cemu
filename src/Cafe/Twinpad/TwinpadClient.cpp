@@ -8,8 +8,19 @@
 #include <cstdio>
 #include <optional>
 #include <string_view>
+#include <memory>
+#include <cstring>
 #include <rapidjson/document.h>
 #include <wels/codec_api.h>
+extern "C"
+{
+#include <libavcodec/avcodec.h>
+#include <libavcodec/bsf.h>
+#include <libavcodec/defs.h>
+#include <libavutil/avutil.h>
+#include <libavutil/hwcontext.h>
+#include <libavutil/opt.h>
+}
 #include "Cafe/CafeSystem.h"
 #include "Cafe/HW/Latte/Renderer/Renderer.h"
 
@@ -73,6 +84,481 @@ constexpr uint64_t kVideoMetricLogIntervalMs = 5'000;
 constexpr uint32_t kOpenH264SliceCount = 4;
 constexpr uint32_t kGyroLogReportInterval = 10;
 constexpr char kBase64Alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+constexpr uint8_t kH264SpsNalType = 7;
+constexpr uint8_t kH264PpsNalType = 8;
+constexpr uint8_t kH264IdrNalType = 5;
+constexpr uint8_t kAnnexBStartCode[] = {0, 0, 0, 1};
+
+size_t FindAnnexBStartCode(const uint8_t* bytes, size_t size, size_t from, size_t& prefixSize)
+{
+	for (size_t index = from; index + 3 <= size; ++index)
+	{
+		if (bytes[index] != 0 || bytes[index + 1] != 0)
+			continue;
+		if (bytes[index + 2] == 1)
+		{
+			prefixSize = 3;
+			return index;
+		}
+		if (index + 4 <= size && bytes[index + 2] == 0 && bytes[index + 3] == 1)
+		{
+			prefixSize = 4;
+			return index;
+		}
+	}
+	return size;
+}
+
+bool ContainsH264Nal(const uint8_t* bytes, size_t size, uint8_t nalType)
+{
+	size_t prefixSize = 0;
+	size_t start = FindAnnexBStartCode(bytes, size, 0, prefixSize);
+	while (start < size)
+	{
+		const size_t nal = start + prefixSize;
+		if (nal < size && (bytes[nal] & 0x1f) == nalType)
+			return true;
+		size_t nextPrefixSize = 0;
+		start = FindAnnexBStartCode(bytes, size, nal + 1, nextPrefixSize);
+		prefixSize = nextPrefixSize;
+	}
+	return false;
+}
+
+bool ExtractH264ParameterSets(const uint8_t* extradata, size_t size, std::vector<uint8_t>& output)
+{
+	output.clear();
+	if (!extradata || size == 0)
+		return false;
+	if (extradata[0] == 1 && size >= 7)
+	{
+		size_t offset = 5;
+		const uint8_t spsCount = extradata[offset++] & 0x1f;
+		for (uint8_t index = 0; index < spsCount; ++index)
+		{
+			if (offset + 2 > size)
+				return false;
+			const size_t nalSize = (static_cast<size_t>(extradata[offset]) << 8) | extradata[offset + 1];
+			offset += 2;
+			if (nalSize == 0 || nalSize > size - offset)
+				return false;
+			if ((extradata[offset] & 0x1f) == kH264SpsNalType)
+			{
+				output.insert(output.end(), std::begin(kAnnexBStartCode), std::end(kAnnexBStartCode));
+				output.insert(output.end(), extradata + offset, extradata + offset + nalSize);
+			}
+			offset += nalSize;
+		}
+		if (offset >= size)
+			return false;
+		const uint8_t ppsCount = extradata[offset++];
+		for (uint8_t index = 0; index < ppsCount; ++index)
+		{
+			if (offset + 2 > size)
+				return false;
+			const size_t nalSize = (static_cast<size_t>(extradata[offset]) << 8) | extradata[offset + 1];
+			offset += 2;
+			if (nalSize == 0 || nalSize > size - offset)
+				return false;
+			if ((extradata[offset] & 0x1f) == kH264PpsNalType)
+			{
+				output.insert(output.end(), std::begin(kAnnexBStartCode), std::end(kAnnexBStartCode));
+				output.insert(output.end(), extradata + offset, extradata + offset + nalSize);
+			}
+			offset += nalSize;
+		}
+	}
+	else
+	{
+		size_t prefixSize = 0;
+		size_t start = FindAnnexBStartCode(extradata, size, 0, prefixSize);
+		while (start < size)
+		{
+			const size_t nal = start + prefixSize;
+			size_t nextPrefixSize = 0;
+			const size_t next = FindAnnexBStartCode(extradata, size, nal + 1, nextPrefixSize);
+			const size_t nalEnd = next < size ? next : size;
+			if (nal < nalEnd && ((extradata[nal] & 0x1f) == kH264SpsNalType
+				|| (extradata[nal] & 0x1f) == kH264PpsNalType))
+			{
+				output.insert(output.end(), std::begin(kAnnexBStartCode), std::end(kAnnexBStartCode));
+				output.insert(output.end(), extradata + nal, extradata + nalEnd);
+			}
+			start = next;
+			prefixSize = nextPrefixSize;
+		}
+	}
+	return ContainsH264Nal(output.data(), output.size(), kH264SpsNalType)
+		&& ContainsH264Nal(output.data(), output.size(), kH264PpsNalType);
+}
+
+bool HasConstrainedBaselineLevel42(const std::vector<uint8_t>& annexB);
+
+struct TwinpadFfmpegEncoder
+{
+	AVCodecContext* context{};
+	AVFrame* frame{};
+	AVFrame* softwareFrame{};
+	AVBufferRef* hwDevice{};
+	AVBufferRef* hwFrames{};
+	bool hardwareFrames{};
+	bool nv12{};
+	bool annexBFilterEnabled{};
+	AVPacket* packet{};
+	AVBSFContext* annexBFilter{};
+	std::vector<uint8_t> annexBParameterSets;
+	std::string name;
+
+	~TwinpadFfmpegEncoder()
+	{
+		av_bsf_free(&annexBFilter);
+		av_packet_free(&packet);
+		av_frame_free(&softwareFrame);
+		av_frame_free(&frame);
+		av_buffer_unref(&hwFrames);
+		av_buffer_unref(&hwDevice);
+		avcodec_free_context(&context);
+	}
+
+	bool Encode(const uint8_t* y, const uint8_t* u, const uint8_t* v,
+		int width, int height, int64_t frameIndex, bool forceIdr,
+		std::vector<uint8_t>& output)
+	{
+		if (!softwareFrame || !context || !packet || (hardwareFrames && !frame)
+			|| av_frame_make_writable(softwareFrame) < 0)
+			return false;
+		for (int row = 0; row < height; ++row)
+			std::memcpy(softwareFrame->data[0] + row * softwareFrame->linesize[0], y + row * width, width);
+		if (nv12)
+		{
+			for (int row = 0; row < height / 2; ++row)
+				for (int column = 0; column < width / 2; ++column)
+				{
+					softwareFrame->data[1][row * softwareFrame->linesize[1] + column * 2] = u[row * (width / 2) + column];
+					softwareFrame->data[1][row * softwareFrame->linesize[1] + column * 2 + 1] = v[row * (width / 2) + column];
+				}
+		}
+		else
+		{
+			for (int row = 0; row < height / 2; ++row)
+			{
+				std::memcpy(softwareFrame->data[1] + row * softwareFrame->linesize[1], u + row * (width / 2), width / 2);
+				std::memcpy(softwareFrame->data[2] + row * softwareFrame->linesize[2], v + row * (width / 2), width / 2);
+			}
+		}
+		softwareFrame->pts = frameIndex;
+		softwareFrame->pict_type = forceIdr ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
+		if (forceIdr)
+			softwareFrame->flags |= AV_FRAME_FLAG_KEY;
+		else
+			softwareFrame->flags &= ~AV_FRAME_FLAG_KEY;
+		softwareFrame->color_range = AVCOL_RANGE_MPEG;
+
+		AVFrame* frameToEncode = softwareFrame;
+		if (hardwareFrames)
+		{
+			av_frame_unref(frame);
+			if (!context->hw_frames_ctx || av_hwframe_get_buffer(context->hw_frames_ctx, frame, 0) < 0
+				|| av_hwframe_transfer_data(frame, softwareFrame, 0) < 0)
+			{
+				av_frame_unref(frame);
+				return false;
+			}
+			frame->pts = frameIndex;
+			frame->pict_type = softwareFrame->pict_type;
+			if (forceIdr)
+				frame->flags |= AV_FRAME_FLAG_KEY;
+			else
+				frame->flags &= ~AV_FRAME_FLAG_KEY;
+			frameToEncode = frame;
+		}
+		else if (softwareFrame->format != context->pix_fmt)
+		{
+			return false;
+		}
+
+		av_packet_unref(packet);
+		if (avcodec_send_frame(context, frameToEncode) < 0)
+		{
+			if (hardwareFrames)
+				av_frame_unref(frame);
+			return false;
+		}
+		int receiveResult = avcodec_receive_packet(context, packet);
+		if (receiveResult == AVERROR(EAGAIN))
+		{
+			if (hardwareFrames)
+				av_frame_unref(frame);
+			return false;
+		}
+		if (receiveResult < 0)
+		{
+			if (hardwareFrames)
+				av_frame_unref(frame);
+			return false;
+		}
+		if (hardwareFrames)
+			av_frame_unref(frame);
+		if (annexBFilterEnabled)
+		{
+			if (av_bsf_send_packet(annexBFilter, packet) < 0)
+			{
+				av_packet_unref(packet);
+				return false;
+			}
+			av_packet_unref(packet);
+			if (av_bsf_receive_packet(annexBFilter, packet) < 0)
+			{
+				av_packet_unref(packet);
+				return false;
+			}
+		}
+		if (packet->size <= 0 || packet->size > 4 * 1024 * 1024)
+		{
+			av_packet_unref(packet);
+			return false;
+		}
+		if (ContainsH264Nal(packet->data, static_cast<size_t>(packet->size), kH264IdrNalType)
+			&& (!ContainsH264Nal(packet->data, static_cast<size_t>(packet->size), kH264SpsNalType)
+				|| !ContainsH264Nal(packet->data, static_cast<size_t>(packet->size), kH264PpsNalType))
+			&& !annexBParameterSets.empty())
+		{
+			std::vector<uint8_t> parameterSetsAndFrame = annexBParameterSets;
+			parameterSetsAndFrame.insert(parameterSetsAndFrame.end(), packet->data, packet->data + packet->size);
+			av_packet_unref(packet);
+			if (av_new_packet(packet, static_cast<int>(parameterSetsAndFrame.size())) < 0)
+				return false;
+			std::memcpy(packet->data, parameterSetsAndFrame.data(), parameterSetsAndFrame.size());
+		}
+		output.assign(packet->data, packet->data + packet->size);
+		av_packet_unref(packet);
+		if (forceIdr && (!ContainsH264Nal(output.data(), output.size(), kH264IdrNalType)
+			|| !ContainsH264Nal(output.data(), output.size(), kH264SpsNalType)
+			|| !ContainsH264Nal(output.data(), output.size(), kH264PpsNalType)
+			|| !HasConstrainedBaselineLevel42(output)))
+			return false;
+		return !output.empty();
+	}
+};
+
+std::unique_ptr<TwinpadFfmpegEncoder> CreateHardwareH264Encoder(uint16_t width, uint16_t height, uint8_t fps)
+{
+#if BOOST_OS_WINDOWS
+	static constexpr const char* candidates[] = {"h264_nvenc", "h264_qsv", "h264_amf"};
+#elif BOOST_OS_MACOS
+	static constexpr const char* candidates[] = {"h264_videotoolbox"};
+#elif BOOST_OS_LINUX
+	static constexpr const char* candidates[] = {"h264_nvenc", "h264_qsv", "h264_amf", "h264_vaapi"};
+#else
+	return nullptr;
+#endif
+	for (const char* candidateName : candidates)
+	{
+		const AVCodec* codec = avcodec_find_encoder_by_name(candidateName);
+		if (!codec)
+			continue;
+		auto encoder = std::make_unique<TwinpadFfmpegEncoder>();
+		encoder->name = candidateName;
+		encoder->context = avcodec_alloc_context3(codec);
+		if (!encoder->context)
+			continue;
+		auto* context = encoder->context;
+		context->width = width;
+		context->height = height;
+		const bool qsv = encoder->name == "h264_qsv";
+		const bool vaapi = encoder->name == "h264_vaapi";
+		encoder->hardwareFrames = qsv || vaapi;
+		encoder->nv12 = encoder->hardwareFrames || encoder->name == "h264_amf"
+			|| encoder->name == "h264_videotoolbox";
+		const AVPixelFormat hardwarePixelFormat = vaapi ? AV_PIX_FMT_VAAPI : AV_PIX_FMT_QSV;
+		context->pix_fmt = encoder->hardwareFrames ? hardwarePixelFormat
+			: (encoder->nv12 ? AV_PIX_FMT_NV12 : AV_PIX_FMT_YUV420P);
+		if (encoder->hardwareFrames)
+		{
+			const AVHWDeviceType deviceType = vaapi ? AV_HWDEVICE_TYPE_VAAPI : AV_HWDEVICE_TYPE_QSV;
+			if (av_hwdevice_ctx_create(&encoder->hwDevice, deviceType, nullptr, nullptr, 0) < 0)
+				continue;
+			encoder->hwFrames = av_hwframe_ctx_alloc(encoder->hwDevice);
+			if (!encoder->hwFrames)
+				continue;
+			auto* frames = reinterpret_cast<AVHWFramesContext*>(encoder->hwFrames->data);
+			frames->format = hardwarePixelFormat;
+			frames->sw_format = AV_PIX_FMT_NV12;
+			frames->width = width;
+			frames->height = height;
+			frames->initial_pool_size = 8;
+			if (av_hwframe_ctx_init(encoder->hwFrames) < 0)
+				continue;
+			context->hw_frames_ctx = av_buffer_ref(encoder->hwFrames);
+			if (!context->hw_frames_ctx)
+				continue;
+		}
+		context->time_base = AVRational{1, fps};
+		context->framerate = AVRational{fps, 1};
+		context->bit_rate = kOpenH264Bitrate;
+		context->rc_max_rate = kOpenH264Bitrate;
+		context->rc_buffer_size = kOpenH264Bitrate;
+		context->color_range = AVCOL_RANGE_MPEG;
+		context->gop_size = fps * 2;
+		context->max_b_frames = 0;
+		context->profile = AV_PROFILE_H264_CONSTRAINED_BASELINE;
+		context->level = 42;
+		context->thread_count = 1;
+		context->flags |= AV_CODEC_FLAG_LOW_DELAY;
+		if (!vaapi)
+			context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+		AVDictionary* options = nullptr;
+		if (encoder->name == "h264_nvenc")
+		{
+			av_dict_set(&options, "preset", "p1", 0);
+			av_dict_set(&options, "tune", "ll", 0);
+			av_dict_set(&options, "forced-idr", "1", 0);
+		}
+		else if (encoder->name == "h264_videotoolbox")
+		{
+			av_dict_set(&options, "realtime", "1", 0);
+			av_dict_set(&options, "allow_sw", "0", 0);
+			av_dict_set(&options, "profile", "constrained_baseline", 0);
+		}
+		else if (encoder->name == "h264_qsv")
+		{
+			av_dict_set(&options, "preset", "veryfast", 0);
+			av_dict_set(&options, "async_depth", "1", 0);
+			av_dict_set(&options, "forced_idr", "1", 0);
+			av_dict_set(&options, "profile", "constrained_baseline", 0);
+		}
+		else if (encoder->name == "h264_vaapi")
+		{
+			av_dict_set(&options, "rc_mode", "CBR", 0);
+			av_dict_set(&options, "profile", "constrained_baseline", 0);
+		}
+		else if (encoder->name == "h264_amf")
+		{
+			av_dict_set(&options, "usage", "ultralowlatency", 0);
+			av_dict_set(&options, "bf", "0", 0);
+			av_dict_set(&options, "profile", "constrained_baseline", 0);
+		}
+		const int openResult = avcodec_open2(context, codec, &options);
+		const bool optionsAccepted = av_dict_count(options) == 0;
+		av_dict_free(&options);
+		if (openResult < 0 || !optionsAccepted
+			|| context->profile != AV_PROFILE_H264_CONSTRAINED_BASELINE
+			|| context->level != 42 || context->max_b_frames != 0)
+			continue;
+		encoder->frame = av_frame_alloc();
+		encoder->softwareFrame = av_frame_alloc();
+		encoder->packet = av_packet_alloc();
+		if (!encoder->frame || !encoder->softwareFrame || !encoder->packet)
+			continue;
+		const size_t extraDataSize = static_cast<size_t>(std::max(context->extradata_size, 0));
+		const bool avcConfiguration = extraDataSize > 0 && context->extradata[0] == 1;
+		const bool hasParameterSets = avcConfiguration
+			? ExtractH264ParameterSets(context->extradata, extraDataSize, encoder->annexBParameterSets)
+			: extraDataSize == 0;
+		if (avcConfiguration && (!hasParameterSets
+			|| !HasConstrainedBaselineLevel42(encoder->annexBParameterSets)))
+			continue;
+		if (avcConfiguration)
+		{
+			const AVBitStreamFilter* filter = av_bsf_get_by_name("h264_mp4toannexb");
+			if (!filter || !hasParameterSets || av_bsf_alloc(filter, &encoder->annexBFilter) < 0
+				|| avcodec_parameters_from_context(encoder->annexBFilter->par_in, context) < 0)
+				continue;
+			av_freep(&encoder->annexBFilter->par_in->extradata);
+			encoder->annexBFilter->par_in->extradata = static_cast<uint8_t*>(
+				av_mallocz(context->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE));
+			if (!encoder->annexBFilter->par_in->extradata)
+				continue;
+			std::memcpy(encoder->annexBFilter->par_in->extradata, context->extradata, context->extradata_size);
+			encoder->annexBFilter->par_in->extradata_size = context->extradata_size;
+			encoder->annexBFilter->time_base_in = context->time_base;
+			if (av_bsf_init(encoder->annexBFilter) < 0)
+				continue;
+			encoder->annexBFilterEnabled = true;
+		}
+		encoder->softwareFrame->format = encoder->hardwareFrames
+			? AV_PIX_FMT_NV12
+			: (context->pix_fmt == AV_PIX_FMT_NV12 ? AV_PIX_FMT_NV12 : AV_PIX_FMT_YUV420P);
+		encoder->softwareFrame->width = width;
+		encoder->softwareFrame->height = height;
+		if (av_frame_get_buffer(encoder->softwareFrame, 32) < 0)
+			continue;
+		return encoder;
+	}
+	return nullptr;
+}
+
+ISVCEncoder* CreateOpenH264Encoder(uint16_t width, uint16_t height, uint8_t fps)
+{
+	ISVCEncoder* encoder = nullptr;
+	if (WelsCreateSVCEncoder(&encoder) != 0 || !encoder)
+		return nullptr;
+	SEncParamExt params{};
+	if (encoder->GetDefaultParams(&params) != 0)
+	{
+		WelsDestroySVCEncoder(encoder);
+		return nullptr;
+	}
+	params.iUsageType = SCREEN_CONTENT_REAL_TIME;
+	params.iComplexityMode = LOW_COMPLEXITY;
+	params.iPicWidth = width;
+	params.iPicHeight = height;
+	params.iTargetBitrate = kOpenH264Bitrate;
+	params.iRCMode = RC_BITRATE_MODE;
+	params.fMaxFrameRate = static_cast<float>(fps);
+	params.iSpatialLayerNum = 1;
+	params.iTemporalLayerNum = 1;
+	params.uiIntraPeriod = fps * 2;
+	params.bEnableFrameSkip = false;
+	params.bEnableSceneChangeDetect = false;
+	params.eSpsPpsIdStrategy = CONSTANT_ID;
+	params.iEntropyCodingModeFlag = 0;
+	params.sSpatialLayers[0].iVideoWidth = width;
+	params.sSpatialLayers[0].iVideoHeight = height;
+	params.sSpatialLayers[0].fFrameRate = static_cast<float>(fps);
+	params.sSpatialLayers[0].iSpatialBitrate = kOpenH264Bitrate;
+	params.sSpatialLayers[0].iMaxSpatialBitrate = kOpenH264Bitrate;
+	params.sSpatialLayers[0].uiProfileIdc = PRO_BASELINE;
+	params.sSpatialLayers[0].uiLevelIdc = LEVEL_4_2;
+	params.sSpatialLayers[0].sSliceArgument.uiSliceMode = SM_FIXEDSLCNUM_SLICE;
+	params.sSpatialLayers[0].sSliceArgument.uiSliceNum = kOpenH264SliceCount;
+	params.iMultipleThreadIdc = static_cast<unsigned short>(kOpenH264SliceCount);
+	if (encoder->InitializeExt(&params) != 0)
+	{
+		WelsDestroySVCEncoder(encoder);
+		return nullptr;
+	}
+	int colorFormat = videoFormatI420;
+	if (encoder->SetOption(ENCODER_OPTION_DATAFORMAT, &colorFormat) != 0)
+	{
+		encoder->Uninitialize();
+		WelsDestroySVCEncoder(encoder);
+		return nullptr;
+	}
+	return encoder;
+}
+
+bool ContainsIdrNal(const std::vector<uint8_t>& annexB)
+{
+	return ContainsH264Nal(annexB.data(), annexB.size(), kH264IdrNalType);
+}
+
+bool HasConstrainedBaselineLevel42(const std::vector<uint8_t>& annexB)
+{
+	size_t prefixSize = 0;
+	size_t start = FindAnnexBStartCode(annexB.data(), annexB.size(), 0, prefixSize);
+	while (start < annexB.size())
+	{
+		const size_t nal = start + prefixSize;
+		if (nal + 3 < annexB.size() && (annexB[nal] & 0x1f) == kH264SpsNalType
+			&& annexB[nal + 1] == 66 && (annexB[nal + 2] & 0x40) != 0 && annexB[nal + 3] == 42)
+			return true;
+		size_t nextPrefixSize = 0;
+		start = FindAnnexBStartCode(annexB.data(), annexB.size(), nal + 1, nextPrefixSize);
+		prefixSize = nextPrefixSize;
+	}
+	return false;
+}
 
 uint8_t SrgbToRgb(uint8_t value)
 {
@@ -169,9 +655,21 @@ TwinpadClient::~TwinpadClient()
 	ResetVideoEncoder();
 }
 
+bool TwinpadClient::IsHardwareEncoderActive()
+{
+	std::scoped_lock encoderLock(m_encoderMutex);
+	return m_encoderHardwareActive;
+}
+
 void TwinpadClient::ResetVideoEncoder()
 {
 	std::scoped_lock encoderLock(m_encoderMutex);
+	const bool hardwareRequested = m_hardwareAccelerationEnabled.load();
+	if (m_hardwareVideoEncoder)
+	{
+		delete static_cast<TwinpadFfmpegEncoder*>(m_hardwareVideoEncoder);
+		m_hardwareVideoEncoder = nullptr;
+	}
 	if (m_videoEncoder)
 	{
 		auto* encoder = static_cast<ISVCEncoder*>(m_videoEncoder);
@@ -182,6 +680,8 @@ void TwinpadClient::ResetVideoEncoder()
 	m_encoderWidth = 0;
 	m_encoderHeight = 0;
 	m_encoderFps = 0;
+	m_encoderHardwareActive = false;
+	m_encoderHardwarePreference = hardwareRequested;
 	m_encoderFrameIndex = 0;
 	m_forceNextIdr = true;
 	m_lastIdrTimestampUs = 0;
@@ -430,8 +930,17 @@ bool TwinpadClient::EncodeGamePadFrame(
 	const uint64_t nowUs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
 		std::chrono::steady_clock::now().time_since_epoch()).count());
 	std::scoped_lock lock(m_encoderMutex);
-	if (!m_videoEncoder || m_encoderWidth != width || m_encoderHeight != height || m_encoderFps != fps)
+	const bool hardwareRequested = m_hardwareAccelerationEnabled.load();
+	const bool encoderExists = m_videoEncoder || m_hardwareVideoEncoder;
+	const bool encoderConfigChanged = m_encoderWidth != width || m_encoderHeight != height || m_encoderFps != fps;
+	const bool hardwarePreferenceChanged = hardwareRequested != m_encoderHardwarePreference;
+	if (!encoderExists || encoderConfigChanged || hardwarePreferenceChanged)
 	{
+		if (m_hardwareVideoEncoder)
+		{
+			delete static_cast<TwinpadFfmpegEncoder*>(m_hardwareVideoEncoder);
+			m_hardwareVideoEncoder = nullptr;
+		}
 		if (m_videoEncoder)
 		{
 			auto* oldEncoder = static_cast<ISVCEncoder*>(m_videoEncoder);
@@ -439,53 +948,30 @@ bool TwinpadClient::EncodeGamePadFrame(
 			WelsDestroySVCEncoder(oldEncoder);
 			m_videoEncoder = nullptr;
 		}
-
-		ISVCEncoder* encoder = nullptr;
-		if (WelsCreateSVCEncoder(&encoder) != 0 || !encoder)
-			return false;
-		SEncParamExt params{};
-		if (encoder->GetDefaultParams(&params) != 0)
+		m_encoderHardwareActive = false;
+		m_encoderHardwarePreference = hardwareRequested;
+		if (hardwareRequested)
 		{
-			WelsDestroySVCEncoder(encoder);
-			return false;
+			auto hardwareEncoder = CreateHardwareH264Encoder(width, height, fps);
+			if (hardwareEncoder)
+			{
+				m_hardwareVideoEncoder = hardwareEncoder.release();
+				m_encoderHardwareActive = true;
+				cemuLog_log(LogType::Force, "[TwinpadVideo] encoder=hardware backend={}",
+					static_cast<TwinpadFfmpegEncoder*>(m_hardwareVideoEncoder)->name);
+			}
+			else
+			{
+				cemuLog_log(LogType::Force, "[TwinpadVideo] hardware encoder unavailable; falling back to OpenH264 CPU");
+			}
 		}
-		params.iUsageType = SCREEN_CONTENT_REAL_TIME;
-		params.iComplexityMode = LOW_COMPLEXITY;
-		params.iPicWidth = width;
-		params.iPicHeight = height;
-		params.iTargetBitrate = kOpenH264Bitrate;
-		params.iRCMode = RC_BITRATE_MODE;
-		params.fMaxFrameRate = static_cast<float>(fps);
-		params.iSpatialLayerNum = 1;
-		params.iTemporalLayerNum = 1;
-		params.uiIntraPeriod = fps * 2;
-		params.bEnableFrameSkip = false;
-		params.bEnableSceneChangeDetect = false;
-		params.eSpsPpsIdStrategy = CONSTANT_ID;
-		params.iEntropyCodingModeFlag = 0;
-		params.sSpatialLayers[0].iVideoWidth = width;
-		params.sSpatialLayers[0].iVideoHeight = height;
-		params.sSpatialLayers[0].fFrameRate = static_cast<float>(fps);
-		params.sSpatialLayers[0].iSpatialBitrate = kOpenH264Bitrate;
-		params.sSpatialLayers[0].iMaxSpatialBitrate = kOpenH264Bitrate;
-		params.sSpatialLayers[0].uiProfileIdc = PRO_BASELINE;
-		params.sSpatialLayers[0].uiLevelIdc = LEVEL_4_2;
-		params.sSpatialLayers[0].sSliceArgument.uiSliceMode = SM_FIXEDSLCNUM_SLICE;
-		params.sSpatialLayers[0].sSliceArgument.uiSliceNum = kOpenH264SliceCount;
-		params.iMultipleThreadIdc = static_cast<unsigned short>(kOpenH264SliceCount);
-		if (encoder->InitializeExt(&params) != 0)
+		if (!m_encoderHardwareActive)
 		{
-			WelsDestroySVCEncoder(encoder);
-			return false;
+			m_videoEncoder = CreateOpenH264Encoder(width, height, fps);
+			if (!m_videoEncoder)
+				return false;
+			cemuLog_log(LogType::Force, "[TwinpadVideo] encoder=OpenH264 CPU");
 		}
-		int colorFormat = videoFormatI420;
-		if (encoder->SetOption(ENCODER_OPTION_DATAFORMAT, &colorFormat) != 0)
-		{
-			encoder->Uninitialize();
-			WelsDestroySVCEncoder(encoder);
-			return false;
-		}
-		m_videoEncoder = encoder;
 		m_encoderWidth = width;
 		m_encoderHeight = height;
 		m_encoderFps = fps;
@@ -540,48 +1026,142 @@ bool TwinpadClient::EncodeGamePadFrame(
 	RecordVideoMetric(TwinpadVideoMetricStage::I420_CONVERT,
 		std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - i420Started).count());
 
-	SSourcePicture picture{};
-	picture.iColorFormat = videoFormatI420;
-	picture.iPicWidth = width;
-	picture.iPicHeight = height;
-	picture.iStride[0] = width;
-	picture.iStride[1] = width / 2;
-	picture.iStride[2] = width / 2;
-	picture.pData[0] = i420.data();
-	picture.pData[1] = uPlane;
-	picture.pData[2] = vPlane;
-	picture.uiTimeStamp = static_cast<long long>(m_encoderFrameIndex * 1000 / fps);
-	auto* encoder = static_cast<ISVCEncoder*>(m_videoEncoder);
-	if ((m_forceNextIdr || nowUs - m_lastIdrTimestampUs >= kIdrIntervalMs * 1000)
-		&& encoder->ForceIntraFrame(true) != 0)
-		return false;
-	SFrameBSInfo info{};
-	const auto openH264Started = std::chrono::steady_clock::now();
-	const int encodeResult = encoder->EncodeFrame(&picture, &info);
-	RecordVideoMetric(TwinpadVideoMetricStage::OPENH264,
-		std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - openH264Started).count());
-	if (encodeResult != 0 || info.eFrameType == videoFrameTypeSkip || info.eFrameType == videoFrameTypeInvalid)
-		return false;
-
 	output.annexB.clear();
-	for (int layerIndex = 0; layerIndex < info.iLayerNum; ++layerIndex)
+	bool forceIdr = m_forceNextIdr || nowUs - m_lastIdrTimestampUs >= kIdrIntervalMs * 1000;
+	auto fallbackToOpenH264 = [&]() {
+		delete static_cast<TwinpadFfmpegEncoder*>(m_hardwareVideoEncoder);
+		m_hardwareVideoEncoder = nullptr;
+		m_encoderHardwareActive = false;
+		m_videoEncoder = CreateOpenH264Encoder(width, height, fps);
+		if (!m_videoEncoder)
+			return false;
+		output.annexB.clear();
+		m_forceNextIdr = true;
+		m_lastIdrTimestampUs = 0;
+		m_encoderEpochUs = nowUs;
+		m_encoderFrameIndex = 0;
+		forceIdr = true;
+		cemuLog_log(LogType::Force, "[TwinpadVideo] hardware encoder violated the H.264 contract; falling back to OpenH264 CPU");
+		return true;
+	};
+	if (m_encoderHardwareActive)
 	{
-		const auto& layer = info.sLayerInfo[layerIndex];
-		const uint8_t* nalData = layer.pBsBuf;
-		for (int nalIndex = 0; nalIndex < layer.iNalCount; ++nalIndex)
+		const auto hardwareStarted = std::chrono::steady_clock::now();
+		auto* encoder = static_cast<TwinpadFfmpegEncoder*>(m_hardwareVideoEncoder);
+		const bool hardwareEncoded = encoder->Encode(i420.data(), uPlane, vPlane, width, height,
+			static_cast<int64_t>(m_encoderFrameIndex), forceIdr, output.annexB);
+		if (!hardwareEncoded)
 		{
-			const int nalLength = layer.pNalLengthInByte[nalIndex];
-			if (nalLength <= 0 || output.annexB.size() + static_cast<size_t>(nalLength) > 4 * 1024 * 1024)
+			if (!fallbackToOpenH264())
 				return false;
-			output.annexB.insert(output.annexB.end(), nalData, nalData + nalLength);
-			nalData += nalLength;
+		}
+		else
+		{
+			RecordVideoMetric(TwinpadVideoMetricStage::HARDWARE_ENCODER,
+				std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - hardwareStarted).count());
+			output.idr = ContainsIdrNal(output.annexB);
+			if (forceIdr && (!output.idr
+				|| !ContainsH264Nal(output.annexB.data(), output.annexB.size(), kH264SpsNalType)
+				|| !ContainsH264Nal(output.annexB.data(), output.annexB.size(), kH264PpsNalType)
+				|| !HasConstrainedBaselineLevel42(output.annexB)))
+			{
+				if (!fallbackToOpenH264())
+					return false;
+			}
+		}
+		if (!hardwareEncoded || !m_encoderHardwareActive)
+		{
+			SSourcePicture picture{};
+			picture.iColorFormat = videoFormatI420;
+			picture.iPicWidth = width;
+			picture.iPicHeight = height;
+			picture.iStride[0] = width;
+			picture.iStride[1] = width / 2;
+			picture.iStride[2] = width / 2;
+			picture.pData[0] = i420.data();
+			picture.pData[1] = uPlane;
+			picture.pData[2] = vPlane;
+			picture.uiTimeStamp = static_cast<long long>(m_encoderFrameIndex * 1000 / fps);
+			auto* cpuEncoder = static_cast<ISVCEncoder*>(m_videoEncoder);
+			if (forceIdr && cpuEncoder->ForceIntraFrame(true) != 0)
+				return false;
+			SFrameBSInfo info{};
+			const auto openH264Started = std::chrono::steady_clock::now();
+			const int encodeResult = cpuEncoder->EncodeFrame(&picture, &info);
+			RecordVideoMetric(TwinpadVideoMetricStage::OPENH264,
+				std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - openH264Started).count());
+			if (encodeResult != 0 || info.eFrameType == videoFrameTypeSkip || info.eFrameType == videoFrameTypeInvalid)
+				return false;
+			for (int layerIndex = 0; layerIndex < info.iLayerNum; ++layerIndex)
+			{
+				const auto& layer = info.sLayerInfo[layerIndex];
+				const uint8_t* nalData = layer.pBsBuf;
+				for (int nalIndex = 0; nalIndex < layer.iNalCount; ++nalIndex)
+				{
+					const int nalLength = layer.pNalLengthInByte[nalIndex];
+					if (nalLength <= 0 || output.annexB.size() + static_cast<size_t>(nalLength) > 4 * 1024 * 1024)
+					return false;
+					output.annexB.insert(output.annexB.end(), nalData, nalData + nalLength);
+					nalData += nalLength;
+				}
+			}
+			if (output.annexB.empty())
+				return false;
+			output.idr = info.eFrameType == videoFrameTypeIDR;
+			if (output.idr && (!ContainsH264Nal(output.annexB.data(), output.annexB.size(), kH264SpsNalType)
+				|| !ContainsH264Nal(output.annexB.data(), output.annexB.size(), kH264PpsNalType)
+				|| !HasConstrainedBaselineLevel42(output.annexB)))
+				return false;
 		}
 	}
-	if (output.annexB.empty())
-		return false;
+	else
+	{
+		SSourcePicture picture{};
+		picture.iColorFormat = videoFormatI420;
+		picture.iPicWidth = width;
+		picture.iPicHeight = height;
+		picture.iStride[0] = width;
+		picture.iStride[1] = width / 2;
+		picture.iStride[2] = width / 2;
+		picture.pData[0] = i420.data();
+		picture.pData[1] = uPlane;
+		picture.pData[2] = vPlane;
+		picture.uiTimeStamp = static_cast<long long>(m_encoderFrameIndex * 1000 / fps);
+		auto* encoder = static_cast<ISVCEncoder*>(m_videoEncoder);
+		if (forceIdr && encoder->ForceIntraFrame(true) != 0)
+			return false;
+		SFrameBSInfo info{};
+		const auto openH264Started = std::chrono::steady_clock::now();
+		const int encodeResult = encoder->EncodeFrame(&picture, &info);
+		RecordVideoMetric(TwinpadVideoMetricStage::OPENH264,
+			std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - openH264Started).count());
+		if (encodeResult != 0 || info.eFrameType == videoFrameTypeSkip || info.eFrameType == videoFrameTypeInvalid)
+			return false;
+		for (int layerIndex = 0; layerIndex < info.iLayerNum; ++layerIndex)
+		{
+			const auto& layer = info.sLayerInfo[layerIndex];
+			const uint8_t* nalData = layer.pBsBuf;
+			for (int nalIndex = 0; nalIndex < layer.iNalCount; ++nalIndex)
+			{
+				const int nalLength = layer.pNalLengthInByte[nalIndex];
+				if (nalLength <= 0 || output.annexB.size() + static_cast<size_t>(nalLength) > 4 * 1024 * 1024)
+					return false;
+				output.annexB.insert(output.annexB.end(), nalData, nalData + nalLength);
+				nalData += nalLength;
+			}
+		}
+		if (output.annexB.empty())
+			return false;
+		output.idr = info.eFrameType == videoFrameTypeIDR;
+		if (output.idr && (!ContainsH264Nal(output.annexB.data(), output.annexB.size(), kH264SpsNalType)
+			|| !ContainsH264Nal(output.annexB.data(), output.annexB.size(), kH264PpsNalType)
+			|| !HasConstrainedBaselineLevel42(output.annexB)))
+			return false;
+	}
 	output.timestampUs = nowUs >= m_encoderEpochUs ? nowUs - m_encoderEpochUs : 0;
-	output.idr = info.eFrameType == videoFrameTypeIDR;
-	if (m_forceNextIdr && !output.idr)
+	if (forceIdr && (!output.idr || !ContainsH264Nal(output.annexB.data(), output.annexB.size(), kH264SpsNalType)
+		|| !ContainsH264Nal(output.annexB.data(), output.annexB.size(), kH264PpsNalType)
+		|| !HasConstrainedBaselineLevel42(output.annexB)))
 		return false;
 	if (output.idr)
 	{
@@ -1109,7 +1689,7 @@ void TwinpadClient::FlushVideoMetricsIfDue()
 
 	static constexpr const char* stageNames[] = {
 		"readback_copy", "readback_ready", "pixel_convert", "i420_convert",
-		"openh264", "encode_pipeline", "base64_json", "ipc_send",
+		"hardware_encoder", "openh264", "encode_pipeline", "base64_json", "ipc_send",
 	};
 	static constexpr const char* eventNames[] = {
 		"drc_callback", "capture_accepted", "readback_queued", "readback_completed",

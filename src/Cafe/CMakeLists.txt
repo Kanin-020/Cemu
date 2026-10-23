@@ -661,6 +661,7 @@ target_link_libraries(CemuCafe PRIVATE
   zstd::zstd
   ${glslang_target}
   PkgConfig::OpenH264
+  PkgConfig::FFMPEG
   PUBLIC
   OpenSSL::SSL
 )

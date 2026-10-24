@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <cmath>
 #include <cstdint>
 #include <deque>
 #include <initializer_list>
@@ -75,6 +76,35 @@ inline std::array<float, 3> ToCemuTurns(const TwinpadInputState& input)
 		static_cast<float>(input.yaw) / kInt16Turns * kCemuGyroSensitivity,
 		static_cast<float>(input.roll) / kInt16Turns * kCemuGyroSensitivity,
 	};
+}
+
+// Convert consecutive absolute orientation snapshots into VPAD angular velocity turns/second.
+// The 0.5x sensitivity makes the signed orientation wrap every half turn.
+inline std::array<float, 3> ToCemuGyroChange(
+	const std::array<float, 3>& previousTurns,
+	const std::array<float, 3>& currentTurns,
+	float elapsedSeconds)
+{
+	constexpr float kMinimumSampleIntervalSeconds = 0.001f;
+	constexpr float kMaximumSampleIntervalSeconds = 0.2f;
+	constexpr float kOrientationPeriodTurns = 0.5f;
+	constexpr float kHalfOrientationPeriodTurns = kOrientationPeriodTurns * 0.5f;
+	if (!std::isfinite(elapsedSeconds) || elapsedSeconds < kMinimumSampleIntervalSeconds
+		|| elapsedSeconds > kMaximumSampleIntervalSeconds)
+		return {};
+
+	std::array<float, 3> change{};
+	for (size_t axis = 0; axis < change.size(); ++axis)
+	{
+		float deltaTurns = currentTurns[axis] - previousTurns[axis];
+		if (deltaTurns > kHalfOrientationPeriodTurns)
+			deltaTurns -= kOrientationPeriodTurns;
+		else if (deltaTurns < -kHalfOrientationPeriodTurns)
+			deltaTurns += kOrientationPeriodTurns;
+		const float axisSign = axis == 0 ? -1.0f : 1.0f;
+		change[axis] = deltaTurns / elapsedSeconds * axisSign;
+	}
+	return change;
 }
 
 // The monitor visualizes the raw screen-relative values received from Android,

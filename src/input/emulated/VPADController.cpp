@@ -312,7 +312,42 @@ void VPADController::update_motion(VPADStatus_t& status, const TwinpadInputState
 {
 	if (input.gyroValid)
 	{
+		const auto now = std::chrono::steady_clock::now();
 		const glm::vec3 orientationTurns = map_twinpad_orientation(input);
+		const std::array<float, 3> currentTurns{
+			orientationTurns.x,
+			orientationTurns.y,
+			orientationTurns.z,
+		};
+		if (m_has_last_twinpad_gyro_update && input.seq != m_last_twinpad_gyro_seq)
+		{
+			const auto elapsed = now - m_last_twinpad_gyro_update;
+			const float elapsedSeconds = std::chrono::duration<float>(elapsed).count();
+			m_twinpad_gyro_change = TwinpadOrientationMapper::ToCemuGyroChange(
+				m_last_twinpad_gyro_turns, currentTurns, elapsedSeconds);
+			if (elapsedSeconds > 0.2f)
+				m_twinpad_gyro_change = {};
+			m_last_twinpad_gyro_turns = currentTurns;
+			m_last_twinpad_gyro_update = now;
+			m_last_twinpad_gyro_seq = input.seq;
+		}
+		else if (m_has_last_twinpad_gyro_update && now - m_last_twinpad_gyro_update > std::chrono::milliseconds(200))
+		{
+			m_twinpad_gyro_change = {};
+		}
+		else if (!m_has_last_twinpad_gyro_update)
+		{
+			m_twinpad_gyro_change = {};
+			m_last_twinpad_gyro_turns = currentTurns;
+			m_last_twinpad_gyro_update = now;
+			m_last_twinpad_gyro_seq = input.seq;
+			m_has_last_twinpad_gyro_update = true;
+		}
+		status.gyroChange = {
+			m_twinpad_gyro_change[0],
+			m_twinpad_gyro_change[1],
+			m_twinpad_gyro_change[2],
+		};
 		status.gyroOrientation = {-orientationTurns.x, orientationTurns.y, orientationTurns.z};
 		status.acc = {0.0f, 0.0f, 1.0f};
 		status.accMagnitude = 1.0f;

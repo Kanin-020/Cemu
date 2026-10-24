@@ -100,6 +100,11 @@ private:
 	uint32be m_last_holdvalue = 0;
 
 	std::chrono::high_resolution_clock::time_point m_last_hold_change{}, m_last_pulse{};
+	std::array<float, 3> m_last_twinpad_gyro_turns{};
+	std::array<float, 3> m_twinpad_gyro_change{};
+	std::chrono::steady_clock::time_point m_last_twinpad_gyro_update{};
+	uint32_t m_last_twinpad_gyro_seq{};
+	bool m_has_last_twinpad_gyro_update{};
 
 	std::mutex m_rumble_mutex;
 	std::chrono::high_resolution_clock::time_point m_last_rumble_check{};

@@ -622,26 +622,47 @@ std::optional<TwinpadInputState> ParseInputReport(const rapidjson::Value& docume
 	state.touchY = static_cast<uint16_t>(touchY);
 	state.touchPressed = document["touch_pressed"].GetBool();
 
-	if (document.HasMember("gyro"))
+	if (document.HasMember("motion"))
 	{
-		const auto& gyro = document["gyro"];
-		if (!gyro.IsArray() || gyro.Size() != 3)
-			return std::nullopt;
-		int16_t* axes[] = {&state.yaw, &state.pitch, &state.roll};
-		for (rapidjson::SizeType index = 0; index < gyro.Size(); ++index)
+		for (auto member = document.MemberBegin(); member != document.MemberEnd(); ++member)
 		{
-			if (!gyro[index].IsInt())
+			const std::string_view name(member->name.GetString(), member->name.GetStringLength());
+			if (name == "motion")
+				continue;
+			if (name != "type" && name != "seq" && name != "stick_lx" && name != "stick_ly"
+				&& name != "stick_rx" && name != "stick_ry" && name != "dpad" && name != "buttons"
+				&& name != "trigger_l2" && name != "trigger_r2" && name != "touch_x" && name != "touch_y"
+				&& name != "touch_pressed")
 				return std::nullopt;
-			const int value = gyro[index].GetInt();
-			if (value < -32768 || value > 32767)
-				return std::nullopt;
-			*axes[index] = static_cast<int16_t>(value);
 		}
-		state.gyroValid = true;
+		const auto& motion = document["motion"];
+		if (!motion.IsObject() || motion.MemberCount() != 3
+			|| !motion.HasMember("timestamp_us") || !motion["timestamp_us"].IsUint64()
+			|| !motion.HasMember("accel") || !motion["accel"].IsArray() || motion["accel"].Size() != 3
+			|| !motion.HasMember("gyro") || !motion["gyro"].IsArray() || motion["gyro"].Size() != 3)
+			return std::nullopt;
+		state.motionTimestampUs = motion["timestamp_us"].GetUint64();
+		for (rapidjson::SizeType index = 0; index < 3; ++index)
+		{
+			if (!motion["accel"][index].IsNumber() || !motion["gyro"][index].IsNumber())
+				return std::nullopt;
+			const double accel = motion["accel"][index].GetDouble();
+			const double gyro = motion["gyro"][index].GetDouble();
+			if (std::abs(accel) > std::numeric_limits<float>::max()
+				|| std::abs(gyro) > std::numeric_limits<float>::max())
+				return std::nullopt;
+			state.accel[index] = static_cast<float>(accel);
+			state.gyro[index] = static_cast<float>(gyro);
+			if (!std::isfinite(state.accel[index]) || !std::isfinite(state.gyro[index]))
+				return std::nullopt;
+		}
+		if (!TwinpadMotionMapper::IsFinite(state))
+			return std::nullopt;
+		state.motionValid = true;
 	}
-	return state;	}
+	return state;
 }
-
+}
 
 TwinpadClient& TwinpadClient::Instance()
 {
@@ -1298,6 +1319,25 @@ TwinpadInputState TwinpadClient::GetGyroMonitorState() const
 	return m_hasGyroMonitorState ? m_gyroMonitorState : TwinpadInputState{};
 }
 
+bool TwinpadClient::HasFreshMotionInput() const
+{
+	std::scoped_lock lock(m_inputMutex);
+	return m_hasFreshMotionInput
+		&& std::chrono::steady_clock::now() - m_lastMotionReceived <= std::chrono::milliseconds(200);
+}
+
+TwinpadFusedMotionState TwinpadClient::GetFusedMotionState() const
+{
+	std::scoped_lock lock(m_inputMutex);
+	return m_fusedMotionState;
+}
+
+void TwinpadClient::SetFusedMotionState(const TwinpadFusedMotionState& state)
+{
+	std::scoped_lock lock(m_inputMutex);
+	m_fusedMotionState = state;
+}
+
 #ifdef TWINPAD_E2E_TEST_HOOK
 namespace
 {
@@ -1370,8 +1410,9 @@ void StartE2eInputProbe(std::string_view line)
 void TwinpadClient::RequestConnection()
 {
 	if (!m_titleActive.load() || !CafeSystem::IsTitleRunning())
-		return;		m_connectionRequested.store(true);
-		m_captureGamePad.store(true);
+		return;
+	m_connectionRequested.store(true);
+	m_captureGamePad.store(true);
 
 	if (!m_running.load())
 		Start(true);
@@ -1383,7 +1424,8 @@ void TwinpadClient::CancelConnectionRequest()
 	if (!m_titleActive.load())
 		return;
 	m_connectionRequested.store(false);
-	m_captureGamePad.store(false);		m_connected.store(false);
+	m_captureGamePad.store(false);
+	m_connected.store(false);
 
 	{
 		std::scoped_lock lock(m_primarySocketMutex);
@@ -1411,6 +1453,11 @@ void TwinpadClient::CancelConnectionRequest()
 		std::scoped_lock lock(m_inputMutex);
 		m_inputState = TwinpadInputState{};
 		m_gyroMonitorState = TwinpadInputState{};
+		m_fusedMotionState = TwinpadFusedMotionState{};
+		m_lastMotionReceived = {};
+		m_hasFreshMotionInput = false;
+		m_hasMotionTimestamp = false;
+		m_lastMotionTimestampUs = 0;
 		m_hasInputSeq = false;
 		m_hasGyroMonitorState = false;
 	}
@@ -1450,8 +1497,13 @@ void TwinpadClient::InputLoop()
 					std::scoped_lock lock(m_inputMutex);
 					m_inputState = TwinpadInputState{};
 					m_gyroMonitorState = TwinpadInputState{};
-					m_hasInputSeq = false;
-					m_hasGyroMonitorState = false;
+					m_fusedMotionState = TwinpadFusedMotionState{};
+					m_lastMotionReceived = {};
+				m_hasFreshMotionInput = false;
+				m_hasMotionTimestamp = false;
+				m_lastMotionTimestampUs = 0;
+				m_hasInputSeq = false;
+				m_hasGyroMonitorState = false;
 				}
 			}
 			if (!m_titleActive.load() || !m_connectionRequested.load())
@@ -1491,11 +1543,17 @@ void TwinpadClient::InputLoop()
 				m_receiveBuffer.clear();
 				{
 					std::scoped_lock lock(m_inputMutex);
-					m_inputState = TwinpadInputState{};
-					m_gyroMonitorState = TwinpadInputState{};
-					m_hasInputSeq = false;
-					m_hasGyroMonitorState = false;
+				m_inputState = TwinpadInputState{};
+				m_gyroMonitorState = TwinpadInputState{};
+				m_fusedMotionState = TwinpadFusedMotionState{};
+				m_lastMotionReceived = {};
+				m_hasFreshMotionInput = false;
+				m_hasMotionTimestamp = false;
+				m_lastMotionTimestampUs = 0;
+				m_hasInputSeq = false;
+				m_hasGyroMonitorState = false;
 				}
+
 				{
 					std::scoped_lock lock(m_audioQueueMutex);
 					m_audioQueue.clear();
@@ -1579,13 +1637,32 @@ void TwinpadClient::InputLoop()
 						{
 							m_inputState = *report;
 							m_gyroMonitorState = *report;
-							m_hasGyroMonitorState = report->gyroValid;
+							m_hasGyroMonitorState = report->motionValid;
 							m_hasInputSeq = true;
 
-							if (report->gyroValid && report->seq % kGyroLogReportInterval == 0)
+							if (report->motionValid
+								&& (!m_hasMotionTimestamp || report->motionTimestampUs > m_lastMotionTimestampUs))
+							{
+								m_lastMotionTimestampUs = report->motionTimestampUs;
+								m_hasMotionTimestamp = true;
+								m_lastMotionReceived = std::chrono::steady_clock::now();
+								m_hasFreshMotionInput = true;
+							}
+							else if (!report->motionValid)
+							{
+								m_hasFreshMotionInput = false;
+								m_hasMotionTimestamp = false;
+								m_lastMotionTimestampUs = 0;
+								m_lastMotionReceived = {};
+								m_fusedMotionState = TwinpadFusedMotionState{};
+							}
+
+							if (report->motionValid && report->seq % kGyroLogReportInterval == 0)
 								cemuLog_log(LogType::Force,
-									"[TwinpadGyro] stage=cemu_rx seq={} yaw={} pitch={} roll={}",
-									report->seq, report->yaw, report->pitch, report->roll);
+									"[TwinpadGyro] stage=cemu_rx seq={} timestamp_us={} accel=({:.5f},{:.5f},{:.5f}) gyro=({:.5f},{:.5f},{:.5f})",
+									report->seq, report->motionTimestampUs,
+									report->accel[0], report->accel[1], report->accel[2],
+									report->gyro[0], report->gyro[1], report->gyro[2]);
 						}
 					}
 				}
@@ -1617,12 +1694,18 @@ void TwinpadClient::InputLoop()
 				std::scoped_lock lock(m_inputMutex);
 				m_inputState = TwinpadInputState{};
 				m_gyroMonitorState = TwinpadInputState{};
+				m_fusedMotionState = TwinpadFusedMotionState{};
+				m_lastMotionReceived = {};
+				m_hasFreshMotionInput = false;
+				m_hasMotionTimestamp = false;
+				m_lastMotionTimestampUs = 0;
 				m_hasInputSeq = false;
-				m_hasGyroMonitorState = false;
-			}
-			{
-				std::scoped_lock lock(m_audioQueueMutex);
-				m_audioQueue.clear();
+					m_hasGyroMonitorState = false;
+				}
+
+				{
+					std::scoped_lock lock(m_audioQueueMutex);
+					m_audioQueue.clear();
 			}
 			nextConnectionAttempt = std::chrono::steady_clock::now()
 				+ std::chrono::milliseconds(kRetryIntervalMs);
@@ -1647,12 +1730,18 @@ void TwinpadClient::InputLoop()
 				std::scoped_lock lock(m_inputMutex);
 				m_inputState = TwinpadInputState{};
 				m_gyroMonitorState = TwinpadInputState{};
+				m_fusedMotionState = TwinpadFusedMotionState{};
+				m_lastMotionReceived = {};
+				m_hasFreshMotionInput = false;
+				m_hasMotionTimestamp = false;
+				m_lastMotionTimestampUs = 0;
 				m_hasInputSeq = false;
-				m_hasGyroMonitorState = false;
-			}
-			{
-				std::scoped_lock lock(m_audioQueueMutex);
-				m_audioQueue.clear();
+					m_hasGyroMonitorState = false;
+				}
+
+				{
+					std::scoped_lock lock(m_audioQueueMutex);
+					m_audioQueue.clear();
 			}
 			nextConnectionAttempt = std::chrono::steady_clock::now()
 				+ std::chrono::milliseconds(kRetryIntervalMs);

@@ -8,6 +8,7 @@
 #include "Cafe/HW/Latte/Core/Latte.h"
 #include "Cafe/CafeSystem.h"
 #include "util/math/quaternion.h"
+#include "input/motion/MotionHandler.h"
 
 enum ControllerVPADMapping2 : uint32
 {
@@ -302,83 +303,75 @@ void VPADController::update_touch(VPADStatus_t& status)
 	status.tpProcessed2 = status.tpData;
 }
 
-glm::vec3 VPADController::map_twinpad_orientation(const TwinpadInputState& input)
+void VPADController::apply_twinpad_fused_motion(VPADStatus_t& status, const TwinpadFusedMotionState& fused)
 {
-	const auto orientationTurns = TwinpadOrientationMapper::ToCemuTurns(input);
-	return {orientationTurns[0], orientationTurns[1], orientationTurns[2]};
+	if (!fused.valid)
+		return;
+	status.acc = {fused.accelerometer[0], fused.accelerometer[1], fused.accelerometer[2]};
+	status.accMagnitude = fused.accelerometerMagnitude;
+	status.accAcceleration = fused.accelerometerAcceleration;
+	status.gyroChange = {fused.gyroChange[0], fused.gyroChange[1], fused.gyroChange[2]};
+	status.gyroOrientation = {fused.gyroOrientation[0], fused.gyroOrientation[1], fused.gyroOrientation[2]};
+	status.dir.x = {fused.attitude[0], fused.attitude[1], fused.attitude[2]};
+	status.dir.y = {fused.attitude[3], fused.attitude[4], fused.attitude[5]};
+	status.dir.z = {fused.attitude[6], fused.attitude[7], fused.attitude[8]};
+	status.accXY = {1.0f, 0.0f};
 }
 
 void VPADController::update_motion(VPADStatus_t& status, const TwinpadInputState& input)
 {
-	if (input.gyroValid)
+	std::scoped_lock lock(m_twinpad_motion_mutex);
+	if (!input.motionValid || !TwinpadClient::Instance().HasFreshMotionInput()
+		|| !TwinpadMotionMapper::IsFinite(input))
 	{
-		const auto now = std::chrono::steady_clock::now();
-		const glm::vec3 orientationTurns = map_twinpad_orientation(input);
-		const std::array<float, 3> currentTurns{
-			orientationTurns.x,
-			orientationTurns.y,
-			orientationTurns.z,
-		};
-		if (m_has_last_twinpad_gyro_update && input.seq != m_last_twinpad_gyro_seq)
-		{
-			const auto elapsed = now - m_last_twinpad_gyro_update;
-			const float elapsedSeconds = std::chrono::duration<float>(elapsed).count();
-			m_twinpad_gyro_change = TwinpadOrientationMapper::ToCemuGyroChange(
-				m_last_twinpad_gyro_turns, currentTurns, elapsedSeconds);
-			if (elapsedSeconds > 0.2f)
-				m_twinpad_gyro_change = {};
-			m_last_twinpad_gyro_turns = currentTurns;
-			m_last_twinpad_gyro_update = now;
-			m_last_twinpad_gyro_seq = input.seq;
-		}
-		else if (m_has_last_twinpad_gyro_update && now - m_last_twinpad_gyro_update > std::chrono::milliseconds(200))
-		{
-			m_twinpad_gyro_change = {};
-		}
-		else if (!m_has_last_twinpad_gyro_update)
-		{
-			m_twinpad_gyro_change = {};
-			m_last_twinpad_gyro_turns = currentTurns;
-			m_last_twinpad_gyro_update = now;
-			m_last_twinpad_gyro_seq = input.seq;
-			m_has_last_twinpad_gyro_update = true;
-		}
-		status.gyroChange = {
-			m_twinpad_gyro_change[0],
-			m_twinpad_gyro_change[1],
-			m_twinpad_gyro_change[2],
-		};
-		status.gyroOrientation = {-orientationTurns.x, orientationTurns.y, orientationTurns.z};
-		status.acc = {0.0f, 0.0f, 1.0f};
-		status.accMagnitude = 1.0f;
-		status.accAcceleration = 0.0f;
-		status.accXY = {1.0f, 0.0f};
-		Quaternionf orientation(orientationTurns.x * 360.0f, orientationTurns.y * 360.0f, orientationTurns.z * 360.0f);
-		const auto axes = orientation.GetTransposedRotationMatrix();
-		const auto x = std::get<0>(axes);
-		const auto y = std::get<1>(axes);
-		const auto z = std::get<2>(axes);
-		status.dir.x = {x.x, x.y, x.z};
-		status.dir.y = {y.x, y.y, y.z};
-		status.dir.z = {z.x, z.y, z.z};
-
-		constexpr uint32_t kGyroLogReportInterval = 10;
-		static uint32_t lastLoggedGyroSeq{};
-		static bool hasLoggedGyroSeq{};
-		if (input.seq % kGyroLogReportInterval == 0 &&
-			(!hasLoggedGyroSeq || input.seq != lastLoggedGyroSeq))
-		{
-			cemuLog_log(LogType::Force,
-				"[TwinpadGyro] stage=vpad seq={} yaw={} pitch={} roll={} mapped_yaw={:.6f} mapped_pitch={:.6f} mapped_roll={:.6f} dir_x=({:.4f},{:.4f},{:.4f}) dir_y=({:.4f},{:.4f},{:.4f}) dir_z=({:.4f},{:.4f},{:.4f})",
-				input.seq, input.yaw, input.pitch, input.roll,
-				status.gyroOrientation.x, status.gyroOrientation.y, status.gyroOrientation.z,
-				status.dir.x.x, status.dir.x.y, status.dir.x.z,
-				status.dir.y.x, status.dir.y.y, status.dir.y.z,
-				status.dir.z.x, status.dir.z.y, status.dir.z.z);
-			lastLoggedGyroSeq = input.seq;
-			hasLoggedGyroSeq = true;
-		}
+		m_has_last_twinpad_motion_sample = false;
+		m_last_twinpad_motion_timestamp_us = 0;
+		m_twinpad_motion_handler = WiiUMotionHandler{};
+		TwinpadClient::Instance().SetFusedMotionState(TwinpadFusedMotionState{});
+		return;
 	}
+
+	if (!m_has_last_twinpad_motion_sample)
+	{
+		m_last_twinpad_motion_timestamp_us = input.motionTimestampUs;
+		m_has_last_twinpad_motion_sample = true;
+		return;
+	}
+	if (input.motionTimestampUs <= m_last_twinpad_motion_timestamp_us)
+		return;
+
+	const float elapsedSeconds = TwinpadMotionMapper::ElapsedSeconds(
+		m_last_twinpad_motion_timestamp_us, input.motionTimestampUs);
+	if (elapsedSeconds <= 0.0f)
+		return;
+	m_last_twinpad_motion_timestamp_us = input.motionTimestampUs;
+	if (elapsedSeconds > 0.2f)
+	{
+		m_twinpad_motion_handler = WiiUMotionHandler{};
+		TwinpadClient::Instance().SetFusedMotionState(TwinpadFusedMotionState{});
+		m_has_last_twinpad_motion_sample = false;
+		return;
+	}
+
+	const auto gyro = TwinpadMotionMapper::ToCemuGyroRadiansPerSecond(input);
+	const auto accel = TwinpadMotionMapper::ToCemuAcceleration(input);
+	if (!std::isfinite(elapsedSeconds)
+		|| !std::all_of(gyro.begin(), gyro.end(), [](float value) { return std::isfinite(value); })
+		|| !std::all_of(accel.begin(), accel.end(), [](float value) { return std::isfinite(value); }))
+		return;
+	m_twinpad_motion_handler.processMotionSample(
+		elapsedSeconds, gyro[0], gyro[1], gyro[2], accel[0], accel[1], accel[2]);
+	MotionSample motionSample = m_twinpad_motion_handler.getMotionSample();
+	TwinpadFusedMotionState fused{};
+	fused.valid = true;
+	motionSample.getVPADAttitudeMatrix(fused.attitude.data());
+	motionSample.getVPADAccelerometer(fused.accelerometer.data());
+	fused.accelerometerMagnitude = motionSample.getVPADAccMagnitude();
+	fused.accelerometerAcceleration = motionSample.getVPADAccAcceleration();
+	motionSample.getVPADGyroChange(fused.gyroChange.data());
+	motionSample.getVPADOrientation(fused.gyroOrientation.data());
+	TwinpadClient::Instance().SetFusedMotionState(fused);
+	apply_twinpad_fused_motion(status, fused);
 }
 
 void VPADController::update_motion(VPADStatus_t& status)

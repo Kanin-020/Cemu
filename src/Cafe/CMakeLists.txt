@@ -5,6 +5,7 @@ add_library(CemuCafe
   Twinpad/TwinpadClient.h
   Twinpad/Base64UrlTest.cpp
   Twinpad/GyroMonitorTest.cpp
+  Twinpad/TwinpadMotionTest.cpp
   Account/Account.h
   CafeSystem.cpp
   CafeSystem.h

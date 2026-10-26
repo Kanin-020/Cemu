@@ -58,56 +58,7 @@ void VulkanRenderer_twinpad_readback_test()
 	cemu_assert_debug(noCompletedSlot != 2);
 }
 
-void TwinpadOrientationMapper_test()
-{
-	// TEST-077 — verifies SPEC-004: absolute yaw/pitch/roll maps to the Cemu VPAD axis order.
-	TwinpadInputState input{};
-	input.yaw = 8192;
-	input.pitch = -4096;
-	input.roll = 16384;
-	const auto mapped = TwinpadOrientationMapper::ToCemuTurns(input);
-	cemu_assert_debug(std::abs(mapped[0] + 0.0625f) < 0.000001f);
-	cemu_assert_debug(std::abs(mapped[1] - 0.125f) < 0.000001f);
-	cemu_assert_debug(std::abs(mapped[2] - 0.25f) < 0.000001f);
 
-	input.yaw = std::numeric_limits<int16_t>::min();
-	input.pitch = std::numeric_limits<int16_t>::min();
-	input.roll = std::numeric_limits<int16_t>::min();
-	const auto extremes = TwinpadOrientationMapper::ToCemuTurns(input);
-	cemu_assert_debug(extremes[0] == -0.5f);
-	cemu_assert_debug(extremes[1] == -0.5f);
-	cemu_assert_debug(extremes[2] == -0.5f);
-
-	input = TwinpadInputState{};
-	input.yaw = 8192;
-	input.pitch = -4096;
-	input.roll = -262;
-	const auto halfSensitivity = TwinpadOrientationMapper::ToCemuTurns(input);
-	cemu_assert_debug(std::abs(halfSensitivity[0] + 0.0625f) < 0.000001f);
-	cemu_assert_debug(std::abs(halfSensitivity[1] - 0.125f) < 0.000001f);
-	cemu_assert_debug(std::abs(halfSensitivity[2] + (262.0f / 32768.0f * 0.5f)) < 0.000001f);
-
-	const std::array<float, 3> previousTurns{};
-	const std::array<float, 3> currentTurns{0.125f, -0.125f, 0.25f};
-	const auto gyroChange = TwinpadOrientationMapper::ToCemuGyroChange(previousTurns, currentTurns, 0.05f);
-	cemu_assert_debug(std::abs(gyroChange[0] + 2.5f) < 0.000001f);
-	cemu_assert_debug(std::abs(gyroChange[1] + 2.5f) < 0.000001f);
-	cemu_assert_debug(std::abs(gyroChange[2] - 5.0f) < 0.000001f);
-
-	const std::array<float, 3> beforeWrap{0.49f, -0.49f, 0.0f};
-	const std::array<float, 3> afterWrap{-0.49f, 0.49f, 0.0f};
-	const auto wrappedChange = TwinpadOrientationMapper::ToCemuGyroChange(beforeWrap, afterWrap, 0.05f);
-	cemu_assert_debug(std::abs(wrappedChange[0] + 0.4f) < 0.000001f);
-	cemu_assert_debug(std::abs(wrappedChange[1] + 0.4f) < 0.000001f);
-
-	const auto tooSoon = TwinpadOrientationMapper::ToCemuGyroChange(previousTurns, currentTurns, 0.0005f);
-	const auto stalled = TwinpadOrientationMapper::ToCemuGyroChange(previousTurns, currentTurns, 0.25f);
-	const auto invalidInterval = TwinpadOrientationMapper::ToCemuGyroChange(
-		previousTurns, currentTurns, std::numeric_limits<float>::quiet_NaN());
-	cemu_assert_debug(tooSoon == std::array<float, 3>{});
-	cemu_assert_debug(stalled == std::array<float, 3>{});
-	cemu_assert_debug(invalidInterval == std::array<float, 3>{});
-}
 
 void TwinpadClient_base64url_test()
 {

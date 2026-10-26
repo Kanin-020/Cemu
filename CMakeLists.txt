@@ -45,7 +45,9 @@ if (ENABLE_VCPKG)
 	else()
 		set(VCPKG_OVERLAY_PORTS "${CMAKE_CURRENT_LIST_DIR}/dependencies/vcpkg_overlay_ports_win;${CMAKE_CURRENT_LIST_DIR}/dependencies/vcpkg_overlay_ports")
 	endif()
-	list(PREPEND VCPKG_OVERLAY_PORTS "${CMAKE_CURRENT_LIST_DIR}/dependencies/vcpkg/ports/ffmpeg")
+	list(PREPEND VCPKG_OVERLAY_PORTS
+		"${CMAKE_CURRENT_LIST_DIR}/../cemu-vcpkg-overlay-linux"
+		"${CMAKE_CURRENT_LIST_DIR}/dependencies/vcpkg/ports/ffmpeg")
 	set(CMAKE_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/vcpkg/scripts/buildsystems/vcpkg.cmake"
 		CACHE STRING "Vcpkg toolchain file")
 	# Set this so that all the various find_package() calls don't need an explicit

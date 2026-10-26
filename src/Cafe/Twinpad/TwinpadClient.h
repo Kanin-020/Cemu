@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <deque>
@@ -60,79 +61,67 @@ struct TwinpadInputState
 	uint8_t dpad{8}, triggerL2{}, triggerR2{};
 	uint16_t buttons{}, touchX{}, touchY{};
 	bool touchPressed{};
-	bool gyroValid{};
-	int16_t yaw{}, pitch{}, roll{};
+	bool motionValid{};
+	uint64_t motionTimestampUs{};
+	std::array<float, 3> accel{};
+	std::array<float, 3> gyro{};
+	float accelerometerMagnitude{};
+	float accelerometerAcceleration{};
 };
 
-namespace TwinpadOrientationMapper
+struct TwinpadFusedMotionState
 {
-// Convert absolute Twinpad turns to the axis order used by Cemu's VPAD orientation.
-inline std::array<float, 3> ToCemuTurns(const TwinpadInputState& input)
+	bool valid{};
+	std::array<float, 3> accelerometer{};
+	float accelerometerMagnitude{};
+	float accelerometerAcceleration{};
+	std::array<float, 3> gyroChange{};
+	std::array<float, 3> gyroOrientation{};
+	std::array<float, 9> attitude{};
+};
+
+namespace TwinpadMotionMapper
 {
-	constexpr float kInt16Turns = 32768.0f;
-	constexpr float kCemuGyroSensitivity = 0.5f;
-	return {
-		static_cast<float>(input.pitch) / kInt16Turns * kCemuGyroSensitivity,
-		static_cast<float>(input.yaw) / kInt16Turns * kCemuGyroSensitivity,
-		static_cast<float>(input.roll) / kInt16Turns * kCemuGyroSensitivity,
-	};
+// Convert Android SI samples through the same axis/sign convention as AndroidDSU → Cemu DSU.
+inline std::array<float, 3> ToCemuGyroRadiansPerSecond(const TwinpadInputState& input)
+{
+	constexpr float kReferenceGyroSensitivity = 0.9f;
+	return {input.gyro[0] * kReferenceGyroSensitivity,
+		-input.gyro[2] * kReferenceGyroSensitivity,
+		input.gyro[1] * kReferenceGyroSensitivity};
 }
 
-// Convert consecutive absolute orientation snapshots into VPAD angular velocity turns/second.
-// The 0.5x sensitivity makes the signed orientation wrap every half turn.
-inline std::array<float, 3> ToCemuGyroChange(
-	const std::array<float, 3>& previousTurns,
-	const std::array<float, 3>& currentTurns,
-	float elapsedSeconds)
+inline std::array<float, 3> ToCemuAcceleration(const TwinpadInputState& input)
 {
-	constexpr float kMinimumSampleIntervalSeconds = 0.001f;
-	constexpr float kMaximumSampleIntervalSeconds = 0.2f;
-	constexpr float kOrientationPeriodTurns = 0.5f;
-	constexpr float kHalfOrientationPeriodTurns = kOrientationPeriodTurns * 0.5f;
-	if (!std::isfinite(elapsedSeconds) || elapsedSeconds < kMinimumSampleIntervalSeconds
-		|| elapsedSeconds > kMaximumSampleIntervalSeconds)
-		return {};
+	constexpr float kReferenceAccelerationScale = 9.8066f / 100.0f;
+	return {-input.accel[0] * kReferenceAccelerationScale,
+		input.accel[2] * kReferenceAccelerationScale,
+		-input.accel[1] * kReferenceAccelerationScale};
+}
 
-	std::array<float, 3> change{};
-	for (size_t axis = 0; axis < change.size(); ++axis)
+inline float ElapsedSeconds(uint64_t previousTimestampUs, uint64_t currentTimestampUs)
+{
+	if (currentTimestampUs <= previousTimestampUs)
+		return 0.0f;
+	return static_cast<float>(currentTimestampUs - previousTimestampUs) / 1'000'000.0f;
+}
+
+inline bool IsFinite(const TwinpadInputState& input)
+{
+	for (size_t axis = 0; axis < input.accel.size(); ++axis)
 	{
-		float deltaTurns = currentTurns[axis] - previousTurns[axis];
-		if (deltaTurns > kHalfOrientationPeriodTurns)
-			deltaTurns -= kOrientationPeriodTurns;
-		else if (deltaTurns < -kHalfOrientationPeriodTurns)
-			deltaTurns += kOrientationPeriodTurns;
-		const float axisSign = axis == 0 ? -1.0f : 1.0f;
-		change[axis] = deltaTurns / elapsedSeconds * axisSign;
+		if (!std::isfinite(input.accel[axis]) || !std::isfinite(input.gyro[axis]))
+			return false;
 	}
-	return change;
+	return true;
 }
 
-// The monitor visualizes the raw screen-relative values received from Android,
-// independently of the axis remapping used by the VPAD.
-inline std::array<double, 3> ToMonitorRadians(const TwinpadInputState& input)
+// The Cemu monitor visualizes the fused orientation reported by MotionSample in VPAD turns.
+inline std::array<double, 2> ToMonitorEndPoint(float orientationTurns, double radius)
 {
-	constexpr double kInt16Turns = 32768.0;
 	constexpr double kTau = 6.283185307179586;
-	return {
-		static_cast<double>(input.yaw) / kInt16Turns * kTau,
-		static_cast<double>(input.pitch) / kInt16Turns * kTau,
-		static_cast<double>(input.roll) / kInt16Turns * kTau,
-	};
-}
-
-inline std::array<double, 2> ToMonitorEndPoint(const TwinpadInputState& input, size_t axis, double radius)
-{
-	const double radians = ToMonitorRadians(input)[axis];
+	const double radians = static_cast<double>(orientationTurns) * kTau;
 	return {std::cos(radians) * radius * 0.86, -std::sin(radians) * radius * 0.86};
-}
-
-inline bool RollPointsRight(const TwinpadInputState& input)
-{
-	constexpr int kNearZeroTurns = 2048;
-	if (std::abs(static_cast<int>(input.roll)) > kNearZeroTurns)
-		return true;
-	const auto endpoint = ToMonitorEndPoint(input, 2, 1.0);
-	return endpoint[0] > 0.0 && std::abs(endpoint[0]) >= std::abs(endpoint[1]);
 }
 }
 
@@ -150,6 +139,9 @@ public:
 	static TwinpadClient& Instance();
 	TwinpadInputState GetInputState() const;
 	TwinpadInputState GetGyroMonitorState() const;
+	bool HasFreshMotionInput() const;
+	TwinpadFusedMotionState GetFusedMotionState() const;
+	void SetFusedMotionState(const TwinpadFusedMotionState& state);
 	void SetGyroMonitorEnabled(bool enabled) { m_gyroMonitorEnabled.store(enabled); }
 	bool IsGyroMonitorEnabled() const { return m_gyroMonitorEnabled.load(); }
 	static bool GetCurrentQr(TwinpadQr& qr);
@@ -210,8 +202,13 @@ private:
 	mutable std::mutex m_inputMutex;
 	TwinpadInputState m_inputState{};
 	TwinpadInputState m_gyroMonitorState{};
+	TwinpadFusedMotionState m_fusedMotionState{};
 	bool m_hasGyroMonitorState{};
 	bool m_hasInputSeq{};
+	std::chrono::steady_clock::time_point m_lastMotionReceived{};
+	bool m_hasFreshMotionInput{};
+	bool m_hasMotionTimestamp{};
+	uint64_t m_lastMotionTimestampUs{};
 	std::string m_receiveBuffer;
 	std::mutex m_lifecycleMutex;
 	std::mutex m_audioQueueMutex;

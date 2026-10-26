@@ -47,27 +47,37 @@ private:
 		dc.DrawLine(graphRect.GetLeft() + 8, centerY, graphRect.GetRight() - 8, centerY);
 		dc.DrawLine(centerX, graphRect.GetTop() + 8, centerX, graphRect.GetBottom() - 8);
 
-		if (!input.gyroValid)
+		const auto fused = TwinpadClient::Instance().GetFusedMotionState();
+		if (!input.motionValid)
 		{
 			dc.SetFont(wxFont(18, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
 			dc.SetTextForeground(wxSystemSettings::GetColour(wxSYS_COLOUR_GRAYTEXT));
-			dc.DrawLabel(wxString::FromUTF8("Esperando entrada de giroscopio…"), graphRect, wxALIGN_CENTER);
+			dc.DrawLabel(wxString::FromUTF8("Esperando muestras de movimiento…"), graphRect, wxALIGN_CENTER);
 			return;
 		}
 
-		const auto mapped = TwinpadOrientationMapper::ToCemuTurns(input);
+		if (!fused.valid)
+		{
+			dc.SetFont(wxFont(14, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
+			dc.SetTextForeground(wxSystemSettings::GetColour(wxSYS_COLOUR_GRAYTEXT));
+			dc.DrawLabel(wxString::FromUTF8("Esperando fusión VPAD"), graphRect, wxALIGN_CENTER);
+		}
+		const auto& orientation = fused.gyroOrientation;
 		const std::array<wxColour, 3> colors{wxColour(101, 214, 129), wxColour(255, 91, 91), wxColour(100, 169, 255)};
 		const std::array<const char*, 3> names{"Yaw", "Pitch", "Roll"};
-		for (size_t axis = 0; axis < names.size(); ++axis)
+		if (fused.valid)
 		{
-			const auto endpoint = TwinpadOrientationMapper::ToMonitorEndPoint(input, axis, radius);
-			const int endX = centerX + static_cast<int>(endpoint[0]);
-			const int endY = centerY + static_cast<int>(endpoint[1]);
-			dc.SetPen(wxPen(colors[axis], 5));
-			dc.DrawLine(centerX, centerY, endX, endY);
-			dc.SetFont(wxFont(14, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_BOLD));
-			dc.SetTextForeground(colors[axis]);
-			dc.DrawText(names[axis], endX + 5, endY - 20);
+			for (size_t axis = 0; axis < names.size(); ++axis)
+			{
+				const auto endpoint = TwinpadMotionMapper::ToMonitorEndPoint(orientation[axis], radius);
+				const int endX = centerX + static_cast<int>(endpoint[0]);
+				const int endY = centerY + static_cast<int>(endpoint[1]);
+				dc.SetPen(wxPen(colors[axis], 5));
+				dc.DrawLine(centerX, centerY, endX, endY);
+				dc.SetFont(wxFont(14, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_BOLD));
+				dc.SetTextForeground(colors[axis]);
+				dc.DrawText(names[axis], endX + 5, endY - 20);
+			}
 		}
 		dc.SetPen(*wxTRANSPARENT_PEN);
 		dc.SetBrush(wxBrush(wxSystemSettings::GetColour(wxSYS_COLOUR_WINDOWTEXT)));
@@ -76,8 +86,10 @@ private:
 		const int valuesTop = size.GetHeight() - 145;
 		dc.SetFont(wxFont(16, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
 		dc.SetTextForeground(wxSystemSettings::GetColour(wxSYS_COLOUR_WINDOWTEXT));
-		dc.DrawText(wxString::Format("Android yaw / pitch / roll: %d / %d / %d", input.yaw, input.pitch, input.roll), 18, valuesTop);
-		dc.DrawText(wxString::Format("VPAD X / Y / Z turns: %.4f / %.4f / %.4f", mapped[0], mapped[1], mapped[2]), 18, valuesTop + 34);
+		dc.DrawText(wxString::Format("Android accel m/s²: %.3f / %.3f / %.3f", input.accel[0], input.accel[1], input.accel[2]), 18, valuesTop);
+		dc.DrawText(wxString::Format("Android gyro rad/s: %.3f / %.3f / %.3f", input.gyro[0], input.gyro[1], input.gyro[2]), 18, valuesTop + 30);
+		if (fused.valid)
+			dc.DrawText(wxString::Format("VPAD fused X / Y / Z turns: %.4f / %.4f / %.4f", orientation[0], orientation[1], orientation[2]), 18, valuesTop + 60);
 	}
 };
 }

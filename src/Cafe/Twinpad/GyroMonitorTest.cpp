@@ -39,10 +39,10 @@ void TwinpadGyroMonitor_test()
 
 	const auto mappedGyro = TwinpadMotionMapper::ToCemuGyroRadiansPerSecond(received);
 	const auto mappedAccel = TwinpadMotionMapper::ToCemuAcceleration(received);
-	cemu_assert_debug(mappedGyro == std::array<float, 3>{0.9f, -2.7f, -1.8f});
+	cemu_assert_debug(mappedGyro == std::array<float, 3>{0.9f, -1.8f, 2.7f});
 	cemu_assert_debug(std::abs(mappedAccel[0]) < 0.000001f);
-	cemu_assert_debug(std::abs(mappedAccel[1]) < 0.000001f);
-	cemu_assert_debug(std::abs(mappedAccel[2] + 9.8066f * 9.8066f / 100.0f) < 0.0001f);
+	cemu_assert_debug(std::abs(mappedAccel[1] - 9.8066f * 9.8066f / 100.0f) < 0.0001f);
+	cemu_assert_debug(std::abs(mappedAccel[2]) < 0.000001f);
 
 	TwinpadFusedMotionState fused{};
 	fused.valid = true;

@@ -82,21 +82,21 @@ struct TwinpadFusedMotionState
 
 namespace TwinpadMotionMapper
 {
-// Convert Android SI samples through the same axis/sign convention as AndroidDSU → Cemu DSU.
+// Android already sends AndroidDSU reference axes; Cemu only converts units.
 inline std::array<float, 3> ToCemuGyroRadiansPerSecond(const TwinpadInputState& input)
 {
 	constexpr float kReferenceGyroSensitivity = 0.9f;
 	return {input.gyro[0] * kReferenceGyroSensitivity,
-		-input.gyro[2] * kReferenceGyroSensitivity,
-		input.gyro[1] * kReferenceGyroSensitivity};
+		input.gyro[1] * kReferenceGyroSensitivity,
+		input.gyro[2] * kReferenceGyroSensitivity};
 }
 
 inline std::array<float, 3> ToCemuAcceleration(const TwinpadInputState& input)
 {
 	constexpr float kReferenceAccelerationScale = 9.8066f / 100.0f;
-	return {-input.accel[0] * kReferenceAccelerationScale,
-		input.accel[2] * kReferenceAccelerationScale,
-		-input.accel[1] * kReferenceAccelerationScale};
+	return {input.accel[0] * kReferenceAccelerationScale,
+		input.accel[1] * kReferenceAccelerationScale,
+		input.accel[2] * kReferenceAccelerationScale};
 }
 
 inline float ElapsedSeconds(uint64_t previousTimestampUs, uint64_t currentTimestampUs)

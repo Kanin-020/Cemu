@@ -359,8 +359,9 @@ void VPADController::update_motion(VPADStatus_t& status, const TwinpadInputState
 		|| !std::all_of(gyro.begin(), gyro.end(), [](float value) { return std::isfinite(value); })
 		|| !std::all_of(accel.begin(), accel.end(), [](float value) { return std::isfinite(value); }))
 		return;
+	// Same axis handling as DSUControllerProvider: accel Y and Z are negated before the motion handler.
 	m_twinpad_motion_handler.processMotionSample(
-		elapsedSeconds, gyro[0], gyro[1], gyro[2], accel[0], accel[1], accel[2]);
+		elapsedSeconds, gyro[0], gyro[1], gyro[2], accel[0], -accel[1], -accel[2]);
 	MotionSample motionSample = m_twinpad_motion_handler.getMotionSample();
 	TwinpadFusedMotionState fused{};
 	fused.valid = true;

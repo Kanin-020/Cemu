@@ -79,7 +79,6 @@ constexpr size_t kE2eRequestLimit = 128;
 constexpr size_t kMaxQrResponseBytes = 16 * 1024;
 constexpr uint64_t kRetryIntervalMs = 2000;
 constexpr uint64_t kIdrIntervalMs = 2000;
-constexpr uint32_t kOpenH264Bitrate = 8'000'000;
 constexpr uint64_t kVideoMetricLogIntervalMs = 5'000;
 constexpr uint32_t kOpenH264SliceCount = 4;
 constexpr uint32_t kGyroLogReportInterval = 10;
@@ -341,7 +340,7 @@ struct TwinpadFfmpegEncoder
 	}
 };
 
-std::unique_ptr<TwinpadFfmpegEncoder> CreateHardwareH264Encoder(uint16_t width, uint16_t height, uint8_t fps)
+std::unique_ptr<TwinpadFfmpegEncoder> CreateHardwareH264Encoder(uint16_t width, uint16_t height, uint8_t fps, uint32_t bitrateKbps)
 {
 #if BOOST_OS_WINDOWS
 	static constexpr const char* candidates[] = {"h264_nvenc", "h264_qsv", "h264_amf"};
@@ -395,9 +394,9 @@ std::unique_ptr<TwinpadFfmpegEncoder> CreateHardwareH264Encoder(uint16_t width, 
 		}
 		context->time_base = AVRational{1, fps};
 		context->framerate = AVRational{fps, 1};
-		context->bit_rate = kOpenH264Bitrate;
-		context->rc_max_rate = kOpenH264Bitrate;
-		context->rc_buffer_size = kOpenH264Bitrate;
+		context->bit_rate = bitrateKbps * 1000;
+		context->rc_max_rate = bitrateKbps * 1000;
+		context->rc_buffer_size = bitrateKbps * 1000;
 		context->color_range = AVCOL_RANGE_MPEG;
 		context->gop_size = fps * 2;
 		context->max_b_frames = 0;
@@ -488,7 +487,7 @@ std::unique_ptr<TwinpadFfmpegEncoder> CreateHardwareH264Encoder(uint16_t width, 
 	return nullptr;
 }
 
-ISVCEncoder* CreateOpenH264Encoder(uint16_t width, uint16_t height, uint8_t fps)
+ISVCEncoder* CreateOpenH264Encoder(uint16_t width, uint16_t height, uint8_t fps, uint32_t bitrateKbps)
 {
 	ISVCEncoder* encoder = nullptr;
 	if (WelsCreateSVCEncoder(&encoder) != 0 || !encoder)
@@ -503,7 +502,7 @@ ISVCEncoder* CreateOpenH264Encoder(uint16_t width, uint16_t height, uint8_t fps)
 	params.iComplexityMode = LOW_COMPLEXITY;
 	params.iPicWidth = width;
 	params.iPicHeight = height;
-	params.iTargetBitrate = kOpenH264Bitrate;
+	params.iTargetBitrate = bitrateKbps * 1000;
 	params.iRCMode = RC_BITRATE_MODE;
 	params.fMaxFrameRate = static_cast<float>(fps);
 	params.iSpatialLayerNum = 1;
@@ -516,8 +515,8 @@ ISVCEncoder* CreateOpenH264Encoder(uint16_t width, uint16_t height, uint8_t fps)
 	params.sSpatialLayers[0].iVideoWidth = width;
 	params.sSpatialLayers[0].iVideoHeight = height;
 	params.sSpatialLayers[0].fFrameRate = static_cast<float>(fps);
-	params.sSpatialLayers[0].iSpatialBitrate = kOpenH264Bitrate;
-	params.sSpatialLayers[0].iMaxSpatialBitrate = kOpenH264Bitrate;
+	params.sSpatialLayers[0].iSpatialBitrate = bitrateKbps * 1000;
+	params.sSpatialLayers[0].iMaxSpatialBitrate = bitrateKbps * 1000;
 	params.sSpatialLayers[0].uiProfileIdc = PRO_BASELINE;
 	params.sSpatialLayers[0].uiLevelIdc = LEVEL_4_2;
 	params.sSpatialLayers[0].sSliceArgument.uiSliceMode = SM_FIXEDSLCNUM_SLICE;
@@ -701,6 +700,7 @@ void TwinpadClient::ResetVideoEncoder()
 	m_encoderWidth = 0;
 	m_encoderHeight = 0;
 	m_encoderFps = 0;
+	m_encoderBitrateKbps = 0;
 	m_encoderHardwareActive = false;
 	m_encoderHardwarePreference = hardwareRequested;
 	m_encoderFrameIndex = 0;
@@ -948,12 +948,14 @@ bool TwinpadClient::EncodeGamePadFrame(
 		return false;
 
 	const uint8_t fps = std::clamp<uint8_t>(m_captureFps.load(), 1, 60);
+	const uint32_t bitrateKbps = std::clamp(m_captureBitrate.load(), 1000u, 30000u); // CR-027
 	const uint64_t nowUs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
 		std::chrono::steady_clock::now().time_since_epoch()).count());
 	std::scoped_lock lock(m_encoderMutex);
 	const bool hardwareRequested = m_hardwareAccelerationEnabled.load();
 	const bool encoderExists = m_videoEncoder || m_hardwareVideoEncoder;
-	const bool encoderConfigChanged = m_encoderWidth != width || m_encoderHeight != height || m_encoderFps != fps;
+	const bool encoderConfigChanged = m_encoderWidth != width || m_encoderHeight != height || m_encoderFps != fps
+		|| m_encoderBitrateKbps != bitrateKbps;
 	const bool hardwarePreferenceChanged = hardwareRequested != m_encoderHardwarePreference;
 	if (!encoderExists || encoderConfigChanged || hardwarePreferenceChanged)
 	{
@@ -973,7 +975,7 @@ bool TwinpadClient::EncodeGamePadFrame(
 		m_encoderHardwarePreference = hardwareRequested;
 		if (hardwareRequested)
 		{
-			auto hardwareEncoder = CreateHardwareH264Encoder(width, height, fps);
+			auto hardwareEncoder = CreateHardwareH264Encoder(width, height, fps, bitrateKbps);
 			if (hardwareEncoder)
 			{
 				m_hardwareVideoEncoder = hardwareEncoder.release();
@@ -988,7 +990,7 @@ bool TwinpadClient::EncodeGamePadFrame(
 		}
 		if (!m_encoderHardwareActive)
 		{
-			m_videoEncoder = CreateOpenH264Encoder(width, height, fps);
+			m_videoEncoder = CreateOpenH264Encoder(width, height, fps, bitrateKbps);
 			if (!m_videoEncoder)
 				return false;
 			cemuLog_log(LogType::Force, "[TwinpadVideo] encoder=OpenH264 CPU");
@@ -996,6 +998,7 @@ bool TwinpadClient::EncodeGamePadFrame(
 		m_encoderWidth = width;
 		m_encoderHeight = height;
 		m_encoderFps = fps;
+		m_encoderBitrateKbps = bitrateKbps;
 		m_encoderFrameIndex = 0;
 		m_forceNextIdr = true;
 		m_lastIdrTimestampUs = 0;
@@ -1053,7 +1056,7 @@ bool TwinpadClient::EncodeGamePadFrame(
 		delete static_cast<TwinpadFfmpegEncoder*>(m_hardwareVideoEncoder);
 		m_hardwareVideoEncoder = nullptr;
 		m_encoderHardwareActive = false;
-		m_videoEncoder = CreateOpenH264Encoder(width, height, fps);
+		m_videoEncoder = CreateOpenH264Encoder(width, height, fps, bitrateKbps);
 		if (!m_videoEncoder)
 			return false;
 		output.annexB.clear();
@@ -1629,6 +1632,12 @@ void TwinpadClient::InputLoop()
 					{
 						SetCaptureFps(static_cast<uint8_t>(std::clamp(document["fps"].GetUint(), 1u, 60u)));
 					}
+					if (document.IsObject() && document.HasMember("type") && document["type"].IsString()
+						&& std::string_view(document["type"].GetString()) == "video_config"
+						&& document.HasMember("bitrate_kbps") && document["bitrate_kbps"].IsUint())
+					{
+						SetCaptureBitrate(std::clamp(document["bitrate_kbps"].GetUint(), 1000u, 30000u)); // CR-027
+					}
 					const auto report = ParseInputReport(document);
 					if (report)
 					{
@@ -1812,6 +1821,14 @@ void TwinpadClient::SetCaptureFps(uint8_t fps)
 	m_lastFrameQueuedUs.store(0);
 	if (g_renderer)
 		g_renderer->ResetTwinpadCapturePacing();
+	ResetVideoEncoder();
+}
+
+void TwinpadClient::SetCaptureBitrate(uint32_t bitrateKbps) // CR-027: bitrate en caliente
+{
+	bitrateKbps = std::clamp(bitrateKbps, 1000u, 30000u);
+	if (m_captureBitrate.exchange(bitrateKbps) == bitrateKbps)
+		return;
 	ResetVideoEncoder();
 }
 

@@ -161,10 +161,12 @@ public:
 		uint16_t height,
 		TwinpadPixelFormat format = TwinpadPixelFormat::Rgb8);
 	void SetCaptureFps(uint8_t fps);
+	void SetCaptureBitrate(uint32_t bitrateKbps);
 	void SetHardwareAccelerationEnabled(bool enabled) { m_hardwareAccelerationEnabled.store(enabled); }
 	bool IsHardwareAccelerationEnabled() const { return m_hardwareAccelerationEnabled.load(); }
 	bool IsHardwareEncoderActive();
 	uint8_t GetCaptureFps() const { return m_captureFps.load(); }
+	uint32_t GetCaptureBitrate() const { return m_captureBitrate.load(); }
 	bool EncodeGamePadFrame(const std::vector<uint8_t>& rgb, uint16_t width, uint16_t height, TwinpadEncodedFrame& output);
 	void ResetVideoEncoder();
 	void PublishAudioBlock(const int16_t* samples, size_t samplesPerChannel, uint8_t channels);
@@ -198,6 +200,7 @@ private:
 	std::atomic<uint64_t> m_lastFrameQueuedUs{0};
 	std::atomic<uint64_t> m_lastCaptureMs{0};
 	std::atomic<uint8_t> m_captureFps{30};
+	std::atomic<uint32_t> m_captureBitrate{8000}; // kbps (CR-027: default 8000, clamped en SetCaptureBitrate)
 	std::atomic_bool m_hardwareAccelerationEnabled{false};
 	mutable std::mutex m_inputMutex;
 	TwinpadInputState m_inputState{};
@@ -237,6 +240,7 @@ private:
 	uint16_t m_encoderWidth{};
 	uint16_t m_encoderHeight{};
 	uint8_t m_encoderFps{};
+	uint32_t m_encoderBitrateKbps{};
 	uint64_t m_encoderFrameIndex{};
 	bool m_forceNextIdr{true};
 	uint64_t m_lastIdrTimestampUs{};

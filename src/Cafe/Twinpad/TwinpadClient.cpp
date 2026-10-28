@@ -1928,6 +1928,33 @@ void TwinpadClient::PublishAudioBlock(const int16_t* samples, size_t samplesPerC
 	m_audioQueueChanged.notify_one();
 }
 
+void TwinpadClient::PublishRumble(const uint8_t* pattern, uint8_t length)
+{
+	if (!m_connected.load())
+		return;
+	static constexpr char kBase64Url[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+	std::string encoded;
+	for (size_t i = 0; i < length; i += 3)
+	{
+		const uint32_t b0 = pattern[i];
+		const uint32_t b1 = i + 1 < length ? pattern[i + 1] : 0;
+		const uint32_t b2 = i + 2 < length ? pattern[i + 2] : 0;
+		const uint32_t triple = (b0 << 16) | (b1 << 8) | b2;
+		encoded.push_back(kBase64Url[(triple >> 18) & 63]);
+		encoded.push_back(kBase64Url[(triple >> 12) & 63]);
+		if (i + 1 < length)
+			encoded.push_back(kBase64Url[(triple >> 6) & 63]);
+		if (i + 2 < length)
+			encoded.push_back(kBase64Url[triple & 63]);
+	}
+	const std::string line = "{\"type\":\"rumble\",\"length\":" + std::to_string(length) + ",\"data\":\"" + encoded + "\"}";
+	std::scoped_lock lock(m_primarySocketMutex);
+	if (!m_connected.load() || m_primarySocket < 0)
+		return;
+	if (!SendLine(m_primarySocket, line))
+		m_connected.store(false);
+}
+
 void TwinpadClient::FrameLoop()
 {
 	while (m_running.load())

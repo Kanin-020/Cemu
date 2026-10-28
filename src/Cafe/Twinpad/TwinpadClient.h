@@ -176,6 +176,8 @@ public:
 	static std::vector<uint8_t> ScaleRgb(
 		const std::vector<uint8_t>& rgb, uint16_t width, uint16_t height, uint16_t targetWidth, uint16_t targetHeight);
 	void PublishAudioBlock(const int16_t* samples, size_t samplesPerChannel, uint8_t channels);
+	// CR-033: patrón de VPADControlMotor hacia el teléfono; length 0 = parar.
+	void PublishRumble(const uint8_t* pattern, uint8_t length);
 	void RecordVideoMetric(TwinpadVideoMetricStage stage, uint64_t elapsedNanoseconds);
 	void RecordVideoEvent(TwinpadVideoMetricEvent event);
 	void FlushVideoMetricsIfDue();

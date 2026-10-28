@@ -4,6 +4,7 @@
 #include "audio/IAudioAPI.h"
 #include "Cafe/OS/libs/coreinit/coreinit_Time.h"
 #include "config/ActiveSettings.h"
+#include "Cafe/Twinpad/TwinpadClient.h"
 #include "Cafe/OS/libs/coreinit/coreinit_Alarm.h"
 #include "input/InputManager.h"
 #include "WindowSystem.h"
@@ -871,6 +872,8 @@ void vpadExport_VPADControlMotor(PPCInterpreter_t* hCPU)
 		if (length == 0)
 		{
 			controller->clear_rumble();
+			if (channel == 0)
+				TwinpadClient::Instance().PublishRumble(nullptr, 0); // CR-033: parada
 		}
 		else
 		{
@@ -880,6 +883,8 @@ void vpadExport_VPADControlMotor(PPCInterpreter_t* hCPU)
 				osLib_returnFromFunction(hCPU, -1); // TODO P: not sure about the exact return value
 				return;
 			}
+			if (channel == 0)
+				TwinpadClient::Instance().PublishRumble(pattern, length); // CR-033
 		}
 	}
 

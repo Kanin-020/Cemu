@@ -166,6 +166,7 @@ void TwinpadClient_base64url_test();
 void TwinpadClient_h264_encoder_test();
 void TwinpadClient_hardware_encoder_test();
 void TwinpadClient_drc_scale_test();
+void TwinpadCameraDecoder_camera_frame_test();
 void VulkanRenderer_twinpad_readback_test();
 
 void UnitTests()
@@ -182,6 +183,7 @@ void UnitTests()
 	TwinpadClient_h264_encoder_test();
 	TwinpadClient_hardware_encoder_test();
 	TwinpadClient_drc_scale_test();
+	TwinpadCameraDecoder_camera_frame_test();
 	VulkanRenderer_twinpad_readback_test();
 }
 

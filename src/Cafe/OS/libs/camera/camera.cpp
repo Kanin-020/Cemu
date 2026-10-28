@@ -5,6 +5,7 @@
 #include "Cafe/OS/libs/coreinit/coreinit_Alarm.h"
 #include "Cafe/OS/libs/coreinit/coreinit_Time.h"
 #include "Cafe/HW/Espresso/PPCCallback.h"
+#include "Cafe/Twinpad/TwinpadCameraDecoder.h"
 
 namespace camera
 {
@@ -165,6 +166,9 @@ namespace camera
 			if (camInstance->queue_targetSurfaces.empty())
 				continue;
 			auto& targetSurface = camInstance->queue_targetSurfaces.front();
+			// CR-034: rellena la superficie con el último frame NV12 de la cámara del teléfono.
+			if (uint8_t* surface = static_cast<uint8_t*>(targetSurface.surfacePtr.GetPtr()))
+				TwinpadCameraDecoder::Instance().CopyLatestNv12(surface, targetSurface.surfaceSize);
 			g_cameraHandlerParam->type = 0;
 			g_cameraHandlerParam->field1 = targetSurface.surfacePtr.GetMPTR();
 			g_cameraHandlerParam->field2 = targetSurface.surfaceSize;

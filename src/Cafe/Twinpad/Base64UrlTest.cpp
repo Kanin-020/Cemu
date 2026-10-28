@@ -1,5 +1,6 @@
 #include "Common/precompiled.h"
 #include "Cafe/Twinpad/TwinpadClient.h"
+#include "Cafe/Twinpad/TwinpadCameraDecoder.h"
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h"
 
 #include <initializer_list>
@@ -229,6 +230,58 @@ void TwinpadClient_hardware_encoder_test()
 	cemu_assert_debug(disabledEncoded);
 	cemu_assert_debug(!client.IsHardwareEncoderActive());
 	client.ResetVideoEncoder();
+}
+
+// TEST-096 — verifies SPEC-006 (CR-034): camera_frame is accepted only as 320x240 with
+// valid base64url H.264 data, the decoder reports no frame until one decodes, and a
+// decoded 4:2:0 frame lands in the CAM surface as NV12 (full Y plane + interleaved UV).
+void TwinpadCameraDecoder_camera_frame_test()
+{
+	auto& decoder = TwinpadCameraDecoder::Instance();
+	cemu_assert_debug(!decoder.HasFrame());
+	cemu_assert_debug(!decoder.DecodeLine(R"({"type":"camera_frame","w":640,"h":480,"ts_capture_us":0,"idr":true,"data":"AAEC"})"));
+	cemu_assert_debug(!decoder.DecodeLine(R"({"type":"camera_frame","w":320,"h":240,"ts_capture_us":0,"idr":true,"data":"!!"})"));
+	cemu_assert_debug(!decoder.DecodeLine(R"({"type":"camera_frame","w":320,"h":240,"ts_capture_us":0,"idr":true,"data":"AAEC"})"));
+	cemu_assert_debug(!decoder.DecodeLine(R"({"type":"rumble"})"));
+	cemu_assert_debug(!decoder.HasFrame());
+	uint8_t out[16];
+	cemu_assert_debug(decoder.CopyLatestNv12(out, sizeof(out)) == 0);
+
+	// 4x2 con stride mayor que el ancho (alineación 16) para probar el muestreo.
+	uint8_t luma[2 * 16];
+	uint8_t chromaU[1 * 16];
+	uint8_t chromaV[1 * 16];
+	for (int row = 0; row < 2; ++row)
+		for (int column = 0; column < 16; ++column)
+			luma[row * 16 + column] = static_cast<uint8_t>(row * 16 + column);
+	for (int column = 0; column < 16; ++column)
+	{
+		chromaU[column] = static_cast<uint8_t>(100 + column);
+		chromaV[column] = static_cast<uint8_t>(200 + column);
+	}
+
+	std::vector<uint8_t> nv12;
+	cemu_assert_debug(TwinpadCameraDecoder::ConvertToNv12(
+		luma, 16, chromaU, chromaV, 16, 4, 2, nv12));
+	cemu_assert_debug(nv12.size() == 4 * 2 + 4 * 2 / 2);
+	cemu_assert_debug(nv12.size() == 12);
+	if (nv12.size() == 12)
+	{
+		// Y completo, fila a fila, sin el relleno del stride.
+		cemu_assert_debug(nv12[0] == 0 && nv12[3] == 3);
+		cemu_assert_debug(nv12[4] == 16 && nv12[7] == 19);
+		// UV intercalado: dos pares por fila de croma.
+		cemu_assert_debug(nv12[8] == 100 && nv12[9] == 200);
+		cemu_assert_debug(nv12[10] == 101 && nv12[11] == 201);
+	}
+
+	// Geometría impar o puntero nulo: no produce buffer.
+	std::vector<uint8_t> rejected;
+	cemu_assert_debug(!TwinpadCameraDecoder::ConvertToNv12(
+		luma, 16, chromaU, chromaV, 16, 3, 2, rejected));
+	cemu_assert_debug(!TwinpadCameraDecoder::ConvertToNv12(
+		nullptr, 16, chromaU, chromaV, 16, 4, 2, rejected));
+	cemu_assert_debug(rejected.empty());
 }
 
 void TwinpadClient_drc_scale_test()

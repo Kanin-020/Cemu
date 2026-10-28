@@ -22,6 +22,7 @@ extern "C"
 #include <libavutil/opt.h>
 }
 #include "Cafe/CafeSystem.h"
+#include "Cafe/Twinpad/TwinpadCameraDecoder.h"
 #include "Cafe/HW/Latte/Renderer/Renderer.h"
 
 #if BOOST_OS_WINDOWS
@@ -999,8 +1000,9 @@ bool TwinpadClient::EncodeGamePadFrame(
 	const uint8_t fps = static_cast<uint8_t>(std::min<uint64_t>(cadenceFps, 120u)); // metadata del rate-control; sin pacing (CR-029)
 	const bool hardwareRequested = m_hardwareAccelerationEnabled.load();
 	const bool encoderExists = m_videoEncoder || m_hardwareVideoEncoder;
+	// CR-036: la cadencia medida ya no reinicia el encoder (solo metadata de rate-control).
 	const bool encoderConfigChanged = m_encoderWidth != width || m_encoderHeight != height
-		|| m_encoderBitrateKbps != bitrateKbps || cadenceChanged;
+		|| m_encoderBitrateKbps != bitrateKbps;
 	const bool hardwarePreferenceChanged = hardwareRequested != m_encoderHardwarePreference;
 	if (!encoderExists || encoderConfigChanged || hardwarePreferenceChanged)
 	{
@@ -1679,6 +1681,12 @@ void TwinpadClient::InputLoop()
 							&& document.HasMember("h") && document["h"].IsUint())
 							SetCaptureResolution(document["w"].GetUint(), document["h"].GetUint());
 					}
+					else if (document.IsObject() && document.HasMember("type") && document["type"].IsString()
+						&& std::string_view(document["type"].GetString()) == "camera_frame")
+					{
+						// CR-034: camera_frame H.264 320x240 del teléfono; se decodifica aquí.
+						TwinpadCameraDecoder::Instance().DecodeLine(std::string(m_receiveBuffer.data(), lineEnd));
+					}
 					const auto report = ParseInputReport(document);
 					if (report)
 					{
@@ -1967,19 +1975,34 @@ void TwinpadClient::FrameLoop()
 		{
 			std::unique_lock lock(m_frameQueueMutex);
 
-			m_frameQueueChanged.wait(lock, [this] { return !m_running.load() || m_hasPendingFrame; });
+			const bool gotFrame = m_frameQueueChanged.wait_for(lock, std::chrono::milliseconds(kFrameRepeatIntervalMs),
+				[this] { return !m_running.load() || m_hasPendingFrame; });
 			if (!m_running.load())
 				break;
 			if (!m_connected.load())
 			{
 				m_hasPendingFrame = false;
+				m_lastFrameRgb.clear();
 				continue;
 			}
-			frameData = std::move(m_pendingFrame);
-			width = m_pendingFrameWidth;
-			height = m_pendingFrameHeight;
-			format = m_pendingFrameFormat;
-			m_hasPendingFrame = false;
+			if (gotFrame)
+			{
+				frameData = std::move(m_pendingFrame);
+				width = m_pendingFrameWidth;
+				height = m_pendingFrameHeight;
+				format = m_pendingFrameFormat;
+				m_hasPendingFrame = false;
+			}
+			else
+			{
+				// CR-036: sin frame nuevo en el intervalo, repetir el último ya escalado (RGB8).
+				if (m_lastFrameRgb.empty())
+					continue;
+				frameData = m_lastFrameRgb;
+				width = m_lastFrameWidth;
+				height = m_lastFrameHeight;
+				format = TwinpadPixelFormat::Rgb8;
+			}
 		}
 
 		const auto pixelConvertStarted = std::chrono::steady_clock::now();
@@ -2020,6 +2043,9 @@ void TwinpadClient::FrameLoop()
 			RecordVideoMetric(TwinpadVideoMetricStage::SCALE,
 				std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - scaleStarted).count());
 		}
+		m_lastFrameRgb = frameData;
+		m_lastFrameWidth = width;
+		m_lastFrameHeight = height;
 		TwinpadEncodedFrame encodedFrame;
 		if (!EncodeGamePadFrame(frameData, width, height, encodedFrame))
 			continue;

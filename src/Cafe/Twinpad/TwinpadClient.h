@@ -215,6 +215,11 @@ private:
 	// medida; con un nominal fijo de 60, emitir a N fps reales acota el
 	// stream a N/60 del bitrate objetivo).
 	static constexpr uint8_t kEncoderNominalFps = 60; // estimación inicial
+	// CR-036: si no llega un frame nuevo en este intervalo, se repite el último.
+	static constexpr int kFrameRepeatIntervalMs = 100;
+	std::vector<uint8_t> m_lastFrameRgb; // último frame RGB8 ya escalado (solo FrameLoop)
+	uint16_t m_lastFrameWidth{};
+	uint16_t m_lastFrameHeight{};
 	static constexpr size_t kCadenceWindowFrames = 12;
 	std::vector<uint64_t> m_encodeStampsUs; // ventana rodante detrás de m_encoderMutex
 	uint16_t m_encoderNominalFps{}; // cadencia configurada en el encoder vigente

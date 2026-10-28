@@ -3,6 +3,8 @@ add_library(CemuCafe
   Account/AccountError.h
   Twinpad/TwinpadClient.cpp
   Twinpad/TwinpadClient.h
+  Twinpad/TwinpadCameraDecoder.cpp
+  Twinpad/TwinpadCameraDecoder.h
   Twinpad/Base64UrlTest.cpp
   Twinpad/GyroMonitorTest.cpp
   Twinpad/TwinpadMotionTest.cpp

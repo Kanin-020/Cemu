@@ -73,7 +73,6 @@ public:
 	void CancelScreenshotRequest();
 	void SetTwinpadCaptureEnabled(bool enabled) { m_twinpadCaptureEnabled.store(enabled); }
 	bool IsTwinpadCaptureEnabled() const { return m_twinpadCaptureEnabled.load(); }
-	void ResetTwinpadCapturePacing() { m_twinpadLastCaptureNs.store(0); }
 	bool ShouldCaptureTwinpadFrame();
 	void CaptureTwinpadFrame(LatteTextureView* texView);
 	void PublishTwinpadFrame(const std::vector<uint8>& rgb, int width, int height);
@@ -196,7 +195,7 @@ protected:
 	ScreenshotState m_screenshot_state = ScreenshotState::None;
 	bool m_screenshot_requested = false;
 	std::atomic_bool m_twinpadCaptureEnabled{false};
-	std::atomic<uint64_t> m_twinpadLastCaptureNs{0};
+
 	ScreenshotSaveFunction m_on_save_screenshot;
 
 	void SaveScreenshot(const std::vector<uint8>& rgb_data, int width, int height, bool mainWindow);

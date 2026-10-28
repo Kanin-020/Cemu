@@ -147,7 +147,6 @@ void TwinpadClient_h264_encoder_test()
 	client.SetHardwareAccelerationEnabled(false);
 	client.ResetVideoEncoder();
 	cemu_assert_debug(!client.IsHardwareAccelerationEnabled());
-	client.SetCaptureFps(30);
 	std::vector<uint8_t> frame(64 * 64 * 3);
 	for (size_t index = 0; index < frame.size(); ++index)
 		frame[index] = static_cast<uint8_t>((index * 37 + index / 19) % 256);
@@ -230,4 +229,48 @@ void TwinpadClient_hardware_encoder_test()
 	cemu_assert_debug(disabledEncoded);
 	cemu_assert_debug(!client.IsHardwareEncoderActive());
 	client.ResetVideoEncoder();
+}
+
+void TwinpadClient_drc_scale_test()
+{
+	// TEST-088 — verifies SPEC-003/CR-030: the GamePad (DRC) emission resolution
+	// is applied by nearest-neighbor scaling before the encoder, without upscale.
+	auto& client = TwinpadClient::Instance();
+	std::vector<uint8_t> source(2 * 2 * 3);
+	// Cuadrantes: izquierda azul, derecha roja (verificables por canal).
+	source[0] = 0; source[1] = 0; source[2] = 255; // píxel (0,0)
+	source[3] = 255; source[4] = 0; source[5] = 0; // píxel (1,0)
+	source[6] = 0; source[7] = 0; source[8] = 255; // píxel (0,1)
+	source[9] = 255; source[10] = 0; source[11] = 0; // píxel (1,1)
+
+	// Escala 2×2 → 2×2: identidad (los targets >= nativos no escalan).
+	const auto identity = TwinpadClient::ScaleRgb(source, 2, 2, 2, 2);
+	cemu_assert_debug(identity.size() == source.size());
+	cemu_assert_debug(identity == source);
+
+	// Escala 2×2 → 1×1: nearest muestrea el píxel superior izquierdo.
+	const auto shrunk = TwinpadClient::ScaleRgb(source, 2, 2, 1, 1);
+	cemu_assert_debug(shrunk.size() == 3);
+	if (shrunk.size() == 3)
+	{
+		cemu_assert_debug(shrunk[0] == 0);
+		cemu_assert_debug(shrunk[1] == 0);
+		cemu_assert_debug(shrunk[2] == 255);
+	}
+
+	// Sin upscale: pedir mayor conserva nativo.
+	const auto unchanged = TwinpadClient::ScaleRgb(source, 2, 2, 4, 4);
+	cemu_assert_debug(unchanged == source);
+
+	// Entrada inválida: buffer que no corresponde a w×h×3 → vacío.
+	cemu_assert_debug(TwinpadClient::ScaleRgb(source, 4, 4, 2, 2).empty());
+	cemu_assert_debug(TwinpadClient::ScaleRgb(source, 2, 2, 0, 2).empty());
+
+	// SetCaptureResolution: target impar se reduce al par inferior; 0/0 → nativo.
+	client.SetCaptureResolution(1919, 1079);
+	cemu_assert_debug(client.GetCaptureRequestWidth() == 1918);
+	cemu_assert_debug(client.GetCaptureRequestHeight() == 1078);
+	client.SetCaptureResolution(0, 0);
+	cemu_assert_debug(client.GetCaptureRequestWidth() == 0);
+	cemu_assert_debug(client.GetCaptureRequestHeight() == 0);
 }

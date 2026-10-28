@@ -18,6 +18,7 @@ enum class TwinpadVideoMetricStage : uint8_t
 	READBACK_COPY,
 	READBACK_READY,
 	PIXEL_CONVERT,
+	SCALE,
 	I420_CONVERT,
 	HARDWARE_ENCODER,
 	OPENH264,
@@ -160,15 +161,20 @@ public:
 		uint16_t width,
 		uint16_t height,
 		TwinpadPixelFormat format = TwinpadPixelFormat::Rgb8);
-	void SetCaptureFps(uint8_t fps);
 	void SetCaptureBitrate(uint32_t bitrateKbps);
+	// CR-030: resolución de emisión del GamePad (DRC). Solo afecta al frame
+	// publicado; la resolución de render del juego en TV no cambia.
+	void SetCaptureResolution(uint32_t width, uint32_t height);
+	uint32_t GetCaptureRequestWidth() const { return m_captureWidth.load(); }
+	uint32_t GetCaptureRequestHeight() const { return m_captureHeight.load(); }
 	void SetHardwareAccelerationEnabled(bool enabled) { m_hardwareAccelerationEnabled.store(enabled); }
 	bool IsHardwareAccelerationEnabled() const { return m_hardwareAccelerationEnabled.load(); }
 	bool IsHardwareEncoderActive();
-	uint8_t GetCaptureFps() const { return m_captureFps.load(); }
 	uint32_t GetCaptureBitrate() const { return m_captureBitrate.load(); }
 	bool EncodeGamePadFrame(const std::vector<uint8_t>& rgb, uint16_t width, uint16_t height, TwinpadEncodedFrame& output);
 	void ResetVideoEncoder();
+	static std::vector<uint8_t> ScaleRgb(
+		const std::vector<uint8_t>& rgb, uint16_t width, uint16_t height, uint16_t targetWidth, uint16_t targetHeight);
 	void PublishAudioBlock(const int16_t* samples, size_t samplesPerChannel, uint8_t channels);
 	void RecordVideoMetric(TwinpadVideoMetricStage stage, uint64_t elapsedNanoseconds);
 	void RecordVideoEvent(TwinpadVideoMetricEvent event);
@@ -197,10 +203,19 @@ private:
 	std::atomic<uint64_t> m_frameNumber{0};
 	std::atomic<uint64_t> m_audioSequence{0};
 	std::atomic<uint64_t> m_lastFrameSentMs{0};
-	std::atomic<uint64_t> m_lastFrameQueuedUs{0};
 	std::atomic<uint64_t> m_lastCaptureMs{0};
-	std::atomic<uint8_t> m_captureFps{30};
 	std::atomic<uint32_t> m_captureBitrate{8000}; // kbps (CR-027: default 8000, clamped en SetCaptureBitrate)
+	// CR-030: target de resolución del DRC (0/0 = nativo, sin escala).
+	std::atomic<uint32_t> m_captureWidth{0};
+	std::atomic<uint32_t> m_captureHeight{0};
+	// CR-029: sin pacing ni tope de fps. La cadencia del encoder es la que
+	// sostenga captura+encode (CR-030: el rate-control usa la cadencia REAL
+	// medida; con un nominal fijo de 60, emitir a N fps reales acota el
+	// stream a N/60 del bitrate objetivo).
+	static constexpr uint8_t kEncoderNominalFps = 60; // estimación inicial
+	static constexpr size_t kCadenceWindowFrames = 12;
+	std::vector<uint64_t> m_encodeStampsUs; // ventana rodante detrás de m_encoderMutex
+	uint16_t m_encoderNominalFps{}; // cadencia configurada en el encoder vigente
 	std::atomic_bool m_hardwareAccelerationEnabled{false};
 	mutable std::mutex m_inputMutex;
 	TwinpadInputState m_inputState{};
@@ -239,7 +254,6 @@ private:
 	bool m_encoderHardwarePreference{};
 	uint16_t m_encoderWidth{};
 	uint16_t m_encoderHeight{};
-	uint8_t m_encoderFps{};
 	uint32_t m_encoderBitrateKbps{};
 	uint64_t m_encoderFrameIndex{};
 	bool m_forceNextIdr{true};

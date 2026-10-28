@@ -696,11 +696,10 @@ void TwinpadClient::ResetVideoEncoder()
 		encoder->Uninitialize();
 		WelsDestroySVCEncoder(encoder);
 		m_videoEncoder = nullptr;
-	}
-	m_encoderWidth = 0;
-	m_encoderHeight = 0;
-	m_encoderFps = 0;
-	m_encoderBitrateKbps = 0;
+	}		m_encoderWidth = 0;
+		m_encoderHeight = 0;
+		m_encoderBitrateKbps = 0;
+		m_encoderNominalFps = 0;
 	m_encoderHardwareActive = false;
 	m_encoderHardwarePreference = hardwareRequested;
 	m_encoderFrameIndex = 0;
@@ -716,7 +715,6 @@ bool TwinpadClient::Start(bool captureGamePad)
 		return true;
 	m_captureGamePad.store(captureGamePad);
 	m_lastFrameSentMs.store(0);
-	m_lastFrameQueuedUs.store(0);
 	m_audioThread = std::thread(&TwinpadClient::AudioLoop, this);
 	m_frameThread = std::thread(&TwinpadClient::FrameLoop, this);
 	m_inputThread = std::thread(&TwinpadClient::InputLoop, this);
@@ -936,6 +934,30 @@ bool TwinpadClient::SendLine(std::intptr_t socket, const std::string& line)
 	return true;
 }
 
+std::vector<uint8_t> TwinpadClient::ScaleRgb(
+	const std::vector<uint8_t>& rgb, uint16_t width, uint16_t height, uint16_t targetWidth, uint16_t targetHeight) // CR-030
+{
+	if (!width || !height || !targetWidth || !targetHeight || rgb.size() != static_cast<size_t>(width) * height * 3)
+		return {};
+	if (targetWidth >= width && targetHeight >= height)
+		return rgb; // sin upscale (CR-030)
+	std::vector<uint8_t> target(static_cast<size_t>(targetWidth) * targetHeight * 3);
+	for (uint32_t targetY = 0; targetY < targetHeight; ++targetY)
+	{
+		const size_t sourceY = targetY * height / targetHeight;
+		for (uint32_t targetX = 0; targetX < targetWidth; ++targetX)
+		{
+			const size_t sourceX = targetX * width / targetWidth;
+			const size_t source = (sourceY * width + sourceX) * 3;
+			const size_t destination = (targetY * targetWidth + targetX) * 3;
+			target[destination] = rgb[source];
+			target[destination + 1] = rgb[source + 1];
+			target[destination + 2] = rgb[source + 2];
+		}
+	}
+	return target;
+}
+
 bool TwinpadClient::EncodeGamePadFrame(
 	const std::vector<uint8_t>& rgb,
 	uint16_t width,
@@ -947,15 +969,38 @@ bool TwinpadClient::EncodeGamePadFrame(
 		|| rgb.size() != static_cast<size_t>(width) * height * 3)
 		return false;
 
-	const uint8_t fps = std::clamp<uint8_t>(m_captureFps.load(), 1, 60);
 	const uint32_t bitrateKbps = std::clamp(m_captureBitrate.load(), 1000u, 30000u); // CR-027
 	const uint64_t nowUs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
 		std::chrono::steady_clock::now().time_since_epoch()).count());
 	std::scoped_lock lock(m_encoderMutex);
+	// CR-030 (bitrate): cadencia REAL de emisión para el rate-control. El
+	// presupuesto por frame es target/cadencia; con un nominal fijo de 60 la
+	// emisión a N fps reales acota el stream a N/60 del bitrate objetivo.
+	m_encodeStampsUs.push_back(nowUs);
+	if (m_encodeStampsUs.size() > kCadenceWindowFrames)
+		m_encodeStampsUs.erase(m_encodeStampsUs.begin());
+	uint16_t cadenceFps = kEncoderNominalFps;
+	if (m_encodeStampsUs.size() >= 2)
+	{
+		const uint64_t spanUs = nowUs - m_encodeStampsUs.front();
+		if (spanUs > 0)
+		{
+			cadenceFps = static_cast<uint16_t>(std::clamp<uint64_t>(
+				(m_encodeStampsUs.size() - 1) * 1000000 / spanUs, 5, 120));
+		}
+	}
+	// Histeresis: reconfigura solo si la cadencia varía >30% del nominal
+	// configurado y han pasado ≥2 s desde la última reconfiguración (evita
+	// palpitación de reset/IDR).
+	const bool cadenceChanged = m_encoderNominalFps != 0
+		&& nowUs - m_encoderEpochUs >= 2000000
+		&& (cadenceFps * 10 > m_encoderNominalFps * 13
+			|| cadenceFps * 13 < m_encoderNominalFps * 10);
+	const uint8_t fps = static_cast<uint8_t>(std::min<uint64_t>(cadenceFps, 120u)); // metadata del rate-control; sin pacing (CR-029)
 	const bool hardwareRequested = m_hardwareAccelerationEnabled.load();
 	const bool encoderExists = m_videoEncoder || m_hardwareVideoEncoder;
-	const bool encoderConfigChanged = m_encoderWidth != width || m_encoderHeight != height || m_encoderFps != fps
-		|| m_encoderBitrateKbps != bitrateKbps;
+	const bool encoderConfigChanged = m_encoderWidth != width || m_encoderHeight != height
+		|| m_encoderBitrateKbps != bitrateKbps || cadenceChanged;
 	const bool hardwarePreferenceChanged = hardwareRequested != m_encoderHardwarePreference;
 	if (!encoderExists || encoderConfigChanged || hardwarePreferenceChanged)
 	{
@@ -994,15 +1039,14 @@ bool TwinpadClient::EncodeGamePadFrame(
 			if (!m_videoEncoder)
 				return false;
 			cemuLog_log(LogType::Force, "[TwinpadVideo] encoder=OpenH264 CPU");
-		}
-		m_encoderWidth = width;
-		m_encoderHeight = height;
-		m_encoderFps = fps;
-		m_encoderBitrateKbps = bitrateKbps;
-		m_encoderFrameIndex = 0;
-		m_forceNextIdr = true;
-		m_lastIdrTimestampUs = 0;
-		m_encoderEpochUs = nowUs;
+		}	m_encoderWidth = width;
+	m_encoderHeight = height;
+	m_encoderBitrateKbps = bitrateKbps;
+	m_encoderNominalFps = fps;
+	m_encoderFrameIndex = 0;
+	m_forceNextIdr = true;
+	m_lastIdrTimestampUs = 0;
+	m_encoderEpochUs = nowUs;
 	}
 
 	const auto i420Started = std::chrono::steady_clock::now();
@@ -1105,7 +1149,7 @@ bool TwinpadClient::EncodeGamePadFrame(
 			picture.pData[0] = i420.data();
 			picture.pData[1] = uPlane;
 			picture.pData[2] = vPlane;
-			picture.uiTimeStamp = static_cast<long long>(m_encoderFrameIndex * 1000 / fps);
+			picture.uiTimeStamp = static_cast<long long>((nowUs - m_encoderEpochUs) / 1000); // CR-029: tiempo real
 			auto* cpuEncoder = static_cast<ISVCEncoder*>(m_videoEncoder);
 			if (forceIdr && cpuEncoder->ForceIntraFrame(true) != 0)
 				return false;
@@ -1150,7 +1194,7 @@ bool TwinpadClient::EncodeGamePadFrame(
 		picture.pData[0] = i420.data();
 		picture.pData[1] = uPlane;
 		picture.pData[2] = vPlane;
-		picture.uiTimeStamp = static_cast<long long>(m_encoderFrameIndex * 1000 / fps);
+		picture.uiTimeStamp = static_cast<long long>((nowUs - m_encoderEpochUs) / 1000); // CR-029: tiempo real
 		auto* encoder = static_cast<ISVCEncoder*>(m_videoEncoder);
 		if (forceIdr && encoder->ForceIntraFrame(true) != 0)
 			return false;
@@ -1542,7 +1586,6 @@ void TwinpadClient::InputLoop()
 				m_frameNumber.store(0);
 				m_audioSequence.store(0);
 				ResetVideoEncoder();
-				m_lastFrameQueuedUs.store(0);
 				m_receiveBuffer.clear();
 				{
 					std::scoped_lock lock(m_inputMutex);
@@ -1627,16 +1670,14 @@ void TwinpadClient::InputLoop()
 				if (!document.HasParseError())
 				{
 					if (document.IsObject() && document.HasMember("type") && document["type"].IsString()
-						&& std::string_view(document["type"].GetString()) == "video_config"
-						&& document.HasMember("fps") && document["fps"].IsUint())
+						&& std::string_view(document["type"].GetString()) == "video_config")
 					{
-						SetCaptureFps(static_cast<uint8_t>(std::clamp(document["fps"].GetUint(), 1u, 60u)));
-					}
-					if (document.IsObject() && document.HasMember("type") && document["type"].IsString()
-						&& std::string_view(document["type"].GetString()) == "video_config"
-						&& document.HasMember("bitrate_kbps") && document["bitrate_kbps"].IsUint())
-					{
-						SetCaptureBitrate(std::clamp(document["bitrate_kbps"].GetUint(), 1000u, 30000u)); // CR-027
+						if (document.HasMember("bitrate_kbps") && document["bitrate_kbps"].IsUint())
+							SetCaptureBitrate(std::clamp(document["bitrate_kbps"].GetUint(), 1000u, 30000u)); // CR-027; fps ignorado (CR-029)
+						// CR-030: resolución de emisión del GamePad (DRC); sin w/h se mantiene nativo.
+						if (document.HasMember("w") && document["w"].IsUint()
+							&& document.HasMember("h") && document["h"].IsUint())
+							SetCaptureResolution(document["w"].GetUint(), document["h"].GetUint());
 					}
 					const auto report = ParseInputReport(document);
 					if (report)
@@ -1786,7 +1827,7 @@ void TwinpadClient::FlushVideoMetricsIfDue()
 		return;
 
 	static constexpr const char* stageNames[] = {
-		"readback_copy", "readback_ready", "pixel_convert", "i420_convert",
+		"readback_copy", "readback_ready", "pixel_convert", "scale", "i420_convert",
 		"hardware_encoder", "openh264", "encode_pipeline", "base64_json", "ipc_send",
 	};
 	static constexpr const char* eventNames[] = {
@@ -1813,23 +1854,32 @@ void TwinpadClient::FlushVideoMetricsIfDue()
 	cemuLog_log(LogType::Force, "{}", summary);
 }
 
-void TwinpadClient::SetCaptureFps(uint8_t fps)
-{
-	fps = fps >= 1 && fps <= 60 ? fps : 30;
-	if (m_captureFps.exchange(fps) == fps)
-		return;
-	m_lastFrameQueuedUs.store(0);
-	if (g_renderer)
-		g_renderer->ResetTwinpadCapturePacing();
-	ResetVideoEncoder();
-}
-
 void TwinpadClient::SetCaptureBitrate(uint32_t bitrateKbps) // CR-027: bitrate en caliente
 {
 	bitrateKbps = std::clamp(bitrateKbps, 1000u, 30000u);
 	if (m_captureBitrate.exchange(bitrateKbps) == bitrateKbps)
 		return;
 	ResetVideoEncoder();
+}
+
+void TwinpadClient::SetCaptureResolution(uint32_t width, uint32_t height) // CR-030: resolución GamePad en caliente
+{
+	// CR-030: el encoding I420 exige dimensiones pares; el target impar
+	// se reduce al par inferior. 0/0 desactiva la escala (nativo).
+	width = (width >> 1) << 1;
+	height = (height >> 1) << 1;
+	if (width == 0 || height == 0)
+	{
+		m_captureWidth.store(0);
+		m_captureHeight.store(0);
+		return;
+	}
+	width = std::clamp(width, 16u, 3840u);
+	height = std::clamp(height, 16u, 2160u);
+	if (m_captureWidth.exchange(width) == width && m_captureHeight.exchange(height) == height)
+		return;
+	// La siguiente AU con dimensión efectiva distinta reinicia el encoder
+	// (encoderConfigChanged); no hace falta rearmarlo aquí.
 }
 
 void TwinpadClient::PublishGamePadFrame(
@@ -1842,17 +1892,9 @@ void TwinpadClient::PublishGamePadFrame(
 	if (!m_connected.load() || !m_captureGamePad.load() || !width || !height
 		|| pixels.size() != static_cast<size_t>(width) * height * bytesPerPixel)
 		return;
-	constexpr uint64_t kMicrosecondsPerSecond = 1'000'000;
-	const uint64_t now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-		std::chrono::steady_clock::now().time_since_epoch()).count());
-	const uint64_t fps = std::clamp<uint8_t>(m_captureFps.load(), 1, 60);
-	const uint64_t interval = kMicrosecondsPerSecond / fps;
+	// CR-029: sin pacing por fps; cada frame capturado entra en cola.
 	{
 		std::scoped_lock lock(m_frameQueueMutex);
-		const uint64_t previous = m_lastFrameQueuedUs.load();
-		if (now - previous < interval)
-			return;
-		m_lastFrameQueuedUs.store(now);
 		m_pendingFrame = std::move(pixels);
 		m_pendingFrameWidth = width;
 		m_pendingFrameHeight = height;
@@ -1936,6 +1978,21 @@ void TwinpadClient::FrameLoop()
 		}
 		RecordVideoMetric(TwinpadVideoMetricStage::PIXEL_CONVERT,
 			std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - pixelConvertStarted).count());
+		// CR-030: aplicar la resolución de emisión del GamePad (DRC). Solo
+		// reduce: si el target >= nativo se publica nativo (sin upscale).
+		const uint32_t targetWidth = m_captureWidth.load(std::memory_order_relaxed);
+		const uint32_t targetHeight = m_captureHeight.load(std::memory_order_relaxed);
+		if (targetWidth > 0 && targetHeight > 0
+			&& (targetWidth < static_cast<uint32_t>(width)
+				|| targetHeight < static_cast<uint32_t>(height)))
+		{
+			const auto scaleStarted = std::chrono::steady_clock::now();
+			frameData = ScaleRgb(frameData, width, height, static_cast<uint16_t>(targetWidth), static_cast<uint16_t>(targetHeight));
+			width = static_cast<uint16_t>(targetWidth);
+			height = static_cast<uint16_t>(targetHeight);
+			RecordVideoMetric(TwinpadVideoMetricStage::SCALE,
+				std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - scaleStarted).count());
+		}
 		TwinpadEncodedFrame encodedFrame;
 		if (!EncodeGamePadFrame(frameData, width, height, encodedFrame))
 			continue;

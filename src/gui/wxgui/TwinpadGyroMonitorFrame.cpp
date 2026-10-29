@@ -86,7 +86,12 @@ private:
 		const int valuesTop = size.GetHeight() - 145;
 		dc.SetFont(wxFont(16, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
 		dc.SetTextForeground(wxSystemSettings::GetColour(wxSYS_COLOUR_WINDOWTEXT));
-		dc.DrawText(wxString::Format("Android accel m/s²: %.3f / %.3f / %.3f", input.accel[0], input.accel[1], input.accel[2]), 18, valuesTop);
+		// A narrow const char* literal must not carry non-ASCII characters: passing it to
+		// wxString::Format goes through wxFormatString::AsWChar -> wxConvLibc.cMB2WC, which
+		// fails on the multibyte '²' and returns a NULL buffer that wx printf dereferences
+		// (SIGSEGV in TwinpadGyroMonitorView::OnPaint). Pass a wxString instead, which uses
+		// the wide/UTF-8 conversion path.
+		dc.DrawText(wxString::Format(wxString::FromUTF8("Android accel m/s²: %.3f / %.3f / %.3f"), input.accel[0], input.accel[1], input.accel[2]), 18, valuesTop);
 		dc.DrawText(wxString::Format("Android gyro rad/s: %.3f / %.3f / %.3f", input.gyro[0], input.gyro[1], input.gyro[2]), 18, valuesTop + 30);
 		if (fused.valid)
 			dc.DrawText(wxString::Format("VPAD fused X / Y / Z turns: %.4f / %.4f / %.4f", orientation[0], orientation[1], orientation[2]), 18, valuesTop + 60);

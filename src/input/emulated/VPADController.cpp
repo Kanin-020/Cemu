@@ -324,9 +324,12 @@ void VPADController::update_motion(VPADStatus_t& status, const TwinpadInputState
 	if (!input.motionValid || !TwinpadClient::Instance().HasFreshMotionInput()
 		|| !TwinpadMotionMapper::IsFinite(input))
 	{
+		// CR-021/SPEC-006: without fresh samples the fusion reports "waiting", but the
+		// Mahony state is preserved like in the DSU path (DSUControllerProvider never
+		// re-initializes its handler) so inputs resuming after a hiccup do not jump
+		// to the default pose.
 		m_has_last_twinpad_motion_sample = false;
 		m_last_twinpad_motion_timestamp_us = 0;
-		m_twinpad_motion_handler = WiiUMotionHandler{};
 		TwinpadClient::Instance().SetFusedMotionState(TwinpadFusedMotionState{});
 		return;
 	}
@@ -347,9 +350,9 @@ void VPADController::update_motion(VPADStatus_t& status, const TwinpadInputState
 	m_last_twinpad_motion_timestamp_us = input.motionTimestampUs;
 	if (elapsedSeconds > 0.2f)
 	{
-		m_twinpad_motion_handler = WiiUMotionHandler{};
-		TwinpadClient::Instance().SetFusedMotionState(TwinpadFusedMotionState{});
-		m_has_last_twinpad_motion_sample = false;
+		// SPEC-004: a gap over 200 ms only skips that sample. The Mahony state is
+		// preserved as in the DSU path (Mahony::updateIMU clamps large deltas), so a
+		// hiccup does not snap the orientation back to the default pose.
 		return;
 	}
 

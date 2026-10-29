@@ -182,6 +182,14 @@ public:
 	// `camera` la emite en las transiciones de instancias abiertas.
 	void PublishCameraRequest(bool on);
 	static std::string CameraRequestLine(bool on);
+	// CR-035: demanda vigente del micrófono del teléfono; el HLE `mic` la
+	// emite al abrir/cerrar con MICOpen/MICClose. El teléfono solo graba
+	// con demanda vigente (bajo demanda).
+	void PublishMicRequest(bool on);
+	static std::string MicRequestLine(bool on);
+	// CR-035: consumo por el HLE `mic` (s16 mono host-order); false si no
+	// hay datos frescos del teléfono (el HLE usa sus caminos existentes).
+	bool ConsumeMicSamples(int16_t* dst, size_t count);
 	void RecordVideoMetric(TwinpadVideoMetricStage stage, uint64_t elapsedNanoseconds);
 	void RecordVideoEvent(TwinpadVideoMetricEvent event);
 	void FlushVideoMetricsIfDue();
@@ -189,6 +197,7 @@ public:
 private:
 	friend void TwinpadClient_base64url_test();
 	friend void TwinpadClient_camera_request_test();
+	friend void TwinpadClient_mic_test();
 	friend void TwinpadClient_hardware_encoder_test();
 	friend void TwinpadGyroMonitor_test();
 	TwinpadClient() = default;
@@ -210,6 +219,8 @@ private:
 	// CR-038: último estado de demanda de cámara; ConnectPrimary lo reenvía
 	// tras game_announce si el IPC vivió una reconexión.
 	std::atomic_bool m_cameraDemandOn{false};
+	// CR-035: último estado de demanda de micrófono (idem cámara).
+	std::atomic_bool m_micDemandOn{false};
 	std::atomic<uint64_t> m_frameNumber{0};
 	std::atomic<uint64_t> m_audioSequence{0};
 	std::atomic<uint64_t> m_lastFrameSentMs{0};
@@ -243,6 +254,14 @@ private:
 	bool m_hasMotionTimestamp{};
 	uint64_t m_lastMotionTimestampUs{};
 	std::string m_receiveBuffer;
+	// CR-035: cola s16 host-order del micrófono del teléfono, drop-old a
+	// 1 s (32000 muestras @ 32 kHz). ConsumeMicSamples exige frescura.
+	static constexpr size_t kMicQueueMaxSamples = 32000; // 1 s @ 32 kHz
+	static constexpr uint64_t kMicFreshIntervalMs = 250;
+	std::mutex m_micSamplesMutex;
+	std::deque<int16_t> m_micSamples;
+	std::atomic<uint64_t> m_lastMicChunkMs{0};
+	bool FeedMicChunk(std::string_view line);
 	std::mutex m_lifecycleMutex;
 	std::mutex m_audioQueueMutex;
 	std::condition_variable m_audioQueueChanged;

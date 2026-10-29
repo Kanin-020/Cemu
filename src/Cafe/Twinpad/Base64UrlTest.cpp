@@ -282,17 +282,15 @@ void TwinpadCameraDecoder_camera_frame_test()
 	cemu_assert_debug(!TwinpadCameraDecoder::ConvertToNv12(
 		nullptr, 16, chromaU, chromaV, 16, 4, 2, rejected));
 	cemu_assert_debug(rejected.empty());
-}
-
-// TEST-0100 — verifies SPEC-006 (CR-038): the camera demand has exactly two canonical
+}// TEST-0100 — verifies SPEC-006 (CR-038): the camera demand has exactly two canonical
 // wire lines and is remembered safely while the IPC channel is offline (it will be
 // re-sent by ConnectPrimary after game_announce).
 void TwinpadClient_camera_request_test()
 {
 	cemu_assert_debug(TwinpadClient::CameraRequestLine(true)
-	 == R"({"type":"camera_request","on":true})");
+		== R"({"type":"camera_request","on":true})");
 	cemu_assert_debug(TwinpadClient::CameraRequestLine(false)
-	 == R"({"type":"camera_request","on":false})");
+		== R"({"type":"camera_request","on":false})");
 
 	// Sin conexión, recordar la demanda no debe crashear ni corromper estado.
 	TwinpadClient::Instance().PublishCameraRequest(true);
@@ -300,6 +298,52 @@ void TwinpadClient_camera_request_test()
 	TwinpadClient::Instance().PublishCameraRequest(false);
 	cemu_assert_debug(TwinpadClient::Instance().m_cameraDemandOn.load() == false);
 }
+
+// TEST-0103 — verifies SPEC-006 (CR-035): the microphone demand has exactly two
+// canonical wire lines, wire `mic_chunk` is strictly validated (sample/byte
+// coherence), it enqueues FIFO as host-order s16 and a warm queue feeds
+// ConsumeMicSamples only under fresh demand.
+void TwinpadClient_mic_test()
+{
+	cemu_assert_debug(TwinpadClient::MicRequestLine(true)
+		== R"({"type":"mic_request","on":true})");
+	cemu_assert_debug(TwinpadClient::MicRequestLine(false)
+		== R"({"type":"mic_request","on":false})");
+
+	// Sin conexión, recordar la demanda no debe crashear ni corromper estado.
+	TwinpadClient::Instance().PublishMicRequest(true);
+	cemu_assert_debug(TwinpadClient::Instance().m_micDemandOn.load() == true);
+	TwinpadClient::Instance().PublishMicRequest(false);
+	cemu_assert_debug(TwinpadClient::Instance().m_micDemandOn.load() == false);
+
+	auto& client = TwinpadClient::Instance();
+	// Chunk canónico: 32 muestras (1 ms @ 32 kHz); muestras 0x0001 y 0xFFFF en s16le.
+	std::vector<uint8_t> pcm(64, 0);
+	pcm[0] = 0x01; pcm[1] = 0x00; pcm[2] = 0xFF; pcm[3] = 0xFF;
+	const std::string encoded = TwinpadClient::Base64Url(pcm.data(), pcm.size());
+	const std::string chunkLine
+		= "{\"type\":\"mic_chunk\",\"samples\":32,\"data\":\"" + encoded + "\"}";
+	cemu_assert_debug(client.FeedMicChunk(chunkLine));
+
+	// Coherencia: bytes que no corresponden a `samples` o muestras fuera
+	// de rango se ignoran (E4 del CR-035).
+	const std::string badCount = "{\"type\":\"mic_chunk\",\"samples\":33,\"data\":\"" + encoded + "\"}";
+	cemu_assert_debug(!client.FeedMicChunk(badCount));
+	const std::string badType = "{\"type\":\"mic_chunk\",\"samples\":32,\"data\":\"!!\"}";
+	cemu_assert_debug(!client.FeedMicChunk(badType));
+	const std::string badMin = "{\"type\":\"mic_chunk\",\"samples\":31,\"data\":\"AAAA\"}";
+	cemu_assert_debug(!client.FeedMicChunk(badMin));
+
+	// Demanda vigente + cola fresca → s16 host-order FIFO y consumo completo.
+	client.PublishMicRequest(true);
+	int16_t sink[32] = {};
+	cemu_assert_debug(client.ConsumeMicSamples(sink, 32));
+	cemu_assert_debug(sink[0] == 1 && sink[1] == -1 && sink[2] == 0);
+	// La cola ya está vacía: sin datos suficientes no se consumen parciales.
+	cemu_assert_debug(!client.ConsumeMicSamples(sink, 32));
+	client.PublishMicRequest(false);
+}
+
 
 void TwinpadClient_drc_scale_test()
 {

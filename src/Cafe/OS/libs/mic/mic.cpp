@@ -2,6 +2,7 @@
 #include "input/InputManager.h"
 #include "audio/IAudioInputAPI.h"
 #include "config/CemuConfig.h"
+#include "Cafe/Twinpad/TwinpadClient.h"
 
 enum class MIC_RESULT
 {
@@ -206,6 +207,11 @@ void micExport_MICOpen(PPCInterpreter_t* hCPU)
 	MICStatus.drc[drcIndex].isOpen = true;
 	osLib_returnFromFunction(hCPU, (uint32)MIC_RESULT::SUCCESS);
 
+	// CR-035: bajo demanda — el teléfono solo graba mientras el juego tenga
+	// el micrófono del GamePad abierto (DRC0).
+	if (drcIndex == 0)
+		TwinpadClient::Instance().PublishMicRequest(true);
+
 	std::shared_lock lock(g_audioInputMutex);
 	if(g_inputAudio)
 		g_inputAudio->Play();
@@ -235,6 +241,10 @@ void micExport_MICClose(PPCInterpreter_t* hCPU)
 	// success
 	MICStatus.drc[drcIndex].isOpen = false;
 	osLib_returnFromFunction(hCPU, (uint32)MIC_RESULT::SUCCESS);
+
+	// CR-035: sin micrófono abierto no hay demanda de captura en el teléfono.
+	if (drcIndex == 0)
+		TwinpadClient::Instance().PublishMicRequest(false);
 
 	std::shared_lock lock(g_audioInputMutex);
 	if (g_inputAudio)
@@ -428,6 +438,14 @@ void mic_updateOnAXFrame()
 
 	std::shared_lock lock(g_audioInputMutex);
 	mic_updateDevicePlayState(true);
+	// CR-035: las muestras frescas del teléfono tienen precedencia; sin
+	// ellas se usan los caminos Cemu existentes (dispositivo del PC / blow mic).
+	sint16 phoneMicSamples[MIC_SAMPLES_PER_3MS_32KHZ];
+	if (TwinpadClient::Instance().ConsumeMicSamples(phoneMicSamples, MIC_SAMPLES_PER_3MS_32KHZ))
+	{
+		mic_feedSamples(0, phoneMicSamples, MIC_SAMPLES_PER_3MS_32KHZ);
+		return;
+	}
 	if (g_inputAudio)
 	{
 		sint16 micSampleData[MIC_SAMPLES_PER_3MS_32KHZ];

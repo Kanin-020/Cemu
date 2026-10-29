@@ -10,6 +10,7 @@
 #include <string_view>
 #include <memory>
 #include <cstring>
+#include <deque>
 #include <rapidjson/document.h>
 #include <wels/codec_api.h>
 extern "C"
@@ -872,9 +873,11 @@ bool TwinpadClient::ConnectPrimary()
 		return false;
 	}
 	// CR-038: si la cámara ya estaba demandada, el canal recién conectado
-	// informa de inmediato al Servidor.
+	// informa de inmediato al Servidor. CR-035: idem micrófono.
 	if (m_cameraDemandOn.load())
 		SendLine(m_primarySocket, CameraRequestLine(true));
+	if (m_micDemandOn.load())
+		SendLine(m_primarySocket, MicRequestLine(true));
 	return true;
 }
 
@@ -1691,6 +1694,13 @@ void TwinpadClient::InputLoop()
 						// CR-034: camera_frame H.264 320x240 del teléfono; se decodifica aquí.
 						TwinpadCameraDecoder::Instance().DecodeLine(std::string(m_receiveBuffer.data(), lineEnd));
 					}
+					else if (document.IsObject() && document.HasMember("type") && document["type"].IsString()
+						&& std::string_view(document["type"].GetString()) == "mic_chunk")
+					{
+						// CR-035: PCM s16le mono 32 kHz del teléfono; entra a la cola
+						// drop-old que consume el HLE `mic` bajo demanda.
+						FeedMicChunk(std::string_view(m_receiveBuffer.data(), lineEnd));
+					}
 					const auto report = ParseInputReport(document);
 					if (report)
 					{
@@ -1985,6 +1995,125 @@ void TwinpadClient::PublishCameraRequest(bool on)
 		return;
 	if (!SendLine(m_primarySocket, CameraRequestLine(on)))
 		m_connected.store(false);
+}
+
+namespace
+{
+// CR-035: decodificador base64url sin relleno (mismo contrato que core;
+// duplicado de TwinpadCameraDecoder porque el codec H.264 no aplica aquí).
+int DecodeBase64UrlCharMic(char c)
+{
+	if (c >= 'A' && c <= 'Z') return c - 'A';
+	if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+	if (c >= '0' && c <= '9') return c - '0' + 52;
+	if (c == '-') return 62;
+	if (c == '_') return 63;
+	return -1;
+}
+
+bool DecodeBase64UrlMic(const char* text, size_t size, std::vector<uint8_t>& out)
+{
+	out.clear();
+	if (size == 0 || size % 4 == 1)
+		return false;
+	uint32_t buffer = 0;
+	int bits = 0;
+	for (size_t i = 0; i < size; ++i)
+	{
+		const int value = DecodeBase64UrlCharMic(text[i]);
+		if (value < 0)
+			return false;
+		buffer = (buffer << 6) | static_cast<uint32_t>(value);
+		bits += 6;
+		if (bits >= 8)
+		{
+			bits -= 8;
+			out.push_back(static_cast<uint8_t>((buffer >> bits) & 0xff));
+		}
+	}
+	return true;
+}
+} // namespace
+
+std::string TwinpadClient::MicRequestLine(bool on)
+{
+	// CR-035: única forma canónica de la línea, compartida por la demanda
+	// en vivo y el reenvío tras game_announce.
+	return on ? "{\"type\":\"mic_request\",\"on\":true}" : "{\"type\":\"mic_request\",\"on\":false}";
+}
+
+void TwinpadClient::PublishMicRequest(bool on)
+{
+	// CR-035: bajo demanda — el teléfono no graba sin este estado vigente;
+	// el HLE `mic` lo emite en las transiciones MICOpen/MICClose del juego.
+	m_micDemandOn.store(on);
+	std::scoped_lock lock(m_primarySocketMutex);
+	if (!m_connected.load() || m_primarySocket < 0)
+		return;
+	if (!SendLine(m_primarySocket, MicRequestLine(on)))
+		m_connected.store(false);
+}
+
+bool TwinpadClient::FeedMicChunk(std::string_view line)
+{
+	// CR-035: `mic_chunk` estricto — samples 32..32000 (1 ms..1 s @ 32 kHz)
+	// y 2 bytes por muestra s16le; lo incoherente se ignora (E4).
+	rapidjson::Document document;
+	document.Parse(line.data(), line.size());
+	if (document.HasParseError() || !document.IsObject())
+		return false;
+	if (!document.HasMember("type") || !document["type"].IsString()
+		|| std::string_view(document["type"].GetString()) != "mic_chunk")
+		return false;
+	if (!document.HasMember("samples") || !document["samples"].IsUint())
+		return false;
+	const uint32_t samples = document["samples"].GetUint();
+	if (samples < 32 || samples > 32000)
+		return false;
+	if (!document.HasMember("data") || !document["data"].IsString())
+		return false;
+	const char* base64Data = document["data"].GetString();
+	std::vector<uint8_t> decoded;
+	if (!DecodeBase64UrlMic(base64Data, document["data"].GetStringLength(), decoded))
+		return false;
+	if (decoded.size() != static_cast<size_t>(samples) * 2)
+		return false;
+	std::deque<int16_t> chunk;
+	for (size_t i = 0; i < decoded.size(); i += 2)
+		chunk.push_back(static_cast<int16_t>(static_cast<uint16_t>(decoded[i]) | (static_cast<uint16_t>(decoded[i + 1]) << 8)));
+	{
+		// Drop-old: si la cola superaría 1 s de audio, se descarta lo más antiguo.
+		std::scoped_lock lock(m_micSamplesMutex);
+		const size_t overflow = m_micSamples.size() + chunk.size() - kMicQueueMaxSamples;
+		if (overflow > 0)
+			m_micSamples.erase(m_micSamples.begin(), m_micSamples.begin() + static_cast<std::ptrdiff_t>(std::min(overflow, m_micSamples.size())));
+		m_micSamples.insert(m_micSamples.end(), chunk.begin(), chunk.end());
+	}
+	m_lastMicChunkMs.store(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count()));
+	return true;
+}
+
+bool TwinpadClient::ConsumeMicSamples(int16_t* dst, size_t count)
+{
+	if (!dst || count == 0 || !m_micDemandOn.load())
+		return false;
+	const auto nowMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count());
+	// CR-035: sin chunks frescos el HLE vuelve a sus caminos existentes
+	// (dispositivo de entrada del PC / blow mic / silencio).
+	const uint64_t last = m_lastMicChunkMs.load();
+	if (nowMs > last + kMicFreshIntervalMs)
+		return false;
+	std::scoped_lock lock(m_micSamplesMutex);
+	if (m_micSamples.size() < count)
+		return false;
+	for (size_t i = 0; i < count; ++i)
+	{
+		dst[i] = m_micSamples.front();
+		m_micSamples.pop_front();
+	}
+	return true;
 }
 
 void TwinpadClient::FrameLoop()

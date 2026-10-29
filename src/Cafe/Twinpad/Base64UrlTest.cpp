@@ -88,7 +88,7 @@ struct H264ParameterSets
 	bool sps{};
 	bool pps{};
 	bool idr{};
-	bool constrainedBaselineLevel42{};
+	bool contractCompliant{};
 };
 
 H264ParameterSets InspectAnnexB(const std::vector<uint8_t>& bytes)
@@ -131,7 +131,8 @@ H264ParameterSets InspectAnnexB(const std::vector<uint8_t>& bytes)
 				const uint8_t profileIdc = bytes[nal + 1];
 				const uint8_t constraints = bytes[nal + 2];
 				const uint8_t levelIdc = bytes[nal + 3];
-				result.constrainedBaselineLevel42 |= profileIdc == 66 && (constraints & 0x40) != 0 && levelIdc == 42;
+				// CR-041: contrato del stream relajado — Baseline (66) o Main (77), nivel ≤4.2.
+				result.contractCompliant |= (profileIdc == 66 || profileIdc == 77) && levelIdc != 0 && levelIdc <= 42;
 			}
 		}
 		start = next;
@@ -162,7 +163,7 @@ void TwinpadClient_h264_encoder_test()
 		cemu_assert_debug(nals.idr);
 		cemu_assert_debug(nals.sps);
 		cemu_assert_debug(nals.pps);
-		cemu_assert_debug(nals.constrainedBaselineLevel42);
+		cemu_assert_debug(nals.contractCompliant);
 	}
 	cemu_assert_debug(!client.IsHardwareEncoderActive());
 	std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -183,7 +184,7 @@ void TwinpadClient_h264_encoder_test()
 		cemu_assert_debug(nals.idr);
 		cemu_assert_debug(nals.sps);
 		cemu_assert_debug(nals.pps);
-		cemu_assert_debug(nals.constrainedBaselineLevel42);
+		cemu_assert_debug(nals.contractCompliant);
 	}
 
 	client.ResetVideoEncoder();
@@ -221,7 +222,7 @@ void TwinpadClient_hardware_encoder_test()
 		cemu_assert_debug(nals.idr);
 		cemu_assert_debug(nals.sps);
 		cemu_assert_debug(nals.pps);
-		cemu_assert_debug(nals.constrainedBaselineLevel42);
+		cemu_assert_debug(nals.contractCompliant);
 	}
 
 	client.SetHardwareAccelerationEnabled(false);

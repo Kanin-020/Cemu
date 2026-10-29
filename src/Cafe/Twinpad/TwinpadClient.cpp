@@ -128,6 +128,27 @@ bool ContainsH264Nal(const uint8_t* bytes, size_t size, uint8_t nalType)
 	return false;
 }
 
+// CR-040 verificación: payload del primer NAL del tipo pedido (sin start code),
+// vacío si no existe. Las cabeceras de SPS necesarios caben con holgura.
+const std::vector<uint8_t> FirstH264Nal(const std::vector<uint8_t>& annexB, uint8_t nalType)
+{
+	size_t prefixSize = 0;
+	size_t nextPrefixSize = 0;
+	size_t start = FindAnnexBStartCode(annexB.data(), annexB.size(), 0, prefixSize);
+	while (start < annexB.size())
+	{
+		const size_t nal = start + prefixSize;
+		if (nal < annexB.size() && (annexB[nal] & 0x1f) == nalType)
+		{
+			const size_t next = FindAnnexBStartCode(annexB.data(), annexB.size(), nal + 1, nextPrefixSize);
+			return std::vector<uint8_t>(annexB.begin() + nal, annexB.begin() + std::min(next, annexB.size()));
+		}
+		start = FindAnnexBStartCode(annexB.data(), annexB.size(), nal + 1, nextPrefixSize);
+		prefixSize = nextPrefixSize;
+	}
+	return {};
+}
+
 bool ExtractH264ParameterSets(const uint8_t* extradata, size_t size, std::vector<uint8_t>& output)
 {
 	output.clear();
@@ -195,7 +216,7 @@ bool ExtractH264ParameterSets(const uint8_t* extradata, size_t size, std::vector
 		&& ContainsH264Nal(output.data(), output.size(), kH264PpsNalType);
 }
 
-bool HasConstrainedBaselineLevel42(const std::vector<uint8_t>& annexB);
+bool HasH264ContractProfile(const std::vector<uint8_t>& annexB);
 
 struct TwinpadFfmpegEncoder
 {
@@ -338,7 +359,7 @@ struct TwinpadFfmpegEncoder
 		if (forceIdr && (!ContainsH264Nal(output.data(), output.size(), kH264IdrNalType)
 			|| !ContainsH264Nal(output.data(), output.size(), kH264SpsNalType)
 			|| !ContainsH264Nal(output.data(), output.size(), kH264PpsNalType)
-			|| !HasConstrainedBaselineLevel42(output)))
+			|| !HasH264ContractProfile(output)))
 			return false;
 		return !output.empty();
 	}
@@ -429,7 +450,11 @@ std::unique_ptr<TwinpadFfmpegEncoder> CreateHardwareH264Encoder(uint16_t width, 
 			frames->height = height;
 			frames->initial_pool_size = 8;
 			if (av_hwframe_ctx_init(encoder->hwFrames) < 0)
+			{
+				cemuLog_log(LogType::Force, "[TwinpadVideo] hardware candidate {} discarded: hw frames context init failed ({}x{} NV12, pool=8)",
+					encoder->name, width, height);
 				continue;
+			}
 			context->hw_frames_ctx = av_buffer_ref(encoder->hwFrames);
 			if (!context->hw_frames_ctx)
 				continue;
@@ -441,9 +466,10 @@ std::unique_ptr<TwinpadFfmpegEncoder> CreateHardwareH264Encoder(uint16_t width, 
 		context->rc_buffer_size = bitrateKbps * 1000;
 		context->color_range = AVCOL_RANGE_MPEG;
 		context->gop_size = fps * 2;
-		context->max_b_frames = 0;
-		context->profile = AV_PROFILE_H264_CONSTRAINED_BASELINE;
-		context->level = 42;
+		context->max_b_frames = 0;			// CR-041: VAAPI negocia el perfil disponible del driver (Baseline o Main en
+			// radeonsi freeworld); los demás backends siguen pidiendo Constrained Baseline.
+			context->profile = vaapi ? AV_PROFILE_UNKNOWN : AV_PROFILE_H264_CONSTRAINED_BASELINE;
+			context->level = 42;
 		context->thread_count = 1;
 		context->flags |= AV_CODEC_FLAG_LOW_DELAY;
 		if (!vaapi)
@@ -467,25 +493,35 @@ std::unique_ptr<TwinpadFfmpegEncoder> CreateHardwareH264Encoder(uint16_t width, 
 			av_dict_set(&options, "async_depth", "1", 0);
 			av_dict_set(&options, "forced_idr", "1", 0);
 			av_dict_set(&options, "profile", "constrained_baseline", 0);
-		}
-		else if (encoder->name == "h264_vaapi")
-		{
-			av_dict_set(&options, "rc_mode", "CBR", 0);
-			av_dict_set(&options, "profile", "constrained_baseline", 0);
+		}			else if (encoder->name == "h264_vaapi")
+			{
+				av_dict_set(&options, "rc_mode", "CBR", 0);
+				// CR-041: sin "profile=constrained_baseline" — el driver freeworld no
+				// lo expone y avcodec_open2 rebota (No usable encoding profile found).
 		}
 		else if (encoder->name == "h264_amf")
 		{
 			av_dict_set(&options, "usage", "ultralowlatency", 0);
 			av_dict_set(&options, "bf", "0", 0);
 			av_dict_set(&options, "profile", "constrained_baseline", 0);
-		}
-		const int openResult = avcodec_open2(context, codec, &options);
-		const bool optionsAccepted = av_dict_count(options) == 0;
-		av_dict_free(&options);
-		if (openResult < 0 || !optionsAccepted
-			|| context->profile != AV_PROFILE_H264_CONSTRAINED_BASELINE
-			|| context->level != 42 || context->max_b_frames != 0)
-			continue;
+		}			const int openResult = avcodec_open2(context, codec, &options);
+			const bool optionsAccepted = av_dict_count(options) == 0;
+			av_dict_free(&options);
+			// CR-041: el candidato negociado debe caer en el contrato del stream
+			// (Constrained Baseline 578, Baseline 66 o Main 77); solo los backends
+			// no-VAAPI fuerzan Constrained Baseline desde la configuración.
+			const bool contractProfile = context->profile == AV_PROFILE_H264_CONSTRAINED_BASELINE
+				|| context->profile == AV_PROFILE_H264_BASELINE
+				|| context->profile == AV_PROFILE_H264_MAIN;
+			if (openResult < 0 || !optionsAccepted
+				|| !contractProfile
+				|| context->level <= 0 || context->level > 42 || context->max_b_frames != 0)
+			{
+				// CR-040 verificación: motivo exacto del descarte del candidato (CR-041 diagnóstico de creación).
+				cemuLog_log(LogType::Force, "[TwinpadVideo] hardware candidate {} discarded at open: result={} options_left={} negotiated profile={} level={} b_frames={} (contract: profile 578/66/77, level ≤42, b=0)",
+					candidateName, openResult, optionsAccepted ? 0 : 1, context->profile, context->level, context->max_b_frames);
+				continue;
+			}
 		encoder->frame = av_frame_alloc();
 		encoder->softwareFrame = av_frame_alloc();
 		encoder->packet = av_packet_alloc();
@@ -495,10 +531,22 @@ std::unique_ptr<TwinpadFfmpegEncoder> CreateHardwareH264Encoder(uint16_t width, 
 		const bool avcConfiguration = extraDataSize > 0 && context->extradata[0] == 1;
 		const bool hasParameterSets = avcConfiguration
 			? ExtractH264ParameterSets(context->extradata, extraDataSize, encoder->annexBParameterSets)
-			: extraDataSize == 0;
-		if (avcConfiguration && (!hasParameterSets
-			|| !HasConstrainedBaselineLevel42(encoder->annexBParameterSets)))
-			continue;
+			: extraDataSize == 0;			if (avcConfiguration && (!hasParameterSets
+				|| !HasH264ContractProfile(encoder->annexBParameterSets)))
+			{
+				const auto& parameterSets = encoder->annexBParameterSets;
+				if (hasParameterSets && !parameterSets.empty())
+				{
+					const auto sps = FirstH264Nal(parameterSets, kH264SpsNalType);
+					if (sps.size() >= 4)
+						cemuLog_log(LogType::Force, "[TwinpadVideo] hardware candidate {} discarded: extradata SPS reads profile_idc={} constraint_flags=0x{:02x} level_idc={} (contract: profile 66/77, level ≤42)",
+							encoder->name, static_cast<unsigned>(sps[1]), static_cast<unsigned>(sps[2]), static_cast<unsigned>(sps[3]));
+				}
+				else
+					cemuLog_log(LogType::Force, "[TwinpadVideo] hardware candidate {} discarded: extradata has no parseable SPS (avc={}, size={})",
+						encoder->name, avcConfiguration ? 1 : 0, extraDataSize);
+				continue;
+			}
 		if (avcConfiguration)
 		{
 			const AVBitStreamFilter* filter = av_bsf_get_by_name("h264_mp4toannexb");
@@ -584,7 +632,13 @@ bool ContainsIdrNal(const std::vector<uint8_t>& annexB)
 	return ContainsH264Nal(annexB.data(), annexB.size(), kH264IdrNalType);
 }
 
-bool HasConstrainedBaselineLevel42(const std::vector<uint8_t>& annexB)
+// CR-041: contrato del stream relajado — Baseline (66, con o sin constraint_set0)
+// o Main (77), nivel ≤4.2, YUV 4:2:0, sin B-frames. Constrained Baseline 4.2
+// (66 + set0 + 42) sigue siendo válido como subconjunto. Motivo: el driver
+// radeonsi freeworld no expone Constrained Baseline y el encoder VAAPI rebota
+// definitivamente con el contrato estricto (log: negotiated profile=578, result=-38).
+// level_idc usa byte directo para todos los niveles estándar; 0 no es un nivel válido.
+bool HasH264ContractProfile(const std::vector<uint8_t>& annexB)
 {
 	size_t prefixSize = 0;
 	size_t start = FindAnnexBStartCode(annexB.data(), annexB.size(), 0, prefixSize);
@@ -592,7 +646,8 @@ bool HasConstrainedBaselineLevel42(const std::vector<uint8_t>& annexB)
 	{
 		const size_t nal = start + prefixSize;
 		if (nal + 3 < annexB.size() && (annexB[nal] & 0x1f) == kH264SpsNalType
-			&& annexB[nal + 1] == 66 && (annexB[nal + 2] & 0x40) != 0 && annexB[nal + 3] == 42)
+			&& (annexB[nal + 1] == 66 || annexB[nal + 1] == 77)
+			&& annexB[nal + 3] != 0 && annexB[nal + 3] <= 42)
 			return true;
 		size_t nextPrefixSize = 0;
 		start = FindAnnexBStartCode(annexB.data(), annexB.size(), nal + 1, nextPrefixSize);
@@ -1168,6 +1223,9 @@ bool TwinpadClient::EncodeGamePadFrame(
 		const bool hardwareEncoded = encoder->Encode(i420.data(), uPlane, vPlane, width, height,
 			static_cast<int64_t>(m_encoderFrameIndex), forceIdr, output.annexB);
 		if (!hardwareEncoded)
+			cemuLog_log(LogType::Force, "[TwinpadVideo] hardware backend {} did not produce an output AU on frame {} (idr_forced={})",
+				encoder->name, m_encoderFrameIndex, forceIdr ? 1 : 0);
+		if (!hardwareEncoded)
 		{
 			if (!fallbackToOpenH264())
 				return false;
@@ -1180,8 +1238,24 @@ bool TwinpadClient::EncodeGamePadFrame(
 			if (forceIdr && (!output.idr
 				|| !ContainsH264Nal(output.annexB.data(), output.annexB.size(), kH264SpsNalType)
 				|| !ContainsH264Nal(output.annexB.data(), output.annexB.size(), kH264PpsNalType)
-				|| !HasConstrainedBaselineLevel42(output.annexB)))
+				|| !HasH264ContractProfile(output.annexB)))
 			{
+				if (!output.idr)
+					cemuLog_log(LogType::Force, "[TwinpadVideo] hardware AE fell back: no IDR NAL in forced keyframe from {}", encoder->name);
+				else if (!ContainsH264Nal(output.annexB.data(), output.annexB.size(), kH264SpsNalType))
+					cemuLog_log(LogType::Force, "[TwinpadVideo] hardware AE fell back: forced keyframe from {} lacks SPS", encoder->name);
+				else if (!ContainsH264Nal(output.annexB.data(), output.annexB.size(), kH264PpsNalType))
+					cemuLog_log(LogType::Force, "[TwinpadVideo] hardware AE fell back: forced keyframe from {} lacks PPS", encoder->name);
+				else
+				{
+					const auto sps = FirstH264Nal(output.annexB, kH264SpsNalType);
+					if (sps.size() >= 4)
+						cemuLog_log(LogType::Force, "[TwinpadVideo] hardware AE fell back: forced SPS from {} reads profile_idc={} constraint_flags=0x{:02x} level_idc={} (contract: profile 66/77, level ≤42)",
+							encoder->name, static_cast<unsigned>(sps[1]), static_cast<unsigned>(sps[2]), static_cast<unsigned>(sps[3]));
+					else
+						cemuLog_log(LogType::Force, "[TwinpadVideo] hardware AE fell back: forced SPS from {} is too short ({} bytes) for contract parsing",
+							encoder->name, sps.size());
+				}
 				if (!fallbackToOpenH264())
 					return false;
 			}
@@ -1227,7 +1301,7 @@ bool TwinpadClient::EncodeGamePadFrame(
 			output.idr = info.eFrameType == videoFrameTypeIDR;
 			if (output.idr && (!ContainsH264Nal(output.annexB.data(), output.annexB.size(), kH264SpsNalType)
 				|| !ContainsH264Nal(output.annexB.data(), output.annexB.size(), kH264PpsNalType)
-				|| !HasConstrainedBaselineLevel42(output.annexB)))
+				|| !HasH264ContractProfile(output.annexB)))
 				return false;
 		}
 	}
@@ -1272,13 +1346,13 @@ bool TwinpadClient::EncodeGamePadFrame(
 		output.idr = info.eFrameType == videoFrameTypeIDR;
 		if (output.idr && (!ContainsH264Nal(output.annexB.data(), output.annexB.size(), kH264SpsNalType)
 			|| !ContainsH264Nal(output.annexB.data(), output.annexB.size(), kH264PpsNalType)
-			|| !HasConstrainedBaselineLevel42(output.annexB)))
+			|| !HasH264ContractProfile(output.annexB)))
 			return false;
 	}
 	output.timestampUs = nowUs >= m_encoderEpochUs ? nowUs - m_encoderEpochUs : 0;
 	if (forceIdr && (!output.idr || !ContainsH264Nal(output.annexB.data(), output.annexB.size(), kH264SpsNalType)
 		|| !ContainsH264Nal(output.annexB.data(), output.annexB.size(), kH264PpsNalType)
-		|| !HasConstrainedBaselineLevel42(output.annexB)))
+		|| !HasH264ContractProfile(output.annexB)))
 		return false;
 	if (output.idr)
 	{

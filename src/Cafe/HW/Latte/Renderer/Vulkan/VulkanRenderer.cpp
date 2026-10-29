@@ -922,6 +922,15 @@ VulkanRenderer::~VulkanRenderer()
 			vkUnmapMemory(m_logicalDevice, slot.memory);
 		memoryManager->DeleteBuffer(slot.buffer, slot.memory);
 	}
+	// CR-040: liberar la imagen de normalización del DRC.
+	if (m_twinpadDrcConvertImage != VK_NULL_HANDLE)
+	{
+		vkDestroyImage(m_logicalDevice, m_twinpadDrcConvertImage, nullptr);
+		m_twinpadDrcConvertImage = VK_NULL_HANDLE;
+		vkFreeMemory(m_logicalDevice, m_twinpadDrcConvertImageMemory, nullptr);
+		m_twinpadDrcConvertImageMemory = VK_NULL_HANDLE;
+		m_twinpadDrcConvertImageFormat = VK_FORMAT_UNDEFINED;
+	}
 	memoryManager->DeleteBuffer(m_textureReadbackBuffer, m_textureReadbackBufferMemory);
 	memoryManager->DeleteBuffer(m_xfbRingBuffer, m_xfbRingBufferMemory);
 	memoryManager->DeleteBuffer(m_occlusionQueries.bufferQueryResults, m_occlusionQueries.memoryQueryResults);
@@ -1037,6 +1046,63 @@ void VulkanRenderer::HandleScreenshotRequest(LatteTextureView* texView, bool pad
 	const bool screenshotRequested = m_screenshot_requested || m_screenshot_state != ScreenshotState::None;
 	if (screenshotRequested)
 		CaptureFrameTexture(texView, padView, false, true);
+}
+
+// CR-040: crea (una vez) la imagen de normalización del readback del DRC en
+// formato destino fijo por sesión (R8G8B8A8 unorm/srgb). Tamaño máximo fijo
+// (3840×2160, mismo techo que TWINPAD_READBACK_SIZE): nunca se recrea y el uso
+// queda ordenado por la cola de comandos del renderer.
+bool VulkanRenderer::EnsureTwinpadDrcConvertImage(VkFormat convertedFormat)
+{
+	if (m_twinpadDrcConvertImage != VK_NULL_HANDLE)
+		return m_twinpadDrcConvertImageFormat == convertedFormat;
+
+	VkImageCreateInfo imageInfo{};
+	imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	imageInfo.format = convertedFormat;
+	imageInfo.extent = { 3840, 2160, 1 };
+	imageInfo.imageType = VK_IMAGE_TYPE_2D;
+	imageInfo.arrayLayers = 1;
+	imageInfo.mipLevels = 1;
+	imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+	imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+	imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+	imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+	VkImage image = VK_NULL_HANDLE;
+	if (vkCreateImage(m_logicalDevice, &imageInfo, nullptr, &image) != VK_SUCCESS)
+		return false;
+
+	VkMemoryRequirements memoryRequirements{};
+	vkGetImageMemoryRequirements(m_logicalDevice, image, &memoryRequirements);
+	VkMemoryAllocateInfo allocateInfo{};
+	allocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	allocateInfo.allocationSize = memoryRequirements.size;
+	uint32 memoryTypeIndex{};
+	if (!memoryManager->FindMemoryType(memoryRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, memoryTypeIndex))
+	{
+		vkDestroyImage(m_logicalDevice, image, nullptr);
+		return false;
+	}
+	allocateInfo.memoryTypeIndex = memoryTypeIndex;
+	VkDeviceMemory memory = VK_NULL_HANDLE;
+	if (vkAllocateMemory(m_logicalDevice, &allocateInfo, nullptr, &memory) != VK_SUCCESS)
+	{
+		vkDestroyImage(m_logicalDevice, image, nullptr);
+		return false;
+	}
+	if (vkBindImageMemory(m_logicalDevice, image, memory, 0) != VK_SUCCESS)
+	{
+		vkFreeMemory(m_logicalDevice, memory, nullptr);
+		vkDestroyImage(m_logicalDevice, image, nullptr);
+		return false;
+	}
+
+	m_twinpadDrcConvertImage = image;
+	m_twinpadDrcConvertImageMemory = memory;
+	m_twinpadDrcConvertImageFormat = convertedFormat;
+	return true;
 }
 
 void VulkanRenderer::CaptureTwinpadFrameBackend(LatteTextureView* texView)
@@ -1186,18 +1252,17 @@ void VulkanRenderer::CaptureTwinpadFrameAsync(LatteTextureView* texView)
 
 	const uint32 width = texView->baseTexture->GetMipWidth(texView->firstMip);
 	const uint32 height = texView->baseTexture->GetMipHeight(texView->firstMip);
-	const VkFormat format = ((LatteTextureViewVk*)texView)->GetFormat();		// CR-036: el formato del DRC puede ser BGRA; considerar 4 bytes/pixel.
+	const VkFormat format = ((LatteTextureViewVk*)texView)->GetFormat();
 		const uint32 bytesPerPixel = format == VK_FORMAT_R8G8B8_UNORM || format == VK_FORMAT_R8G8B8_SRGB ? 3
 			: format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_R8G8B8A8_SRGB
 				|| format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB ? 4 : 0;
 	const VkDeviceSize copySize = static_cast<VkDeviceSize>(width) * height * bytesPerPixel;
-	if (bytesPerPixel == 0 || copySize == 0 || copySize > TWINPAD_READBACK_SIZE
-		|| texView->firstMip != 0 || texView->baseTexture->dim == Latte::E_DIM::DIM_3D)
+	// CR-036: los descartes por geometría (tamaño/mip/3D) siguen fail-loud.
+	if (copySize > TWINPAD_READBACK_SIZE || texView->firstMip != 0 || texView->baseTexture->dim == Latte::E_DIM::DIM_3D)
 	{
-		// CR-036 diagnóstico: identifíca el DRC que se rechaza en silencio (formato/geometría).
-		static std::atomic_bool warnedReject{false};
-		if (!warnedReject.exchange(true))
-			cemuLog_log(LogType::Force, "[TwinpadVideo] READBACK rechazado: fmt={} w={} h={} bpp={} copySize={} firstMip={} dim={}",
+		static std::atomic_bool warnedGeometricReject{false};
+		if (!warnedGeometricReject.exchange(true))
+			cemuLog_log(LogType::Force, "[TwinpadVideo] READBACK rechazado (geometría): fmt={} w={} h={} bpp={} copySize={} firstMip={} dim={}",
 				static_cast<int>(format), width, height, bytesPerPixel, static_cast<uint64_t>(copySize), texView->firstMip, static_cast<int>(texView->baseTexture->dim));
 		return;
 	}
@@ -1215,19 +1280,85 @@ void VulkanRenderer::CaptureTwinpadFrameAsync(LatteTextureView* texView)
 	region.imageSubresource.mipLevel = textureView->firstMip;
 	region.imageExtent = {width, height, 1};
 
+	// CR-040: formato fuera del conjunto directo (bytesPerPixel==0, p. ej.
+	// VK_FORMAT_A2B10G10R10_UNORM_PACK32 del DRC de Wind Waker HD → bpp=0)
+	// se normaliza en GPU a R8G8B8A8 y el copy sale de esa imagen; sin cambio
+	// de wire: el slot registra R8G8B8A8 unorm/srgb → Rgba8/Rgba8Srgb.
+	VkImage readbackImage = image->m_image;
+	VkFormat slotFormat = format;
+	VkDeviceSize slotCopySize = copySize;
+	if (bytesPerPixel == 0)
+	{
+		const VkFormat convertedFormat = LatteGPUState.drcBufferUsesSRGB ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+		bool normalized = EnsureTwinpadDrcConvertImage(convertedFormat);
+		if (normalized)
+		{
+			VkFormatProperties sourceProperties{}, convertedProperties{};
+			vkGetPhysicalDeviceFormatProperties(m_physicalDevice, format, &sourceProperties);
+			vkGetPhysicalDeviceFormatProperties(m_physicalDevice, convertedFormat, &convertedProperties);
+			normalized = (sourceProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) != 0
+				&& (convertedProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) != 0;
+		}
+		if (!normalized)
+		{
+			// CR-036 diagnóstico: descarte fail-loud (una vez por sesión) del formato sin normalización posible.
+			static std::atomic_bool warnedFormatReject{false};
+			if (!warnedFormatReject.exchange(true))
+				cemuLog_log(LogType::Force, "[TwinpadVideo] READBACK rechazado (formato {} sin soporte de blit para normalizar): w={} h={}",
+					static_cast<int>(format), width, height);
+			return;
+		}
+		static std::atomic_bool warnedNormalized{false};
+		if (!warnedNormalized.exchange(true))
+			cemuLog_log(LogType::Force, "[TwinpadVideo] READBACK normalizado en GPU: fmt={} w={} h={} → R8G8B8A8({})",
+				static_cast<int>(format), width, height, convertedFormat == VK_FORMAT_R8G8B8A8_SRGB ? "srgb" : "unorm");
+		readbackImage = m_twinpadDrcConvertImage;
+		slotFormat = convertedFormat;
+		slotCopySize = static_cast<VkDeviceSize>(width) * height * 4;
+	}
+
 	draw_endRenderPass();
 	barrier_image<ANY_TRANSFER | IMAGE_WRITE, TRANSFER_READ>(baseTexture, region.imageSubresource, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 	VkBufferImageCopy slotRegion = region;
 	slotRegion.bufferOffset = 0;
-	vkCmdCopyImageToBuffer(m_state.currentCommandBuffer, image->m_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		slot.buffer, 1, &slotRegion);
-	barrier_bufferRange<TRANSFER_WRITE, HOST_READ>(slot.buffer, 0, copySize);
+	if (readbackImage == image->m_image)
+	{
+		vkCmdCopyImageToBuffer(m_state.currentCommandBuffer, image->m_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			slot.buffer, 1, &slotRegion);
+	}
+	else
+	{
+		// CR-040: blit de la superficie DRC a la imagen RGBA8 y copy de esa imagen al buffer del slot.
+		VkImageSubresourceRange convertRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+		barrier_image<TRANSFER_READ, TRANSFER_WRITE>(m_twinpadDrcConvertImage, convertRange, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+		VkImageBlit blitRegion{};
+		blitRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		blitRegion.srcSubresource.mipLevel = 0;
+		blitRegion.srcSubresource.baseArrayLayer = textureView->firstSlice;
+		blitRegion.srcSubresource.layerCount = 1;
+		blitRegion.srcOffsets[1] = {static_cast<int32_t>(width), static_cast<int32_t>(height), 1};
+		blitRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		blitRegion.dstSubresource.mipLevel = 0;
+		blitRegion.dstSubresource.baseArrayLayer = 0;
+		blitRegion.dstSubresource.layerCount = 1;
+		blitRegion.dstOffsets[1] = blitRegion.srcOffsets[1];
+		vkCmdBlitImage(m_state.currentCommandBuffer, image->m_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			m_twinpadDrcConvertImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blitRegion, VK_FILTER_NEAREST);
+		barrier_image<TRANSFER_WRITE, TRANSFER_READ>(m_twinpadDrcConvertImage, convertRange, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+		slotRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		slotRegion.imageSubresource.baseArrayLayer = 0;
+		slotRegion.imageSubresource.layerCount = 1;
+		slotRegion.imageSubresource.mipLevel = 0;
+		vkCmdCopyImageToBuffer(m_state.currentCommandBuffer, m_twinpadDrcConvertImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			slot.buffer, 1, &slotRegion);
+	}
+	barrier_bufferRange<TRANSFER_WRITE, HOST_READ>(slot.buffer, 0, slotCopySize);
 	barrier_image<TRANSFER_READ, ANY_TRANSFER | IMAGE_WRITE>(baseTexture, region.imageSubresource, baseTexture->GetDefaultLayout());
 	slot.commandBufferId = GetCurrentCommandBufferId();
 	slot.sequence = m_twinpadReadbackSequence++;
 	slot.width = width;
 	slot.height = height;
-	slot.format = format;
+	slot.format = slotFormat;
 	slot.queuedAt = std::chrono::steady_clock::now();
 	slot.pending = true;
 	twinpad.RecordVideoEvent(TwinpadVideoMetricEvent::READBACK_QUEUED);

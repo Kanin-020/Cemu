@@ -669,6 +669,15 @@ private:
 	size_t m_twinpadReadbackWriteIndex{};
 	uint64 m_twinpadReadbackSequence{};
 
+	// CR-040: imagen de normalización del DRC. Los formatos fuera del conjunto
+	// directo (R8G8B8/R8G8B8A8/B8G8R8A8) se blitean aquí a R8G8B8A8 (unorm/srgb)
+	// y de ella sale el copy al buffer del slot; misma cola de comandos y
+	// submit-in-order garantizan un uso secuencial y sin solapes.
+	bool EnsureTwinpadDrcConvertImage(VkFormat convertedFormat);
+	VkImage m_twinpadDrcConvertImage{ VK_NULL_HANDLE };
+	VkDeviceMemory m_twinpadDrcConvertImageMemory{ VK_NULL_HANDLE };
+	VkFormat m_twinpadDrcConvertImageFormat{ VK_FORMAT_UNDEFINED };
+
 	// placeholder objects to simulate NULL buffers and textures
 	struct NullTexture
 	{

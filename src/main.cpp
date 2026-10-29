@@ -163,6 +163,7 @@ void InputManager_twinpad_vpad_test();
 void TwinpadMotionMapper_test();
 void TwinpadGyroMonitor_test();
 void TwinpadClient_base64url_test();
+void TwinpadClient_camera_request_test();
 void TwinpadClient_h264_encoder_test();
 void TwinpadClient_hardware_encoder_test();
 void TwinpadClient_drc_scale_test();
@@ -180,6 +181,7 @@ void UnitTests()
 	TwinpadMotionMapper_test();
 	TwinpadGyroMonitor_test();
 	TwinpadClient_base64url_test();
+	TwinpadClient_camera_request_test();
 	TwinpadClient_h264_encoder_test();
 	TwinpadClient_hardware_encoder_test();
 	TwinpadClient_drc_scale_test();

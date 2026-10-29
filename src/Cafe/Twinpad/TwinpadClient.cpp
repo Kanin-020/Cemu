@@ -871,6 +871,10 @@ bool TwinpadClient::ConnectPrimary()
 		m_primarySocket = -1;
 		return false;
 	}
+	// CR-038: si la cámara ya estaba demandada, el canal recién conectado
+	// informa de inmediato al Servidor.
+	if (m_cameraDemandOn.load())
+		SendLine(m_primarySocket, CameraRequestLine(true));
 	return true;
 }
 
@@ -1960,6 +1964,26 @@ void TwinpadClient::PublishRumble(const uint8_t* pattern, uint8_t length)
 	if (!m_connected.load() || m_primarySocket < 0)
 		return;
 	if (!SendLine(m_primarySocket, line))
+		m_connected.store(false);
+}
+
+std::string TwinpadClient::CameraRequestLine(bool on)
+{
+	// CR-038: única forma canónica de la línea, compartida por la demanda
+	// en vivo y el reenvío tras game_announce.
+	return on ? "{\"type\":\"camera_request\",\"on\":true}" : "{\"type\":\"camera_request\",\"on\":false}";
+}
+
+void TwinpadClient::PublishCameraRequest(bool on)
+{
+	// CR-038: el último estado se recuerda aunque el IPC no esté vivo, para
+	// que ConnectPrimary lo reenvíe al reconectar (el servidor lo entrega a
+	// la sesión que seleccione el Plugin).
+	m_cameraDemandOn.store(on);
+	std::scoped_lock lock(m_primarySocketMutex);
+	if (!m_connected.load() || m_primarySocket < 0)
+		return;
+	if (!SendLine(m_primarySocket, CameraRequestLine(on)))
 		m_connected.store(false);
 }
 

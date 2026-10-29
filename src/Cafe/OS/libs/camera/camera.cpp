@@ -6,6 +6,7 @@
 #include "Cafe/OS/libs/coreinit/coreinit_Time.h"
 #include "Cafe/HW/Espresso/PPCCallback.h"
 #include "Cafe/Twinpad/TwinpadCameraDecoder.h"
+#include "Cafe/Twinpad/TwinpadClient.h"
 
 namespace camera
 {
@@ -73,6 +74,18 @@ namespace camera
 		return g_table_cameraHandles[camHandle];
 	}
 
+	// CR-038: traduce la cantidad de instancias de cámara abiertas a la
+	// demanda vigente del video del teléfono. Solo habla en transiciones.
+	static std::atomic_bool s_cameraDemandSent{ false };
+
+	void NotifyCameraDemand(bool on)
+	{
+		if (s_cameraDemandSent.exchange(on) == on)
+			return;
+		TwinpadClient::Instance().PublishCameraRequest(on);
+		cemuLog_log(LogType::Force, "[TwinpadCamera] camera_request on={}", on);
+	}
+
 	struct CameraInstance 
 	{
 		CameraInstance(uint32 frameWidth, uint32 frameHeight, MPTR handlerFunc) : width(frameWidth), height(frameHeight), handlerFunc(handlerFunc) { AcquireHandle(); };
@@ -90,7 +103,14 @@ namespace camera
 			if (isOpen)
 				return false;
 			isOpen = true;
-			g_activeCameraInstances.push_back(this);
+			bool notify = false;
+			{
+				std::unique_lock<std::recursive_mutex> _lock(g_mutex_camera);
+				g_activeCameraInstances.push_back(this);
+				notify = g_activeCameraInstances.size() == 1; // 0 → 1 instancias
+			}
+			if (notify)
+				NotifyCameraDemand(true); // CR-038: pedir la cámara del teléfono
 			return true;
 		}
 
@@ -99,7 +119,14 @@ namespace camera
 			if (!isOpen)
 				return false;
 			isOpen = false;
-			vectorRemoveByValue(g_activeCameraInstances, this);
+			bool notify = false;
+			{
+				std::unique_lock<std::recursive_mutex> _lock(g_mutex_camera);
+				vectorRemoveByValue(g_activeCameraInstances, this);
+				notify = g_activeCameraInstances.empty(); // de vuelta a 0
+			}
+			if (notify)
+				NotifyCameraDemand(false); // CR-038: dejar de enviar la cámara
 			return true;
 		}
 

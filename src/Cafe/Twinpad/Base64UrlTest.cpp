@@ -284,6 +284,23 @@ void TwinpadCameraDecoder_camera_frame_test()
 	cemu_assert_debug(rejected.empty());
 }
 
+// TEST-0100 — verifies SPEC-006 (CR-038): the camera demand has exactly two canonical
+// wire lines and is remembered safely while the IPC channel is offline (it will be
+// re-sent by ConnectPrimary after game_announce).
+void TwinpadClient_camera_request_test()
+{
+	cemu_assert_debug(TwinpadClient::CameraRequestLine(true)
+	 == R"({"type":"camera_request","on":true})");
+	cemu_assert_debug(TwinpadClient::CameraRequestLine(false)
+	 == R"({"type":"camera_request","on":false})");
+
+	// Sin conexión, recordar la demanda no debe crashear ni corromper estado.
+	TwinpadClient::Instance().PublishCameraRequest(true);
+	cemu_assert_debug(TwinpadClient::Instance().m_cameraDemandOn.load() == true);
+	TwinpadClient::Instance().PublishCameraRequest(false);
+	cemu_assert_debug(TwinpadClient::Instance().m_cameraDemandOn.load() == false);
+}
+
 void TwinpadClient_drc_scale_test()
 {
 	// TEST-088 — verifies SPEC-003/CR-030: the GamePad (DRC) emission resolution

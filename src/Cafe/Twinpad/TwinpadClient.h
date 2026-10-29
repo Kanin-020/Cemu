@@ -178,12 +178,17 @@ public:
 	void PublishAudioBlock(const int16_t* samples, size_t samplesPerChannel, uint8_t channels);
 	// CR-033: patrón de VPADControlMotor hacia el teléfono; length 0 = parar.
 	void PublishRumble(const uint8_t* pattern, uint8_t length);
+	// CR-038: demanda vigente del video de la cámara del teléfono; el HLE
+	// `camera` la emite en las transiciones de instancias abiertas.
+	void PublishCameraRequest(bool on);
+	static std::string CameraRequestLine(bool on);
 	void RecordVideoMetric(TwinpadVideoMetricStage stage, uint64_t elapsedNanoseconds);
 	void RecordVideoEvent(TwinpadVideoMetricEvent event);
 	void FlushVideoMetricsIfDue();
 
 private:
 	friend void TwinpadClient_base64url_test();
+	friend void TwinpadClient_camera_request_test();
 	friend void TwinpadClient_hardware_encoder_test();
 	friend void TwinpadGyroMonitor_test();
 	TwinpadClient() = default;
@@ -202,6 +207,9 @@ private:
 	std::atomic_bool m_titleActive{false};
 	std::atomic_bool m_connectionRequested{false};
 	std::atomic_bool m_gyroMonitorEnabled{false};
+	// CR-038: último estado de demanda de cámara; ConnectPrimary lo reenvía
+	// tras game_announce si el IPC vivió una reconexión.
+	std::atomic_bool m_cameraDemandOn{false};
 	std::atomic<uint64_t> m_frameNumber{0};
 	std::atomic<uint64_t> m_audioSequence{0};
 	std::atomic<uint64_t> m_lastFrameSentMs{0};

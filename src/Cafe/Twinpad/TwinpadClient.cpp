@@ -10,6 +10,8 @@
 #include <string_view>
 #include <memory>
 #include <cstring>
+#include <filesystem>
+#include <cstdlib>
 #include <deque>
 #include <rapidjson/document.h>
 #include <wels/codec_api.h>
@@ -342,6 +344,39 @@ struct TwinpadFfmpegEncoder
 	}
 };
 
+// CR-039: en Linux, la variante GNU/libre del driver VA-API de AMD no publica
+// el entrypoint de encode H.264; el driver completo (RPM Fusion Free,
+// mesa-va-drivers-freeworld) solo se resuelve si libva recibe
+// LIBVA_DRIVERS_PATH. Tras un primer fallo de creación del device, exporta
+// el directorio freeworld (instalado o junto al ejecutable) y reintenta una vez.
+static bool CreateVaapiHwDevice(AVBufferRef** device)
+{
+	if (av_hwdevice_ctx_create(device, AV_HWDEVICE_TYPE_VAAPI, nullptr, nullptr, 0) == 0)
+		return true;
+#if BOOST_OS_LINUX
+	static bool sFreeworldPathExported = false;
+	if (sFreeworldPathExported)
+		return false;
+	sFreeworldPathExported = true;
+	std::string searchPath;
+	std::array<char, 4096> exePath{};
+	const ssize_t exeLength = readlink("/proc/self/exe", exePath.data(), exePath.size() - 1);
+	if (exeLength > 0)
+	{
+		exePath[exeLength] = '\0';
+		const std::filesystem::path exeDir = std::filesystem::path(exePath.data()).parent_path();
+		searchPath = (exeDir / "va-freeworld").string();
+	}
+	searchPath += ":/usr/lib64/dri-freeworld";
+	setenv("LIBVA_DRIVERS_PATH", searchPath.c_str(), 0); // respeta un valor externo ya definido
+	cemuLog_log(LogType::Force, "[TwinpadVideo] VAAPI device creation failed; retrying with freeworld drivers ({})",
+		searchPath);
+	return av_hwdevice_ctx_create(device, AV_HWDEVICE_TYPE_VAAPI, nullptr, nullptr, 0) == 0;
+#else
+	return false;
+#endif
+}
+
 std::unique_ptr<TwinpadFfmpegEncoder> CreateHardwareH264Encoder(uint16_t width, uint16_t height, uint8_t fps, uint32_t bitrateKbps)
 {
 #if BOOST_OS_WINDOWS
@@ -377,7 +412,12 @@ std::unique_ptr<TwinpadFfmpegEncoder> CreateHardwareH264Encoder(uint16_t width, 
 		if (encoder->hardwareFrames)
 		{
 			const AVHWDeviceType deviceType = vaapi ? AV_HWDEVICE_TYPE_VAAPI : AV_HWDEVICE_TYPE_QSV;
-			if (av_hwdevice_ctx_create(&encoder->hwDevice, deviceType, nullptr, nullptr, 0) < 0)
+			bool deviceCreated = false;
+			if (vaapi)
+				deviceCreated = CreateVaapiHwDevice(&encoder->hwDevice);
+			else
+				deviceCreated = av_hwdevice_ctx_create(&encoder->hwDevice, deviceType, nullptr, nullptr, 0) == 0;
+			if (!deviceCreated)
 				continue;
 			encoder->hwFrames = av_hwframe_ctx_alloc(encoder->hwDevice);
 			if (!encoder->hwFrames)

@@ -29,6 +29,7 @@
 
 #include "Cafe/HW/Latte/Core/LatteTiming.h" // vsync control
 
+#include <atomic>
 #include <cstdint>
 #include <glslang/Public/ShaderLang.h>
 
@@ -1116,6 +1117,9 @@ void VulkanRenderer::CaptureTwinpadFrameAsync(LatteTextureView* texView)
 		case VK_FORMAT_R8G8B8_SRGB: pixelFormat = TwinpadPixelFormat::Rgb8Srgb; break;
 		case VK_FORMAT_R8G8B8A8_UNORM: pixelFormat = TwinpadPixelFormat::Rgba8; break;
 		case VK_FORMAT_R8G8B8A8_SRGB: pixelFormat = TwinpadPixelFormat::Rgba8Srgb; break;
+		// CR-036: BGRA del DRC (p. ej. Wind Waker HD).
+		case VK_FORMAT_B8G8R8A8_UNORM: pixelFormat = TwinpadPixelFormat::Bgra8; break;
+		case VK_FORMAT_B8G8R8A8_SRGB: pixelFormat = TwinpadPixelFormat::Bgra8Srgb; break;
 		case VK_FORMAT_R8G8B8_UNORM: break;
 		default: newestCompleted.pending = false; return;
 		}
@@ -1132,7 +1136,13 @@ void VulkanRenderer::CaptureTwinpadFrameAsync(LatteTextureView* texView)
 	}
 
 	if (m_twinpadReadbackSlotCount == 0)
+	{
+		// CR-036 diagnóstico: este retorno silencioso dejó el video sin frames toda la sesión.
+		static std::atomic_bool warnedSlotsUnavail{false};
+		if (!warnedSlotsUnavail.exchange(true))
+			cemuLog_log(LogType::Force, "[TwinpadVideo] READBACK descartado: sin slots (CreateBuffer/vkMapMemory falló en init)");
 		return;
+	}
 	m_twinpadReadbackWriteIndex %= m_twinpadReadbackSlotCount;
 	size_t writeIndex = FindAvailableTwinpadReadbackSlot(
 		m_twinpadReadbackSlots, m_twinpadReadbackSlotCount, m_twinpadReadbackWriteIndex);
@@ -1154,12 +1164,13 @@ void VulkanRenderer::CaptureTwinpadFrameAsync(LatteTextureView* texView)
 			const size_t completedBytesPerPixel = staleCompleted.format == VK_FORMAT_R8G8B8_UNORM
 				|| staleCompleted.format == VK_FORMAT_R8G8B8_SRGB ? 3 : 4;
 			std::vector<uint8> pixels(staleCompleted.data,
-				staleCompleted.data + static_cast<size_t>(staleCompleted.width) * staleCompleted.height * completedBytesPerPixel);
-			const TwinpadPixelFormat pixelFormat = staleCompleted.format == VK_FORMAT_R8G8B8_SRGB
-				? TwinpadPixelFormat::Rgb8Srgb
-				: staleCompleted.format == VK_FORMAT_R8G8B8A8_UNORM ? TwinpadPixelFormat::Rgba8
-				: staleCompleted.format == VK_FORMAT_R8G8B8A8_SRGB ? TwinpadPixelFormat::Rgba8Srgb
-				: TwinpadPixelFormat::Rgb8;
+				staleCompleted.data + static_cast<size_t>(staleCompleted.width) * staleCompleted.height * completedBytesPerPixel);				const TwinpadPixelFormat pixelFormat = staleCompleted.format == VK_FORMAT_R8G8B8_SRGB
+					? TwinpadPixelFormat::Rgb8Srgb
+					: staleCompleted.format == VK_FORMAT_R8G8B8A8_UNORM ? TwinpadPixelFormat::Rgba8
+					: staleCompleted.format == VK_FORMAT_R8G8B8A8_SRGB ? TwinpadPixelFormat::Rgba8Srgb
+					: staleCompleted.format == VK_FORMAT_B8G8R8A8_UNORM ? TwinpadPixelFormat::Bgra8
+					: staleCompleted.format == VK_FORMAT_B8G8R8A8_SRGB ? TwinpadPixelFormat::Bgra8Srgb
+					: TwinpadPixelFormat::Rgb8;
 			twinpad.PublishGamePadFrame(std::move(pixels),
 				static_cast<uint16_t>(staleCompleted.width), static_cast<uint16_t>(staleCompleted.height), pixelFormat);
 			staleCompleted.pending = false;
@@ -1175,13 +1186,21 @@ void VulkanRenderer::CaptureTwinpadFrameAsync(LatteTextureView* texView)
 
 	const uint32 width = texView->baseTexture->GetMipWidth(texView->firstMip);
 	const uint32 height = texView->baseTexture->GetMipHeight(texView->firstMip);
-	const VkFormat format = ((LatteTextureViewVk*)texView)->GetFormat();
-	const uint32 bytesPerPixel = format == VK_FORMAT_R8G8B8_UNORM || format == VK_FORMAT_R8G8B8_SRGB ? 3
-		: format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_R8G8B8A8_SRGB ? 4 : 0;
+	const VkFormat format = ((LatteTextureViewVk*)texView)->GetFormat();		// CR-036: el formato del DRC puede ser BGRA; considerar 4 bytes/pixel.
+		const uint32 bytesPerPixel = format == VK_FORMAT_R8G8B8_UNORM || format == VK_FORMAT_R8G8B8_SRGB ? 3
+			: format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_R8G8B8A8_SRGB
+				|| format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB ? 4 : 0;
 	const VkDeviceSize copySize = static_cast<VkDeviceSize>(width) * height * bytesPerPixel;
 	if (bytesPerPixel == 0 || copySize == 0 || copySize > TWINPAD_READBACK_SIZE
 		|| texView->firstMip != 0 || texView->baseTexture->dim == Latte::E_DIM::DIM_3D)
+	{
+		// CR-036 diagnóstico: identifíca el DRC que se rechaza en silencio (formato/geometría).
+		static std::atomic_bool warnedReject{false};
+		if (!warnedReject.exchange(true))
+			cemuLog_log(LogType::Force, "[TwinpadVideo] READBACK rechazado: fmt={} w={} h={} bpp={} copySize={} firstMip={} dim={}",
+				static_cast<int>(format), width, height, bytesPerPixel, static_cast<uint64_t>(copySize), texView->firstMip, static_cast<int>(texView->baseTexture->dim));
 		return;
+	}
 
 	auto* textureView = (LatteTextureViewVk*)texView;
 	auto* baseTexture = textureView->GetBaseImage();

@@ -132,6 +132,11 @@ enum class TwinpadPixelFormat : uint8_t
 	Rgb8Srgb,
 	Rgba8,
 	Rgba8Srgb,
+	// CR-036: el DRC de títulos como Wind Waker HD usa BGRA; sin estos
+	// formatos el frame se rechazaba en silencio y la Segunda pantalla
+	// quedaba sin video.
+	Bgra8,
+	Bgra8Srgb,
 };
 
 class TwinpadClient

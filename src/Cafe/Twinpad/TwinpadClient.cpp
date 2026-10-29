@@ -2163,8 +2163,13 @@ void TwinpadClient::FrameLoop()
 		{
 			std::transform(frameData.begin(), frameData.end(), frameData.begin(), SrgbToRgb);
 		}
-		else if (format == TwinpadPixelFormat::Rgba8 || format == TwinpadPixelFormat::Rgba8Srgb)
+		else if (format == TwinpadPixelFormat::Rgba8 || format == TwinpadPixelFormat::Rgba8Srgb
+			|| format == TwinpadPixelFormat::Bgra8 || format == TwinpadPixelFormat::Bgra8Srgb)
 		{
+			// CR-036: BGRA del DRC (p. ej. Wind Waker HD) requiere el intercambio
+			// de los canales B y R para producir RGB; sRGB aplica gamma igual.
+			const bool swapBr = format == TwinpadPixelFormat::Bgra8 || format == TwinpadPixelFormat::Bgra8Srgb;
+			const bool applySrgb = format == TwinpadPixelFormat::Rgba8Srgb || format == TwinpadPixelFormat::Bgra8Srgb;
 			const size_t pixelCount = static_cast<size_t>(width) * height;
 			std::vector<uint8_t> rgb(pixelCount * 3);
 			for (size_t pixel = 0; pixel < pixelCount; ++pixel)
@@ -2173,8 +2178,9 @@ void TwinpadClient::FrameLoop()
 				const size_t destination = pixel * 3;
 				for (size_t channel = 0; channel < 3; ++channel)
 				{
-					const uint8_t value = frameData[source + channel];
-					rgb[destination + channel] = format == TwinpadPixelFormat::Rgba8Srgb ? SrgbToRgb(value) : value;
+					const size_t sourceChannel = swapBr && channel == 0 ? 2 : swapBr && channel == 2 ? 0 : channel;
+					const uint8_t value = frameData[source + sourceChannel];
+					rgb[destination + channel] = applySrgb ? SrgbToRgb(value) : value;
 				}
 			}
 			frameData = std::move(rgb);

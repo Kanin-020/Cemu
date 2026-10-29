@@ -151,7 +151,7 @@ class VulkanRenderer : public Renderer
 	static const inline int UNIFORMVAR_RINGBUFFER_SIZE = 1024 * 1024 * 16; // 16MB
 
 	static const inline int TEXTURE_READBACK_SIZE = 32 * 1024 * 1024; // 32 MB
-	static const inline uint32 TWINPAD_READBACK_SIZE = 16 * 1024 * 1024;
+	static const inline uint32 TWINPAD_READBACK_SIZE = 3840 * 2160 * 4; // CR-036: caber un DRC hasta 4K RGBA/BGRA
 	static const inline size_t TWINPAD_READBACK_SLOT_COUNT = 3;
 
 	static const inline int OCCLUSION_QUERY_POOL_SIZE = 1024;

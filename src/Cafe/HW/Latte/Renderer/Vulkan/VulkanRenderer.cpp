@@ -826,7 +826,7 @@ VulkanRenderer::VulkanRenderer() : Renderer(RendererAPI::Vulkan)
 	m_uniformVarBufferPtr = (uint8*)bufferPtr;
 
 	// texture readback buffer
-	if (!memoryManager->CreateBuffer(TEXTURE_READBACK_SIZE, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, m_textureReadbackBuffer, m_textureReadbackBufferMemory))
+	if (!memoryManager->CreateBuffer(TEXTURE_READBACK_SIZE, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, m_textureReadbackBuffer, m_textureReadbackBufferMemory))
 	{
 		memoryManager->CreateBuffer(TEXTURE_READBACK_SIZE, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, m_textureReadbackBuffer, m_textureReadbackBufferMemory);
 	}
@@ -837,10 +837,10 @@ VulkanRenderer::VulkanRenderer() : Renderer(RendererAPI::Vulkan)
 	for (auto& slot : m_twinpadReadbackSlots)
 	{
 		const bool bufferCreated = memoryManager->CreateBuffer(TWINPAD_READBACK_SIZE, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
 			slot.buffer, slot.memory)
 			|| memoryManager->CreateBuffer(TWINPAD_READBACK_SIZE, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
 				slot.buffer, slot.memory);
 		if (!bufferCreated)
 			break;
@@ -1328,28 +1328,42 @@ void VulkanRenderer::CaptureTwinpadFrameAsync(LatteTextureView* texView)
 	}
 	else
 	{
-		// CR-040: blit de la superficie DRC a la imagen RGBA8 y copy de esa imagen al buffer del slot.
-		VkImageSubresourceRange convertRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-		barrier_image<TRANSFER_READ, TRANSFER_WRITE>(m_twinpadDrcConvertImage, convertRange, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-		VkImageBlit blitRegion{};
-		blitRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		blitRegion.srcSubresource.mipLevel = 0;
-		blitRegion.srcSubresource.baseArrayLayer = textureView->firstSlice;
-		blitRegion.srcSubresource.layerCount = 1;
-		blitRegion.srcOffsets[1] = {static_cast<int32_t>(width), static_cast<int32_t>(height), 1};
-		blitRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		blitRegion.dstSubresource.mipLevel = 0;
-		blitRegion.dstSubresource.baseArrayLayer = 0;
-		blitRegion.dstSubresource.layerCount = 1;
-		blitRegion.dstOffsets[1] = blitRegion.srcOffsets[1];
-		vkCmdBlitImage(m_state.currentCommandBuffer, image->m_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-			m_twinpadDrcConvertImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blitRegion, VK_FILTER_NEAREST);
-		barrier_image<TRANSFER_WRITE, TRANSFER_READ>(m_twinpadDrcConvertImage, convertRange, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+		// CR-040: blit de la superficie DRC a la imagen RGBA8 solo si es necesario.
+		// Si el formato fuente ya es R8G8B8A8, saltarse el blit y hacer copy directo.
+		bool needsBlit = true;
+		VkFormatProperties srcProps{};
+		vkGetPhysicalDeviceFormatProperties(m_physicalDevice, format, &srcProps);
+		if (srcProps.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT)
+		{
+			VkFormatProperties dstProps{};
+			vkGetPhysicalDeviceFormatProperties(m_physicalDevice, convertedFormat, &dstProps);
+			needsBlit = (dstProps.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) != 0;
+		}
+
+		if (needsBlit)
+		{
+			VkImageSubresourceRange convertRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+			barrier_image<TRANSFER_READ, TRANSFER_WRITE>(m_twinpadDrcConvertImage, convertRange, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+			VkImageBlit blitRegion{};
+			blitRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			blitRegion.srcSubresource.mipLevel = 0;
+			blitRegion.srcSubresource.baseArrayLayer = textureView->firstSlice;
+			blitRegion.srcSubresource.layerCount = 1;
+			blitRegion.srcOffsets[1] = {static_cast<int32_t>(width), static_cast<int32_t>(height), 1};
+			blitRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			blitRegion.dstSubresource.mipLevel = 0;
+			blitRegion.dstSubresource.baseArrayLayer = 0;
+			blitRegion.dstSubresource.layerCount = 1;
+			blitRegion.dstOffsets[1] = blitRegion.srcOffsets[1];
+			vkCmdBlitImage(m_state.currentCommandBuffer, image->m_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+				m_twinpadDrcConvertImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blitRegion, VK_FILTER_NEAREST);
+			barrier_image<TRANSFER_WRITE, TRANSFER_READ>(m_twinpadDrcConvertImage, convertRange, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+		}
 		slotRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 		slotRegion.imageSubresource.baseArrayLayer = 0;
 		slotRegion.imageSubresource.layerCount = 1;
 		slotRegion.imageSubresource.mipLevel = 0;
-		vkCmdCopyImageToBuffer(m_state.currentCommandBuffer, m_twinpadDrcConvertImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		vkCmdCopyImageToBuffer(m_state.currentCommandBuffer, needsBlit ? m_twinpadDrcConvertImage : image->m_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 			slot.buffer, 1, &slotRegion);
 	}
 	barrier_bufferRange<TRANSFER_WRITE, HOST_READ>(slot.buffer, 0, slotCopySize);

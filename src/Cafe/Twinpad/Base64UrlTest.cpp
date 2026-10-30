@@ -389,3 +389,90 @@ void TwinpadClient_drc_scale_test()
 	cemu_assert_debug(client.GetCaptureRequestWidth() == 0);
 	cemu_assert_debug(client.GetCaptureRequestHeight() == 0);
 }
+
+// TEST-0110 — verifies SPEC-006 (CR-044): the `keyboard_request` demand has
+// two canonical wire lines (the `off` one without text or limit), the text
+// of the form travels base64url UTF-8 (UTF-16 units of the swkbd),
+// `keyboard_input` is strictly validated (known action, `update`-only text,
+// <= 2048 bytes), transitions enqueue FIFO for the swkbd thread and the
+// pending cap drops the oldest.
+void TwinpadClient_keyboard_test()
+{
+	cemu_assert_debug(TwinpadClient::KeyboardRequestLine(false, "", 0)
+		== R"({"type":"keyboard_request","on":false})");
+	cemu_assert_debug(TwinpadClient::KeyboardRequestLine(true, "aG9sYQ", 24)
+		== R"({"type":"keyboard_request","on":true,"text":"aG9sYQ","max_length":24})");
+
+	// Demanda on/off sin conexión: recuerda el estado sin crashear. El
+	// texto del form (UTF-16 → UTF-8 → base64url) queda en la instantánea.
+	auto& client = TwinpadClient::Instance();
+	const uint16_t form[] = {'h', 'o', 0x00F1, 'a'}; // "hoña"
+	const uint8_t hona_utf8[] = {'h', 'o', 0xC3, 0xB1, 'a'};
+	client.PublishKeyboardRequest(true, form, 4, 4096);
+	cemu_assert_debug(client.m_keyboardDemandOn.load() == true);
+	cemu_assert_debug(client.m_keyboardDemandMaxLength.load() == 4096);
+	cemu_assert_debug(client.m_keyboardDemandTextBase64Url
+		== TwinpadClient::Base64Url(hona_utf8, sizeof(hona_utf8)));
+	client.PublishKeyboardRequest(false, nullptr, 0, 0);
+	cemu_assert_debug(client.m_keyboardDemandOn.load() == false);
+
+	// `update` canónico: el texto completo en base64url se decodifica como
+	// unidades UTF-16 en orden.
+	cemu_assert_debug(client.FeedKeyboardInput(
+		R"({"type":"keyboard_input","action":"update","text":"aG9sYQ"})"));
+	TwinpadKeyboardPending pending;
+	cemu_assert_debug(client.ConsumeKeyboardInput(pending));
+	cemu_assert_debug(pending.action == TwinpadKeyboardPending::Action::Update);
+	cemu_assert_debug(pending.text.size() == 4);
+	if (pending.text.size() == 4)
+	{
+		cemu_assert_debug(pending.text[0] == 'h' && pending.text[1] == 'o'
+			&& pending.text[2] == 'l' && pending.text[3] == 'a');
+	}
+	cemu_assert_debug(!client.ConsumeKeyboardInput(pending));
+
+	// `update` vacío también es válido: borra todo el texto del form.
+	cemu_assert_debug(client.FeedKeyboardInput(R"({\"type\":\"keyboard_input\",\"action\":\"update\",\"text\":\"\"})"));
+	cemu_assert_debug(client.ConsumeKeyboardInput(pending));
+	cemu_assert_debug(pending.action == TwinpadKeyboardPending::Action::Update);
+	cemu_assert_debug(pending.text.empty());
+
+	// `confirm`/`cancel` llegan sin texto; son válidos y consumen una unidad.
+	cemu_assert_debug(client.FeedKeyboardInput(R"({"type":"keyboard_input","action":"confirm","text":""})"));
+	cemu_assert_debug(client.FeedKeyboardInput(R"({"type":"keyboard_input","action":"cancel","text":""})"));
+	cemu_assert_debug(client.ConsumeKeyboardInput(pending));
+	cemu_assert_debug(pending.action == TwinpadKeyboardPending::Action::Confirm);
+	cemu_assert_debug(pending.text.empty());
+	cemu_assert_debug(client.ConsumeKeyboardInput(pending));
+	cemu_assert_debug(pending.action == TwinpadKeyboardPending::Action::Cancel);
+	cemu_assert_debug(!client.ConsumeKeyboardInput(pending));
+
+	// Estricto (E4): acción desconocida, `confirm` con texto, base64url
+	// inválido, `text` ausente — todo se ignora (el vacío con `update`
+	// es válido: borra todo el form).
+	cemu_assert_debug(!client.FeedKeyboardInput(R"({"type":"keyboard_input","action":"paste","text":""})"));
+	cemu_assert_debug(!client.FeedKeyboardInput(R"({"type":"keyboard_input","action":"confirm","text":"aG9sYQ"})"));
+	cemu_assert_debug(!client.FeedKeyboardInput(R"({"type":"keyboard_input","action":"update","text":"!!"})"));
+	cemu_assert_debug(!client.FeedKeyboardInput(R"({"type":"keyboard_input","action":"update"})"));
+	cemu_assert_debug(!client.FeedKeyboardInput(R"({"type":"mic_chunk","samples":32})"));
+	cemu_assert_debug(!client.ConsumeKeyboardInput(pending));
+
+	// Cap de pendientes (8): tras 10, sobreviven las últimas 8 en orden.
+	for (int i = 0; i < 10; ++i)
+	{
+		const uint8_t keyA[] = {'A'};
+		const std::string text = TwinpadClient::Base64Url(keyA, sizeof(keyA));
+		cemu_assert_debug(client.FeedKeyboardInput(
+			"{\"type\":\"keyboard_input\",\"action\":\"update\",\"text\":\"" + text + "\"}"));
+	}
+	TwinpadKeyboardPending drained;
+	for (int i = 1; i <= 2; ++i) // las dos primeras se descartaron
+		cemu_assert_debug(client.ConsumeKeyboardInput(drained));
+	for (int i = 0; i < 8; ++i)
+	{
+		cemu_assert_debug(client.ConsumeKeyboardInput(drained));
+		cemu_assert_debug(drained.action == TwinpadKeyboardPending::Action::Update);
+		cemu_assert_debug(drained.text == std::vector<uint16_t>{'A'});
+	}
+	cemu_assert_debug(!client.ConsumeKeyboardInput(drained));
+}

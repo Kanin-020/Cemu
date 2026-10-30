@@ -1243,6 +1243,16 @@ bool TwinpadClient::ConnectPrimary()
 		SendLine(m_primarySocket, CameraRequestLine(true));
 	if (m_micDemandOn.load())
 		SendLine(m_primarySocket, MicRequestLine(true));
+	// CR-044: idem teclado; el texto base64url vigente viaja con la demanda.
+	if (m_keyboardDemandOn.load())
+	{
+		std::string textBase64Url;
+		{
+			std::scoped_lock keyboardLock(m_keyboardMutex);
+			textBase64Url = m_keyboardDemandTextBase64Url;
+		}
+		SendLine(m_primarySocket, KeyboardRequestLine(true, textBase64Url, m_keyboardDemandMaxLength.load()));
+	}
 	return true;
 }
 
@@ -2067,6 +2077,13 @@ void TwinpadClient::InputLoop()
 						// drop-old que consume el HLE `mic` bajo demanda.
 						FeedMicChunk(std::string_view(m_receiveBuffer.data(), lineEnd));
 					}
+					else if (document.IsObject() && document.HasMember("type") && document["type"].IsString()
+						&& std::string_view(document["type"].GetString()) == "keyboard_input")
+					{
+						// CR-044: texto/acción del IME del teléfono; se valida estrictamente
+						// y queda pendiente para el hilo de render del HLE `swkbd`.
+						FeedKeyboardInput(std::string_view(m_receiveBuffer.data(), lineEnd));
+					}
 					const auto report = ParseInputReport(document);
 					if (report)
 					{
@@ -2365,6 +2382,69 @@ void TwinpadClient::PublishCameraRequest(bool on)
 
 namespace
 {
+// CR-044: el form del swkbd HLE guarda una unidad de código UTF-16 por
+// carácter (wchar_t en ambas plataformas recibe solo valores <= 0xFFFF).
+// Conversión explícita UTF-16 ↔ UTF-8 (BMP), compartida por la demanda y
+// por `keyboard_input`; el incoherente se rechaza.
+std::string Utf16ToUtf8(const uint16_t* units, size_t count)
+{
+	std::string out;
+	out.reserve(count);
+	for (size_t i = 0; i < count; ++i)
+	{
+		const uint32_t c = units[i];
+		if (c < 0x80)
+			out.push_back(static_cast<char>(c));
+		else if (c < 0x800)
+		{
+			out.push_back(static_cast<char>(0xC0 | (c >> 6)));
+			out.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+		}
+		else
+		{
+			out.push_back(static_cast<char>(0xE0 | (c >> 12)));
+			out.push_back(static_cast<char>(0x80 | ((c >> 6) & 0x3F)));
+			out.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+		}
+	}
+	return out;
+}
+
+bool Utf8ToUtf16(std::string_view utf8, std::vector<uint16_t>& out)
+{
+	out.clear();
+	out.reserve(utf8.size());
+	for (size_t i = 0; i < utf8.size();)
+	{
+		const uint8_t b0 = static_cast<uint8_t>(utf8[i]);
+		if (b0 < 0x80)
+		{
+			out.push_back(b0);
+			i += 1;
+		}
+		else if ((b0 & 0xE0) == 0xC0)
+		{
+			if (i + 1 >= utf8.size())
+				return false;
+			const uint32_t c = ((b0 & 0x1F) << 6) | (static_cast<uint8_t>(utf8[i + 1]) & 0x3F);
+			out.push_back(static_cast<uint16_t>(c));
+			i += 2;
+		}
+		else if ((b0 & 0xF0) == 0xE0)
+		{
+			if (i + 2 >= utf8.size())
+				return false;
+			const uint32_t c = ((b0 & 0x0F) << 12) | ((static_cast<uint8_t>(utf8[i + 1]) & 0x3F) << 6)
+				| (static_cast<uint8_t>(utf8[i + 2]) & 0x3F);
+			out.push_back(static_cast<uint16_t>(c));
+			i += 3;
+		}
+		else
+			return false;
+	}
+	return true;
+}
+
 // CR-035: decodificador base64url sin relleno (mismo contrato que core;
 // duplicado de TwinpadCameraDecoder porque el codec H.264 no aplica aquí).
 int DecodeBase64UrlCharMic(char c)
@@ -2418,6 +2498,102 @@ void TwinpadClient::PublishMicRequest(bool on)
 		return;
 	if (!SendLine(m_primarySocket, MicRequestLine(on)))
 		m_connected.store(false);
+}
+
+std::string TwinpadClient::KeyboardRequestLine(bool on, const std::string& textBase64Url, uint16_t maxLength)
+{
+	// CR-044: única forma canónica de la línea, compartida por la demanda en
+	// vivo y el reenvío tras game_announce; `off` no lleva texto ni techo.
+	if (!on)
+		return "{\"type\":\"keyboard_request\",\"on\":false}";
+	return "{\"type\":\"keyboard_request\",\"on\":true,\"text\":\"" + textBase64Url
+		+ "\",\"max_length\":" + std::to_string(maxLength) + "}";
+}
+
+void TwinpadClient::PublishKeyboardRequest(bool on, const uint16_t* text, uint16_t count, uint16_t maxLength)
+{
+	// CR-044: el último estado se recuerda aunque el IPC no esté vivo, para
+	// que ConnectPrimary lo reenvíe al reconectar (como cámara/micrófono).
+	m_keyboardDemandOn.store(on);
+	if (on)
+	{
+		m_keyboardDemandMaxLength.store(std::max<uint16_t>(1, maxLength));
+		const std::string utf8 = Utf16ToUtf8(text, text == nullptr ? 0 : count);
+		const std::string base64 = Base64Url(reinterpret_cast<const uint8_t*>(utf8.data()), utf8.size());
+		std::scoped_lock keyboardLock(m_keyboardMutex);
+		m_keyboardDemandTextBase64Url = base64;
+	}
+	std::scoped_lock lock(m_primarySocketMutex);
+	if (!m_connected.load() || m_primarySocket < 0)
+		return;
+	std::string textBase64Url;
+	if (on)
+	{
+		std::scoped_lock keyboardLock(m_keyboardMutex);
+		textBase64Url = m_keyboardDemandTextBase64Url;
+	}
+	if (!SendLine(m_primarySocket, KeyboardRequestLine(on, textBase64Url, m_keyboardDemandMaxLength.load())))
+		m_connected.store(false);
+}
+
+bool TwinpadClient::FeedKeyboardInput(std::string_view line)
+{
+	// CR-044: `keyboard_input` estricto — action conocida y texto base64url
+	// UTF-8 que solo `update` lleva (<= 2048 bytes; vacío permitido con
+	// `update` para borrar todo el form). Lo incoherente se ignora (E4).
+	rapidjson::Document document;
+	document.Parse(line.data(), line.size());
+	if (document.HasParseError() || !document.IsObject())
+		return false;
+	if (!document.HasMember("type") || !document["type"].IsString()
+		|| std::string_view(document["type"].GetString()) != "keyboard_input")
+		return false;
+	if (!document.HasMember("action") || !document["action"].IsString())
+		return false;
+	if (!document.HasMember("text") || !document["text"].IsString())
+		return false;
+	const std::string_view action = document["action"].GetString();
+	TwinpadKeyboardPending::Action pendingAction{};
+	if (action == "update")
+		pendingAction = TwinpadKeyboardPending::Action::Update;
+	else if (action == "confirm")
+		pendingAction = TwinpadKeyboardPending::Action::Confirm;
+	else if (action == "cancel")
+		pendingAction = TwinpadKeyboardPending::Action::Cancel;
+	else
+		return false;
+	const auto text = document["text"].GetString();
+	if (pendingAction != TwinpadKeyboardPending::Action::Update && *text != '\0')
+		return false;
+	TwinpadKeyboardPending pending;
+	pending.action = pendingAction;
+	if (pendingAction == TwinpadKeyboardPending::Action::Update)
+	{
+		// El texto completo del form solo viaja con `update` (<= 2048 bytes;
+		// vacío es válido: borra todo el texto del form).
+		std::vector<uint8_t> decoded;
+		if (!DecodeBase64UrlMic(text, document["text"].GetStringLength(), decoded))
+			return false;
+		if (decoded.size() > 2048)
+			return false;
+		if (!Utf8ToUtf16(std::string_view(reinterpret_cast<const char*>(decoded.data()), decoded.size()), pending.text))
+			return false;
+	}
+	std::scoped_lock lock(m_keyboardMutex);
+	while (m_keyboardPending.size() >= kKeyboardPendingMax)
+		m_keyboardPending.pop_front();
+	m_keyboardPending.push_back(std::move(pending));
+	return true;
+}
+
+bool TwinpadClient::ConsumeKeyboardInput(TwinpadKeyboardPending& out)
+{
+	std::scoped_lock lock(m_keyboardMutex);
+	if (m_keyboardPending.empty())
+		return false;
+	out = std::move(m_keyboardPending.front());
+	m_keyboardPending.pop_front();
+	return true;
 }
 
 bool TwinpadClient::FeedMicChunk(std::string_view line)

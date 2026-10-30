@@ -2,6 +2,9 @@
 #include "Cafe/OS/libs/coreinit/coreinit_FS.h"
 #include "Cafe/OS/libs/gx2/GX2.h"
 #include "Cafe/HW/Latte/Renderer/Renderer.h"
+#include "Cafe/Twinpad/TwinpadClient.h"
+
+#include <algorithm>
 
 #include <imgui.h>
 #include "imgui/imgui_extension.h"
@@ -88,6 +91,89 @@ typedef struct
 swkbdInternalState_t* swkbdInternalState = nullptr;
 sint32 isNeedCalcSubThreadFont = 0;
 sint32 isNeedCalcSubThreadPredict = 0;
+
+// CR-044: techo de caracteres que el juego impone al form: el `maxTextLength`
+// del input form, o el buffer del receiver en keyboard-only mode. Ya acotado
+// a SWKBD_FORM_STRING_MAX_LENGTH-1 salvo en keyboard-only mode.
+static uint16 swkbd_effectiveMaxLength()
+{
+	if (swkbdInternalState == nullptr)
+		return 0;
+	sint32 maxLength = swkbdInternalState->maxTextLength;
+	if (swkbdInternalState->keyboardOnlyMode)
+	{
+		const sint32 stringBufferSize = swkbdInternalState->keyboardArg.receiverArg.stringBufSize;
+		maxLength = stringBufferSize > 1 ? stringBufferSize - 1 : 0;
+	}
+	return (uint16)std::max(1, std::min(maxLength, SWKBD_FORM_STRING_MAX_LENGTH - 1));
+}
+
+// CR-044: demanda vigente del teclado hacia el teléfono (server la entrega
+// al Plugin seleccionado); el texto del form viaja base64url UTF-8.
+static void swkbd_publishKeyboardRequest(bool on)
+{
+	if (swkbdInternalState == nullptr)
+		return;
+	if (!on)
+	{
+		TwinpadClient::Instance().PublishKeyboardRequest(false, nullptr, 0, 0);
+		return;
+	}
+	// El buffer del swkbd es wchar_t (32-bit en Linux; el reinterpret_cast
+	// directo leía el high-half de cada unidad como una unidad UTF-16 más,
+	// desfasando el eco tras la primera letra): compactar explícitamente a
+	// unidades de 16-bit para el conversor de TwinpadClient.
+	std::vector<uint16_t> units;
+	units.reserve((size_t)swkbdInternalState->formStringLength);
+	for (sint32 i = 0; i < swkbdInternalState->formStringLength; ++i)
+		units.push_back(static_cast<uint16_t>(swkbdInternalState->formStringBuffer[i]));
+	TwinpadClient::Instance().PublishKeyboardRequest(
+		true, units.data(), (uint16)units.size(), swkbd_effectiveMaxLength());
+}
+
+// CR-044: aplica las transiciones pendientes de `keyboard_input` del teléfono
+// al form del swkbd. Se ejecuta en el hilo de render (el overlay ImGui no
+// toca `formStringBuffer` cuando Twinpad está conectado), así que la entrada
+// directa del ratón/gamepad ya no interfiere.
+void swkbd_inputStringChanged();
+void swkbd_finishInput();
+static void swkbd_cancelInput(); // CR-044: cerrar el form sin aceptar
+static void swkbd_applyTwinpadKeyboardInput()
+{
+	if (swkbdInternalState == nullptr)
+		return;
+	TwinpadKeyboardPending pending;
+	while (TwinpadClient::Instance().ConsumeKeyboardInput(pending))
+	{
+		switch (pending.action)
+		{
+		case TwinpadKeyboardPending::Action::Update:
+		{
+			const uint16 maxLength = swkbd_effectiveMaxLength();
+			const uint16 copyLength = std::min<uint16>((uint16)pending.text.size(), maxLength);
+			for (uint16 i = 0; i < copyLength; ++i)
+				swkbdInternalState->formStringBuffer[i] = pending.text[i];
+			swkbdInternalState->formStringBuffer[copyLength] = '\0';
+			swkbdInternalState->formStringLength = copyLength;
+			swkbd_inputStringChanged();
+			// Publicar el estado aplicado (sincroniza reconexiones u otro
+			// teléfono que entre a escribir con el teclado ya abierto).
+			swkbd_publishKeyboardRequest(true);
+			break;
+		}
+		case TwinpadKeyboardPending::Action::Confirm:
+			// El HLE "siempre acepta la entrada" (swkbd_finishInput); el juego
+			// cierra el form con SwkbdDisappearInputForm y el estado `off`
+			// llega al teléfono por ese camino.
+			swkbd_finishInput();
+			break;
+		case TwinpadKeyboardPending::Action::Cancel:
+			// «Cancelar» retrocede: cierra el form sin aceptar (CR-044).
+			swkbd_cancelInput();
+			break;
+		}
+	}
+}
 
 void SwkbdCreate(uint8* workMemory, uint32 regionType, uint32 unk, coreinit::FSClient_t* fsClient)
 {
@@ -222,6 +308,8 @@ uint32 SwkbdAppearInputForm(const swkbdAppearArg_t* appearArg)
 		swkbdInternalState->formStringBuffer[0] = '\0';
 		swkbdInternalState->formStringLength = 0;
 	}
+	// CR-044: el teléfono abre el IME a partir de aquí (texto inicial + techo).
+	swkbd_publishKeyboardRequest(true);
 	return 1;
 }
 
@@ -241,6 +329,9 @@ uint32 SwkbdAppearKeyboard(const SwkbdKeyboardArg_t* keyboardArg)
 	swkbdInternalState->formStringBuffer[0] = '\0';
 	swkbdInternalState->formStringLength = 0;
 	swkbdInternalState->keyboardArg = *keyboardArg;
+	// CR-044: keyboard-only mode inicializa el form vacío; el teléfono abre
+	// el IME a partir de aquí (techo = buffer del receiver).
+	swkbd_publishKeyboardRequest(true);
 	return 1;
 }
 
@@ -248,6 +339,8 @@ uint32 SwkbdDisappearInputForm()
 {
 	debug_printf("SwkbdDisappearInputForm__3RplFv\n");
 	swkbdInternalState->isActive = false;
+	// CR-044: el teléfono cierra el IME al desaparecer el form.
+	swkbd_publishKeyboardRequest(false);
 	return 1;
 }
 
@@ -255,6 +348,8 @@ uint32 SwkbdDisappearKeyboard()
 {
 	debug_printf("SwkbdDisappearKeyboard__3RplFv\n");
 	swkbdInternalState->isActive = false;
+	// CR-044: idem para el teclado standalone.
+	swkbd_publishKeyboardRequest(false);
 	return 1;
 }
 
@@ -402,6 +497,14 @@ void swkbd_render(bool mainWindow)
 	// only render if active
 	if( swkbdInternalState == NULL || swkbdInternalState->isActive == false)
 		return;
+	// CR-044: con Twinpad conectado el teclado físico en pantalla no sale:
+	// la escritura la hace el IME del teléfono vía `keyboard_input`, que se
+	// aplica aquí (hilo de render) antes de devolver sin dibujar nada.
+	if (TwinpadClient::Instance().IsConnected())
+	{
+		swkbd_applyTwinpadKeyboardInput();
+		return;
+	}
 	
 	auto& io = ImGui::GetIO();
 	const auto font = ImGui_GetFont(48.0f);
@@ -568,6 +671,16 @@ void swkbd_finishInput()
 	swkbdInternalState->decideButtonWasPressed = true; // currently we always accept the input
 }
 
+// CR-044: «Cancelar» del IME del teléfono: cierra el form SIN aceptar
+// (decideButton queda limpio; el juego percibe el cierre con su polling
+// de estado, igual que con SwkbdDisappearInputForm).
+static void swkbd_cancelInput()
+{
+	swkbdInternalState->isActive = false;
+	swkbdInternalState->decideButtonWasPressed = false;
+	swkbd_publishKeyboardRequest(false);
+}
+
 typedef struct  
 {
 	uint32be beginIndex;
@@ -619,6 +732,7 @@ void swkbd_keyInput(uint32 keyCode)
 			swkbdInternalState->formStringLength--;
 		swkbdInternalState->formStringBuffer[swkbdInternalState->formStringLength] = '\0';
 		swkbd_inputStringChanged();
+		swkbd_publishKeyboardRequest(true);
 		return;
 	}
 	else if (keyCode == 13) // return
@@ -666,6 +780,7 @@ void swkbd_keyInput(uint32 keyCode)
 		swkbdInternalState->formStringLength++;
 		swkbdInternalState->formStringBuffer[swkbdInternalState->formStringLength] = '\0';
 		swkbd_inputStringChanged();
+		swkbd_publishKeyboardRequest(true);
 	}
 }
 

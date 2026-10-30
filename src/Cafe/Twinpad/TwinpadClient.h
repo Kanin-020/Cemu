@@ -81,6 +81,21 @@ struct TwinpadFusedMotionState
 	std::array<float, 9> attitude{};
 };
 
+// CR-044: transición del teclado del juego pendiente de aplicar por el HLE
+// `swkbd` en su hilo de render. `text` son unidades de código UTF-16 (el form
+// del swkbd guarda una por carácter).
+struct TwinpadKeyboardPending
+{
+	enum class Action : uint8_t
+	{
+		Update,
+		Confirm,
+		Cancel,
+	};
+	Action action{Action::Update};
+	std::vector<uint16_t> text;
+};
+
 namespace TwinpadMotionMapper
 {
 // Android already sends AndroidDSU reference axes; Cemu only converts units.
@@ -195,6 +210,16 @@ public:
 	// CR-035: consumo por el HLE `mic` (s16 mono host-order); false si no
 	// hay datos frescos del teléfono (el HLE usa sus caminos existentes).
 	bool ConsumeMicSamples(int16_t* dst, size_t count);
+	// CR-044: demanda vigente del teclado del juego; el HLE `swkbd` la emite
+	// al aparecer/desaparecer y en cada cambio del texto del form. `text` son
+	// unidades de código UTF-16 (se codifican base64url UTF-8 en el wire).
+	void PublishKeyboardRequest(bool on, const uint16_t* text, uint16_t count, uint16_t maxLength);
+	static std::string KeyboardRequestLine(bool on, const std::string& textBase64Url, uint16_t maxLength);
+	// CR-044: `keyboard_input` del teléfono (action/text base64url); falso si
+	// la línea es incoherente (E4, se ignora). Encola para el hilo del swkbd.
+	bool FeedKeyboardInput(std::string_view line);
+	// CR-044: consumo por el HLE `swkbd` en su hilo de render; false sin pendientes.
+	bool ConsumeKeyboardInput(TwinpadKeyboardPending& out);
 	void RecordVideoMetric(TwinpadVideoMetricStage stage, uint64_t elapsedNanoseconds);
 	void RecordVideoEvent(TwinpadVideoMetricEvent event);
 	void FlushVideoMetricsIfDue();
@@ -203,6 +228,7 @@ private:
 	friend void TwinpadClient_base64url_test();
 	friend void TwinpadClient_camera_request_test();
 	friend void TwinpadClient_mic_test();
+	friend void TwinpadClient_keyboard_test();
 	friend void TwinpadClient_hardware_encoder_test();
 	friend void TwinpadGyroMonitor_test();
 	TwinpadClient() = default;
@@ -226,6 +252,10 @@ private:
 	std::atomic_bool m_cameraDemandOn{false};
 	// CR-035: último estado de demanda de micrófono (idem cámara).
 	std::atomic_bool m_micDemandOn{false};
+	// CR-044: último estado de demanda de teclado vigente; ConnectPrimary lo
+	// reenvía tras game_announce si el IPC vivió una reconexión.
+	std::atomic_bool m_keyboardDemandOn{false};
+	std::atomic_uint16_t m_keyboardDemandMaxLength{0};
 	std::atomic<uint64_t> m_frameNumber{0};
 	std::atomic<uint64_t> m_audioSequence{0};
 	std::atomic<uint64_t> m_lastFrameSentMs{0};
@@ -267,6 +297,12 @@ private:
 	std::deque<int16_t> m_micSamples;
 	std::atomic<uint64_t> m_lastMicChunkMs{0};
 	bool FeedMicChunk(std::string_view line);
+	// CR-044: cola (drop-old) de transiciones pendientes que aplica el HLE
+	// `swkbd` en su hilo de render, y el texto base64url de la demanda vigente.
+	static constexpr size_t kKeyboardPendingMax = 8;
+	std::mutex m_keyboardMutex;
+	std::deque<TwinpadKeyboardPending> m_keyboardPending;
+	std::string m_keyboardDemandTextBase64Url;
 	std::mutex m_lifecycleMutex;
 	std::mutex m_audioQueueMutex;
 	std::condition_variable m_audioQueueChanged;

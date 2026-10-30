@@ -1154,6 +1154,21 @@ size_t VulkanRenderer::FindAvailableTwinpadReadbackSlot(
 	return slotCount;
 }
 
+// CR-042: los slots usan HOST_VISIBLE|HOST_CACHED (sin HOST_COHERENT), así que
+// antes de leer el mapeo CPU hay que invalidar el rango para que las escrituras
+// que hizo la GPU (copy image→buffer) sean visibles desde el host. En heaps
+// coherentes es un no-op permitido.
+static void InvalidateTwinpadReadbackMemory(VkDeviceMemory memory)
+{
+	if (!memory)
+		return;
+	VkMappedMemoryRange invalidateRange{};
+	invalidateRange.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+	invalidateRange.memory = memory;
+	invalidateRange.size = VK_WHOLE_SIZE;
+	vkInvalidateMappedMemoryRanges(VulkanRenderer::GetInstance()->GetLogicalDevice(), 1, &invalidateRange);
+}
+
 void VulkanRenderer::CaptureTwinpadFrameAsync(LatteTextureView* texView)
 {
 	if (!texView)
@@ -1163,12 +1178,12 @@ void VulkanRenderer::CaptureTwinpadFrameAsync(LatteTextureView* texView)
 	// Publish only the freshest completed transfer; never wait for the GPU.
 	const size_t newestCompletedIndex = FindNewestCompletedTwinpadReadbackSlot(
 		m_twinpadReadbackSlots, m_countCommandBufferFinished);
-	uint64 newestCompletedSequence = 0;
-	if (newestCompletedIndex != m_twinpadReadbackSlots.size())
-	{
-		auto& newestCompleted = m_twinpadReadbackSlots[newestCompletedIndex];
-		newestCompletedSequence = newestCompleted.sequence;
-		twinpad.RecordVideoEvent(TwinpadVideoMetricEvent::READBACK_COMPLETED);
+	uint64 newestCompletedSequence = 0;		if (newestCompletedIndex != m_twinpadReadbackSlots.size())
+		{
+			auto& newestCompleted = m_twinpadReadbackSlots[newestCompletedIndex];
+			newestCompletedSequence = newestCompleted.sequence;
+			InvalidateTwinpadReadbackMemory(newestCompleted.memory);
+			twinpad.RecordVideoEvent(TwinpadVideoMetricEvent::READBACK_COMPLETED);
 		twinpad.RecordVideoMetric(TwinpadVideoMetricStage::READBACK_READY,
 			std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - newestCompleted.queuedAt).count());
 		const auto readbackCopyStarted = std::chrono::steady_clock::now();
@@ -1224,6 +1239,7 @@ void VulkanRenderer::CaptureTwinpadFrameAsync(LatteTextureView* texView)
 		auto& staleCompleted = m_twinpadReadbackSlots[writeIndex];
 		if (staleCompleted.sequence > newestCompletedSequence)
 		{
+			InvalidateTwinpadReadbackMemory(staleCompleted.memory);
 			twinpad.RecordVideoEvent(TwinpadVideoMetricEvent::READBACK_COMPLETED);
 			twinpad.RecordVideoMetric(TwinpadVideoMetricStage::READBACK_READY,
 				std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - staleCompleted.queuedAt).count());

@@ -1330,13 +1330,15 @@ void VulkanRenderer::CaptureTwinpadFrameAsync(LatteTextureView* texView)
 	{
 		// CR-040: blit de la superficie DRC a la imagen RGBA8 solo si es necesario.
 		// Si el formato fuente ya es R8G8B8A8, saltarse el blit y hacer copy directo.
-		bool needsBlit = true;
+		bool needsBlit = false;
 		VkFormatProperties srcProps{};
 		vkGetPhysicalDeviceFormatProperties(m_physicalDevice, format, &srcProps);
+		// Check if source format supports blit to R8G8B8A8
+		VkFormat dstFormat = LatteGPUState.drcBufferUsesSRGB ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+		VkFormatProperties dstProps{};
+		vkGetPhysicalDeviceFormatProperties(m_physicalDevice, dstFormat, &dstProps);
 		if (srcProps.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT)
 		{
-			VkFormatProperties dstProps{};
-			vkGetPhysicalDeviceFormatProperties(m_physicalDevice, convertedFormat, &dstProps);
 			needsBlit = (dstProps.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) != 0;
 		}
 

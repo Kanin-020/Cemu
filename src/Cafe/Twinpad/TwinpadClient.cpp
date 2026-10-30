@@ -1770,6 +1770,18 @@ void TwinpadClient::SetFusedMotionState(const TwinpadFusedMotionState& state)
 	m_fusedMotionState = state;
 }
 
+// CR-045: drenaje una vez por frame desde el hilo de input del VPAD; la cola
+// vive detrás de m_inputMutex junto al resto del estado de motion.
+std::vector<TwinpadMotionSample> TwinpadClient::DrainPendingMotionSamples()
+{
+	std::vector<TwinpadMotionSample> pending;
+	{
+		std::scoped_lock lock(m_inputMutex);
+		pending.swap(m_pendingMotionSamples);
+	}
+	return pending;
+}
+
 #ifdef TWINPAD_E2E_TEST_HOOK
 namespace
 {
@@ -1884,6 +1896,7 @@ void TwinpadClient::CancelConnectionRequest()
 	{
 		std::scoped_lock lock(m_inputMutex);
 		m_inputState = TwinpadInputState{};
+		m_pendingMotionSamples.clear();
 		m_gyroMonitorState = TwinpadInputState{};
 		m_fusedMotionState = TwinpadFusedMotionState{};
 		m_lastMotionReceived = {};
@@ -1928,6 +1941,7 @@ void TwinpadClient::InputLoop()
 				{
 					std::scoped_lock lock(m_inputMutex);
 					m_inputState = TwinpadInputState{};
+					m_pendingMotionSamples.clear();
 					m_gyroMonitorState = TwinpadInputState{};
 					m_fusedMotionState = TwinpadFusedMotionState{};
 					m_lastMotionReceived = {};
@@ -1975,6 +1989,7 @@ void TwinpadClient::InputLoop()
 				{
 					std::scoped_lock lock(m_inputMutex);
 				m_inputState = TwinpadInputState{};
+				m_pendingMotionSamples.clear();
 				m_gyroMonitorState = TwinpadInputState{};
 				m_fusedMotionState = TwinpadFusedMotionState{};
 				m_lastMotionReceived = {};
@@ -2085,8 +2100,7 @@ void TwinpadClient::InputLoop()
 						FeedKeyboardInput(std::string_view(m_receiveBuffer.data(), lineEnd));
 					}
 					const auto report = ParseInputReport(document);
-					if (report)
-					{
+					if (report)					{
 						std::scoped_lock lock(m_inputMutex);
 						if (!m_hasInputSeq || report->seq > m_inputState.seq)
 						{
@@ -2094,6 +2108,19 @@ void TwinpadClient::InputLoop()
 							m_gyroMonitorState = *report;
 							m_hasGyroMonitorState = report->motionValid;
 							m_hasInputSeq = true;
+							// CR-045: cada muestra con motion valido se encola para el
+							// drenaje por frame del VPAD (sin drop de muestras intermedias).
+							if (report->motionValid)
+							{
+								TwinpadMotionSample pending{};
+								pending.timestampUs = report->motionTimestampUs;
+								pending.seq = report->seq;
+								pending.accel = report->accel;
+								pending.gyro = report->gyro;
+								m_pendingMotionSamples.push_back(std::move(pending));
+								if (m_pendingMotionSamples.size() > kMotionQueueMaxSamples)
+									m_pendingMotionSamples.erase(m_pendingMotionSamples.begin());
+							}
 
 							if (report->motionValid
 								&& (!m_hasMotionTimestamp || report->motionTimestampUs > m_lastMotionTimestampUs))
@@ -2148,6 +2175,7 @@ void TwinpadClient::InputLoop()
 			{
 				std::scoped_lock lock(m_inputMutex);
 				m_inputState = TwinpadInputState{};
+				m_pendingMotionSamples.clear();
 				m_gyroMonitorState = TwinpadInputState{};
 				m_fusedMotionState = TwinpadFusedMotionState{};
 				m_lastMotionReceived = {};
@@ -2184,6 +2212,7 @@ void TwinpadClient::InputLoop()
 			{
 				std::scoped_lock lock(m_inputMutex);
 				m_inputState = TwinpadInputState{};
+				m_pendingMotionSamples.clear();
 				m_gyroMonitorState = TwinpadInputState{};
 				m_fusedMotionState = TwinpadFusedMotionState{};
 				m_lastMotionReceived = {};

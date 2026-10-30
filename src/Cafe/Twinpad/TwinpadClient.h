@@ -81,6 +81,17 @@ struct TwinpadFusedMotionState
 	std::array<float, 9> attitude{};
 };
 
+// CR-045: muestra de motion recibida, pendiente de procesar por el VPAD en
+// su hilo de input. Los ejes son los del marco AndroidDSU (CR-037); el
+// mapeo a unidades Cemu se aplica en el drenaje, no en la encolada.
+struct TwinpadMotionSample
+{
+	uint64_t timestampUs{};
+	uint32_t seq{};
+	std::array<float, 3> accel{};
+	std::array<float, 3> gyro{};
+};
+
 // CR-044: transición del teclado del juego pendiente de aplicar por el HLE
 // `swkbd` en su hilo de render. `text` son unidades de código UTF-16 (el form
 // del swkbd guarda una por carácter).
@@ -98,22 +109,27 @@ struct TwinpadKeyboardPending
 
 namespace TwinpadMotionMapper
 {
+constexpr float kReferenceGyroSensitivity = 0.9f;
+constexpr float kReferenceAccelerationScale = 9.8066f / 100.0f;
+
 // Android already sends AndroidDSU reference axes; Cemu only converts units.
 inline std::array<float, 3> ToCemuGyroRadiansPerSecond(const TwinpadInputState& input)
 {
-	constexpr float kReferenceGyroSensitivity = 0.9f;
 	return {input.gyro[0] * kReferenceGyroSensitivity,
 		input.gyro[1] * kReferenceGyroSensitivity,
 		input.gyro[2] * kReferenceGyroSensitivity};
 }
 
+inline float ToCemuGyroRadiansPerSecond(float value) { return value * kReferenceGyroSensitivity; }
+
 inline std::array<float, 3> ToCemuAcceleration(const TwinpadInputState& input)
 {
-	constexpr float kReferenceAccelerationScale = 9.8066f / 100.0f;
 	return {input.accel[0] * kReferenceAccelerationScale,
 		input.accel[1] * kReferenceAccelerationScale,
 		input.accel[2] * kReferenceAccelerationScale};
 }
+
+inline float ToCemuAcceleration(float value) { return value * kReferenceAccelerationScale; }
 
 inline float ElapsedSeconds(uint64_t previousTimestampUs, uint64_t currentTimestampUs)
 {
@@ -163,6 +179,9 @@ public:
 	bool HasFreshMotionInput() const;
 	TwinpadFusedMotionState GetFusedMotionState() const;
 	void SetFusedMotionState(const TwinpadFusedMotionState& state);
+	// CR-045: entrega las muestras de motion pendientes (mayor a menor antiguidad)
+	// y vacía la cola; llamada una vez por frame desde el hilo de input del VPAD.
+	std::vector<TwinpadMotionSample> DrainPendingMotionSamples();
 	void SetGyroMonitorEnabled(bool enabled) { m_gyroMonitorEnabled.store(enabled); }
 	bool IsGyroMonitorEnabled() const { return m_gyroMonitorEnabled.load(); }
 	static bool GetCurrentQr(TwinpadQr& qr);
@@ -231,6 +250,7 @@ private:
 	friend void TwinpadClient_keyboard_test();
 	friend void TwinpadClient_hardware_encoder_test();
 	friend void TwinpadGyroMonitor_test();
+	friend void TwinpadMotionQueue_test();
 	TwinpadClient() = default;
 	~TwinpadClient();
 	bool ConnectPrimary();
@@ -288,6 +308,10 @@ private:
 	bool m_hasFreshMotionInput{};
 	bool m_hasMotionTimestamp{};
 	uint64_t m_lastMotionTimestampUs{};
+	// CR-045: cola FIFO de muestras de motion pendientes (drop-old). El
+	// drenaje es una vez por frame; en régimen estable quedan 0–1 muestras.
+	static constexpr size_t kMotionQueueMaxSamples = 32;
+	std::vector<TwinpadMotionSample> m_pendingMotionSamples;
 	std::string m_receiveBuffer;
 	// CR-035: cola s16 host-order del micrófono del teléfono, drop-old a
 	// 1 s (32000 muestras @ 32 kHz). ConsumeMicSamples exige frescura.

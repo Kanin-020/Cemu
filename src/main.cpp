@@ -161,6 +161,7 @@ void FSTVolumeTest();
 void CRCTest();
 void InputManager_twinpad_vpad_test();
 void TwinpadMotionMapper_test();
+void TwinpadMotionQueue_test();
 void TwinpadGyroMonitor_test();
 void TwinpadClient_base64url_test();
 void TwinpadClient_camera_request_test();
@@ -181,6 +182,7 @@ void UnitTests()
 	CRCTest();
 	InputManager_twinpad_vpad_test();
 	TwinpadMotionMapper_test();
+	TwinpadMotionQueue_test();
 	TwinpadGyroMonitor_test();
 	TwinpadClient_base64url_test();
 	TwinpadClient_camera_request_test();

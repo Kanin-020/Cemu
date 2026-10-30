@@ -330,50 +330,77 @@ void VPADController::update_motion(VPADStatus_t& status, const TwinpadInputState
 		// to the default pose.
 		m_has_last_twinpad_motion_sample = false;
 		m_last_twinpad_motion_timestamp_us = 0;
+		// CR-045: sin señal fresca las muestras encoladas son viejas; se descartan.
+		TwinpadClient::Instance().DrainPendingMotionSamples();
 		TwinpadClient::Instance().SetFusedMotionState(TwinpadFusedMotionState{});
 		return;
 	}
 
-	if (!m_has_last_twinpad_motion_sample)
+	// CR-045: drenaje completo de la cola por frame; cada muestra se procesa con
+	// su propio Δt (positivo y ≤200 ms, como antes). Así el juego no pierde las
+	// muestras intermedias de un giro rápido (tirones). El estado `input` es el
+	// reporte vigente y solo entra como fallback sin cola.
+	std::vector<TwinpadMotionSample> samples = TwinpadClient::Instance().DrainPendingMotionSamples();
+	if (samples.empty())
 	{
-		m_last_twinpad_motion_timestamp_us = input.motionTimestampUs;
-		m_has_last_twinpad_motion_sample = true;
-		return;
-	}
-	if (input.motionTimestampUs <= m_last_twinpad_motion_timestamp_us)
-		return;
-
-	const float elapsedSeconds = TwinpadMotionMapper::ElapsedSeconds(
-		m_last_twinpad_motion_timestamp_us, input.motionTimestampUs);
-	if (elapsedSeconds <= 0.0f)
-		return;
-	m_last_twinpad_motion_timestamp_us = input.motionTimestampUs;
-	if (elapsedSeconds > 0.2f)
-	{
-		// SPEC-004: a gap over 200 ms only skips that sample. The Mahony state is
-		// preserved as in the DSU path (Mahony::updateIMU clamps large deltas), so a
-		// hiccup does not snap the orientation back to the default pose.
-		return;
+		TwinpadMotionSample fallback{};
+		fallback.timestampUs = input.motionTimestampUs;
+		fallback.seq = input.seq;
+		fallback.accel = input.accel;
+		fallback.gyro = input.gyro;
+		samples.push_back(fallback);
 	}
 
-	const auto gyro = TwinpadMotionMapper::ToCemuGyroRadiansPerSecond(input);
-	const auto accel = TwinpadMotionMapper::ToCemuAcceleration(input);
-	if (!std::isfinite(elapsedSeconds)
-		|| !std::all_of(gyro.begin(), gyro.end(), [](float value) { return std::isfinite(value); })
-		|| !std::all_of(accel.begin(), accel.end(), [](float value) { return std::isfinite(value); }))
+	MotionSample lastMotionSample;
+	bool processedAny = false;
+	for (const auto& sample : samples)
+	{
+		if (!m_has_last_twinpad_motion_sample)
+		{
+			m_last_twinpad_motion_timestamp_us = sample.timestampUs;
+			m_has_last_twinpad_motion_sample = true;
+			continue;
+		}
+		const float elapsedSeconds = TwinpadMotionMapper::ElapsedSeconds(
+			m_last_twinpad_motion_timestamp_us, sample.timestampUs);
+		if (elapsedSeconds <= 0.0f)
+			continue; // runs each frame while the report timestamp is unchanged
+		m_last_twinpad_motion_timestamp_us = sample.timestampUs;
+		if (elapsedSeconds > 0.2f)
+		{
+			// SPEC-004: a gap over 200 ms only skips that sample. The Mahony state is
+			// preserved as in the DSU path (Mahony::updateIMU clamps large deltas), so a
+			// hiccup does not snap the orientation back to the default pose.
+			continue;
+		}
+
+		const float gyro[3] = {TwinpadMotionMapper::ToCemuGyroRadiansPerSecond(sample.gyro[0]),
+			TwinpadMotionMapper::ToCemuGyroRadiansPerSecond(sample.gyro[1]),
+			TwinpadMotionMapper::ToCemuGyroRadiansPerSecond(sample.gyro[2])};
+		const float accel[3] = {TwinpadMotionMapper::ToCemuAcceleration(sample.accel[0]),
+			TwinpadMotionMapper::ToCemuAcceleration(sample.accel[1]),
+			TwinpadMotionMapper::ToCemuAcceleration(sample.accel[2])};
+		if (!std::isfinite(elapsedSeconds)
+			|| !std::isfinite(gyro[0]) || !std::isfinite(gyro[1]) || !std::isfinite(gyro[2])
+			|| !std::isfinite(accel[0]) || !std::isfinite(accel[1]) || !std::isfinite(accel[2]))
+			continue;
+		// Same axis handling as DSUControllerProvider: accel Y and Z are negated before the motion handler.
+		m_twinpad_motion_handler.processMotionSample(
+			elapsedSeconds, gyro[0], gyro[1], gyro[2], accel[0], -accel[1], -accel[2]);
+		lastMotionSample = m_twinpad_motion_handler.getMotionSample();
+		processedAny = true;
+	}
+	if (!processedAny)
 		return;
-	// Same axis handling as DSUControllerProvider: accel Y and Z are negated before the motion handler.
-	m_twinpad_motion_handler.processMotionSample(
-		elapsedSeconds, gyro[0], gyro[1], gyro[2], accel[0], -accel[1], -accel[2]);
-	MotionSample motionSample = m_twinpad_motion_handler.getMotionSample();
+
 	TwinpadFusedMotionState fused{};
 	fused.valid = true;
-	motionSample.getVPADAttitudeMatrix(fused.attitude.data());
-	motionSample.getVPADAccelerometer(fused.accelerometer.data());
-	fused.accelerometerMagnitude = motionSample.getVPADAccMagnitude();
-	fused.accelerometerAcceleration = motionSample.getVPADAccAcceleration();
-	motionSample.getVPADGyroChange(fused.gyroChange.data());
-	motionSample.getVPADOrientation(fused.gyroOrientation.data());
+	lastMotionSample.getVPADAttitudeMatrix(fused.attitude.data());
+	lastMotionSample.getVPADAccelerometer(fused.accelerometer.data());
+	fused.accelerometerMagnitude = lastMotionSample.getVPADAccMagnitude();
+	fused.accelerometerAcceleration = lastMotionSample.getVPADAccAcceleration();
+	lastMotionSample.getVPADGyroChange(fused.gyroChange.data());
+	lastMotionSample.getVPADOrientation(fused.gyroOrientation.data());
 	TwinpadClient::Instance().SetFusedMotionState(fused);
 	apply_twinpad_fused_motion(status, fused);
 }

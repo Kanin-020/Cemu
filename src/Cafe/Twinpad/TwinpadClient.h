@@ -274,7 +274,10 @@ private:
 	std::mutex m_frameQueueMutex;
 	std::condition_variable m_frameQueueChanged;
 	std::vector<uint8_t> m_pendingFrame;
-	std::vector<uint8_t> m_i420Buffer;
+	// CR-043: buffer de conversión YUV por frame (I420 para OpenH264, NV12
+	// para los encoders hardware QSV/VAAPI/AMF/VideoToolbox). Tamaño
+	// idéntico: width*height*3/2.
+	std::vector<uint8_t> m_yuvBuffer;
 	uint16_t m_pendingFrameWidth{};
 	uint16_t m_pendingFrameHeight{};
 	TwinpadPixelFormat m_pendingFrameFormat{TwinpadPixelFormat::Rgb8};

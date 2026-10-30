@@ -46,6 +46,17 @@ using SocketHandle = int;
 static void CloseSocket(SocketHandle socket) { if (socket >= 0) close(socket); }
 #endif
 
+// CR-043: conversión RGB8→YUV acelerada con SSSE3 (runtime dispatch; sin
+// soporte se usa el fallback escalar, que conserva el comportamiento exacto
+// previo). No cambia el wire: solo el coste por frame del pipeline.
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#define TWINPAD_YUV_X86 1
+#include <immintrin.h>
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#endif
+#endif
+
 #ifdef TWINPAD_E2E_TEST_HOOK
 #include <atomic>
 #include <string>
@@ -230,6 +241,7 @@ struct TwinpadFfmpegEncoder
 	bool annexBFilterEnabled{};
 	AVPacket* packet{};
 	AVBSFContext* annexBFilter{};
+	bool bufferedOutput{}; // el último Encode() devolvió EAGAIN: el frame sigue en pipeline (saldrá más tarde)
 	std::vector<uint8_t> annexBParameterSets;
 	std::string name;
 
@@ -244,32 +256,22 @@ struct TwinpadFfmpegEncoder
 		avcodec_free_context(&context);
 	}
 
-	bool Encode(const uint8_t* y, const uint8_t* u, const uint8_t* v,
+	// CR-043: el frame de entrada (RGB8) ya se convirtió a NV12 consolidado
+	// (Y + UV intercalado); data[] se apunta al buffer en lugar de copiar por
+	// filas ni interleavear croma por pixel. Todos los candidatos hardware
+	// (NVENC/QSV/AMF/VAAPI/VideoToolbox) consumen NV12.
+	bool Encode(const uint8_t* nv12Y, const uint8_t* nv12Chroma,
 		int width, int height, int64_t frameIndex, bool forceIdr,
 		std::vector<uint8_t>& output)
 	{
-		if (!softwareFrame || !context || !packet || (hardwareFrames && !frame)
-			|| av_frame_make_writable(softwareFrame) < 0)
+		if (!softwareFrame || !context || !packet || (hardwareFrames && !frame))
 			return false;
-		for (int row = 0; row < height; ++row)
-			std::memcpy(softwareFrame->data[0] + row * softwareFrame->linesize[0], y + row * width, width);
-		if (nv12)
-		{
-			for (int row = 0; row < height / 2; ++row)
-				for (int column = 0; column < width / 2; ++column)
-				{
-					softwareFrame->data[1][row * softwareFrame->linesize[1] + column * 2] = u[row * (width / 2) + column];
-					softwareFrame->data[1][row * softwareFrame->linesize[1] + column * 2 + 1] = v[row * (width / 2) + column];
-				}
-		}
-		else
-		{
-			for (int row = 0; row < height / 2; ++row)
-			{
-				std::memcpy(softwareFrame->data[1] + row * softwareFrame->linesize[1], u + row * (width / 2), width / 2);
-				std::memcpy(softwareFrame->data[2] + row * softwareFrame->linesize[2], v + row * (width / 2), width / 2);
-			}
-		}
+		softwareFrame->data[0] = const_cast<uint8_t*>(nv12Y);
+		softwareFrame->data[1] = const_cast<uint8_t*>(nv12Chroma);
+		softwareFrame->data[2] = nullptr;
+		softwareFrame->linesize[0] = width;
+		softwareFrame->linesize[1] = width;
+		softwareFrame->linesize[2] = 0;
 		softwareFrame->pts = frameIndex;
 		softwareFrame->pict_type = forceIdr ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
 		if (forceIdr)
@@ -299,9 +301,7 @@ struct TwinpadFfmpegEncoder
 		else if (softwareFrame->format != context->pix_fmt)
 		{
 			return false;
-		}
-
-		av_packet_unref(packet);
+		}		av_packet_unref(packet);
 		if (avcodec_send_frame(context, frameToEncode) < 0)
 		{
 			if (hardwareFrames)
@@ -311,10 +311,14 @@ struct TwinpadFfmpegEncoder
 		int receiveResult = avcodec_receive_packet(context, packet);
 		if (receiveResult == AVERROR(EAGAIN))
 		{
+			// El encoder hardware almacena el frame en su pipeline interno
+			// (p. ej. VAAPI con asincronía): NO falla, emitirá la AU más tarde.
+			bufferedOutput = true;
 			if (hardwareFrames)
 				av_frame_unref(frame);
 			return false;
 		}
+		bufferedOutput = false;
 		if (receiveResult < 0)
 		{
 			if (hardwareFrames)
@@ -496,9 +500,15 @@ std::unique_ptr<TwinpadFfmpegEncoder> CreateHardwareH264Encoder(uint16_t width, 
 		}			else if (encoder->name == "h264_vaapi")
 			{
 				av_dict_set(&options, "rc_mode", "CBR", 0);
-				// CR-041: sin "profile=constrained_baseline" — el driver freeworld no
-				// lo expone y avcodec_open2 rebota (No usable encoding profile found).
-		}
+				// CR-041: "constrained_baseline" rebota en el driver freeworld (no lo
+				// expone: No usable encoding profile found). Sin la opción el driver
+				// negocia High (100), fuera del contrato. Pedimos Main (77): si el
+				// driver no lo soporta, el descarte queda fail-loud en el log.
+				av_dict_set(&options, "profile", "main", 0);
+				// Minimizar el pipeline interno del encoder para que la IA salga
+				// (casi) en el mismo tick que se envía el frame (latencia baja).
+				av_dict_set(&options, "async_depth", "1", 0);
+			}
 		else if (encoder->name == "h264_amf")
 		{
 			av_dict_set(&options, "usage", "ultralowlatency", 0);
@@ -570,8 +580,8 @@ std::unique_ptr<TwinpadFfmpegEncoder> CreateHardwareH264Encoder(uint16_t width, 
 			: (context->pix_fmt == AV_PIX_FMT_NV12 ? AV_PIX_FMT_NV12 : AV_PIX_FMT_YUV420P);
 		encoder->softwareFrame->width = width;
 		encoder->softwareFrame->height = height;
-		if (av_frame_get_buffer(encoder->softwareFrame, 32) < 0)
-			continue;
+		// CR-043: sin av_frame_get_buffer — Encode apunta data[] al buffer NV12
+		// del caller (zero-copy); la reserva propia quedó muerta.
 		return encoder;
 	}
 	return nullptr;
@@ -630,6 +640,266 @@ ISVCEncoder* CreateOpenH264Encoder(uint16_t width, uint16_t height, uint8_t fps,
 bool ContainsIdrNal(const std::vector<uint8_t>& annexB)
 {
 	return ContainsH264Nal(annexB.data(), annexB.size(), kH264IdrNalType);
+}
+
+// ===== CR-043: conversión RGB8→YUV (I420/NV12) =====
+// MISMA aritmética de punto fijo y redondeos que la ruta escalar previa:
+// y_i = ((66R+129G+25B+128) >> 8) + 16
+// u_i = ((-38R-74G+112B+128) >> 8) + 128, croma = promedio de los 4 u_i del
+// bloque 2x2 (floor /4), pinchado a 0..255 (el rango ya está en 16..239).
+// Ambas rutas (escalar y SIMD) producen resultados idénticos bit a bit.
+
+#if defined(TWINPAD_YUV_X86) && (defined(__GNUC__) || defined(__clang__))
+#define TWINPAD_YUV_TARGET __attribute__((target("ssse3")))
+#else
+#define TWINPAD_YUV_TARGET
+#endif
+
+bool HasSsse3Support()
+{
+#ifdef TWINPAD_YUV_X86
+#if defined(__GNUC__) || defined(__clang__)
+	return __builtin_cpu_supports("ssse3") != 0;
+#elif defined(_MSC_VER)
+	int cpuInfo[4] = {};
+	__cpuid(cpuInfo, 1);
+	return (cpuInfo[2] & (1 << 9)) != 0;
+#else
+	return false;
+#endif
+#else
+	return false;
+#endif
+}
+
+// Promedio 2x2 de croma para el rango de columnas [columnStart, columnEnd).
+// Con nv12=true produce UV intercalado (ancha de fila: width bytes); con
+// nv12=false escribe planos U y V separados (una fila: width/2 bytes).
+void ConvertChromaScalarRange(const uint8_t* rgb, int width, int height, bool nv12, uint8_t* dst, int columnStart, int columnEnd)
+{
+	const size_t ySize = static_cast<size_t>(width) * height;
+	for (int row = 0; row < height; row += 2)
+	{
+		const size_t chromaRow = static_cast<size_t>(row / 2) * (nv12 ? width : width / 2);
+		for (int column = columnStart; column < columnEnd; column += 2)
+		{
+			int sumU = 0;
+			int sumV = 0;
+			for (int dy = 0; dy < 2; ++dy)
+			{
+				for (int dx = 0; dx < 2; ++dx)
+				{
+					const size_t source = (static_cast<size_t>(row + dy) * width + column + dx) * 3;
+					const int red = rgb[source];
+					const int green = rgb[source + 1];
+					const int blue = rgb[source + 2];
+					sumU += ((-38 * red - 74 * green + 112 * blue + 128) >> 8) + 128;
+					sumV += ((112 * red - 94 * green - 18 * blue + 128) >> 8) + 128;
+				}
+			}
+			const uint8_t uValue = static_cast<uint8_t>(std::clamp(sumU / 4, 0, 255));
+			const uint8_t vValue = static_cast<uint8_t>(std::clamp(sumV / 4, 0, 255));
+			if (nv12)
+			{
+				dst[ySize + chromaRow + column] = uValue;
+				dst[ySize + chromaRow + column + 1] = vValue;
+			}
+			else
+			{
+				const size_t chroma = chromaRow + column / 2;
+				dst[ySize + chroma] = uValue;
+				dst[ySize + ySize / 4 + chroma] = vValue;
+			}
+		}
+	}
+}
+
+void ConvertRgbToI420Scalar(const uint8_t* rgb, int width, int height, uint8_t* dst)
+{
+	for (int row = 0; row < height; ++row)
+	{
+		for (int column = 0; column < width; ++column)
+		{
+			const size_t source = (static_cast<size_t>(row) * width + column) * 3;
+			const int red = rgb[source];
+			const int green = rgb[source + 1];
+			const int blue = rgb[source + 2];
+			dst[static_cast<size_t>(row) * width + column] = static_cast<uint8_t>(
+				((66 * red + 129 * green + 25 * blue + 128) >> 8) + 16);
+		}
+	}
+	ConvertChromaScalarRange(rgb, width, height, false, dst, 0, width);
+}
+
+void ConvertRgbToNv12Scalar(const uint8_t* rgb, int width, int height, uint8_t* dst)
+{
+	for (int row = 0; row < height; ++row)
+	{
+		for (int column = 0; column < width; ++column)
+		{
+			const size_t source = (static_cast<size_t>(row) * width + column) * 3;
+			const int red = rgb[source];
+			const int green = rgb[source + 1];
+			const int blue = rgb[source + 2];
+			dst[static_cast<size_t>(row) * width + column] = static_cast<uint8_t>(
+				((66 * red + 129 * green + 25 * blue + 128) >> 8) + 16);
+		}
+	}
+	ConvertChromaScalarRange(rgb, width, height, true, dst, 0, width);
+}
+
+#ifdef TWINPAD_YUV_X86
+// CR-043: conversión SSSE3. pshufb arma por dword los pares (r,g) (byte B
+// aparte) y _mm_madd_epi16 aplica los pares de coeficientes BT.601: un dword
+// por píxel en luma y croma. La carga de 16 B sale de la fila cuando
+// 3x+15 < 3*width; los guards "x+6 ≤ width" (luma) y "column+6 ≤ width"
+// (croma) acotan la ventana y las columnas de cola pasan por la ruta escalar.
+TWINPAD_YUV_TARGET
+static void ConvertRgbToYuvSsse3(const uint8_t* rgb, int width, int height, bool nv12, uint8_t* dst)
+{
+	const size_t ySize = static_cast<size_t>(width) * height;
+	const __m128i zero = _mm_setzero_si128();
+	// pshufb reordena BYTE a BYTE con copy directo del índice; el byte fuente
+	// 0x80 (índice inválido) escribe 0. Cada dword del vector destino es
+	// [r_i, 0, g_i, 0] (o b_i solo); interpretado como dos WORD little-endian:
+	// w0 = r_i, w1 = g_i; _mm_madd_epi16 con par (66,129) evalúa w0*66 + w1*129
+	// (BT.601 completo) en el dword i = 66*r_i + 129*g_i. Coef B (25) en otro
+	// madd, con set1 (par constante → él solo el byte B).
+	const __m128i rg4Mask = _mm_setr_epi8(0, static_cast<char>(0x80), 1, static_cast<char>(0x80),
+		3, static_cast<char>(0x80), 4, static_cast<char>(0x80),
+		6, static_cast<char>(0x80), 7, static_cast<char>(0x80),
+		9, static_cast<char>(0x80), 10, static_cast<char>(0x80));
+	// dword del canal B: [B_i, 0, 0, 0] (¡no en la posición 2! si B_{i+1}
+	// cayera en ese dword, madd con set1 sumaría dos píxeles).
+	const __m128i b4Mask = _mm_setr_epi8(2, static_cast<char>(0x80), static_cast<char>(0x80), static_cast<char>(0x80),
+		5, static_cast<char>(0x80), static_cast<char>(0x80), static_cast<char>(0x80),
+		8, static_cast<char>(0x80), static_cast<char>(0x80), static_cast<char>(0x80),
+		11, static_cast<char>(0x80), static_cast<char>(0x80), static_cast<char>(0x80));
+	const __m128i rg2Mask = _mm_setr_epi8(0, static_cast<char>(0x80), 1, static_cast<char>(0x80),
+		3, static_cast<char>(0x80), 4, static_cast<char>(0x80),
+		static_cast<char>(0x80), static_cast<char>(0x80), static_cast<char>(0x80), static_cast<char>(0x80),
+		static_cast<char>(0x80), static_cast<char>(0x80), static_cast<char>(0x80), static_cast<char>(0x80));
+	const __m128i b2Mask = _mm_setr_epi8(2, static_cast<char>(0x80), static_cast<char>(0x80), static_cast<char>(0x80),
+		5, static_cast<char>(0x80), static_cast<char>(0x80), static_cast<char>(0x80),
+		static_cast<char>(0x80), static_cast<char>(0x80), static_cast<char>(0x80), static_cast<char>(0x80),
+		static_cast<char>(0x80), static_cast<char>(0x80), static_cast<char>(0x80), static_cast<char>(0x80));
+	const __m128i yRGPair = _mm_setr_epi16(66, 129, 66, 129, 66, 129, 66, 129);
+	const __m128i uRGPair = _mm_setr_epi16(-38, -74, -38, -74, -38, -74, -38, -74);
+	const __m128i vRGPair = _mm_setr_epi16(112, -94, 112, -94, 112, -94, 112, -94);
+	const __m128i yBCoeff = _mm_set1_epi16(25);
+	const __m128i uBCoeff = _mm_set1_epi16(112);
+	const __m128i vBCoeff = _mm_set1_epi16(-18);
+	const __m128i roundBias = _mm_set1_epi32(128);
+	const __m128i lumaLift = _mm_set1_epi32(16);
+	const __m128i chromaLift = _mm_set1_epi32(128);
+	// byte bajo del dword i (0x80 = escribe 0): Y queda en [16,235], el byte
+	// bajo ES el valor; sin saturación (packss_epi32 sería SSE4.1).
+	const __m128i lowBytesMask = _mm_setr_epi8(0, 4, 8, 12, static_cast<char>(0x80),
+		static_cast<char>(0x80), static_cast<char>(0x80), static_cast<char>(0x80),
+		static_cast<char>(0x80), static_cast<char>(0x80), static_cast<char>(0x80), static_cast<char>(0x80),
+		static_cast<char>(0x80), static_cast<char>(0x80), static_cast<char>(0x80), static_cast<char>(0x80));
+
+	for (int row = 0; row < height; ++row)
+	{
+		const uint8_t* line = rgb + static_cast<size_t>(row) * width * 3;
+		uint8_t* dstY = dst + static_cast<size_t>(row) * width;
+		int x = 0;
+		// La ventana de 16 B llega hasta 3x+15; con x+6 ≤ width queda dentro de la fila.
+		for (; x + 6 <= width; x += 4, dstY += 4)
+		{
+			const __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(line + x * 3));
+			const __m128i rg = _mm_shuffle_epi8(raw, rg4Mask);
+			const __m128i b = _mm_shuffle_epi8(raw, b4Mask);
+			__m128i y32 = _mm_add_epi32(_mm_madd_epi16(rg, yRGPair), _mm_madd_epi16(b, yBCoeff));
+			y32 = _mm_add_epi32(y32, roundBias);
+			y32 = _mm_srli_epi32(y32, 8); // el pre-offset garantiza no negativos
+			y32 = _mm_add_epi32(y32, lumaLift);
+			// Sin saturación: Y ∈ [16,235] cabe en un byte pese a todo.
+			const __m128i yBytes = _mm_shuffle_epi8(y32, lowBytesMask);
+			std::memcpy(dstY, &yBytes, 4);
+		}
+		for (; x < width; ++x, ++dstY)
+		{
+			const int red = line[x * 3];
+			const int green = line[x * 3 + 1];
+			const int blue = line[x * 3 + 2];
+			*dstY = static_cast<uint8_t>(((66 * red + 129 * green + 25 * blue + 128) >> 8) + 16);
+		}
+	}
+
+	// Croma SIMD por bloque 2x2; las columnas colas (x ≥ width-4) pasan por el
+	// helper escalar al final (mismo redondeo).
+	if (width >= 6)
+	{
+		for (int row = 0; row < height; row += 2)
+		{
+			const uint8_t* rowA = rgb + static_cast<size_t>(row) * width * 3;
+			const uint8_t* rowB = rowA + static_cast<size_t>(width) * 3;
+			const size_t chromaRow = static_cast<size_t>(row / 2) * (nv12 ? width : width / 2);
+			uint8_t* const dstU = dst + ySize + chromaRow;
+			uint8_t* const dstV = nv12 ? dstU + 1 : dst + ySize + ySize / 4 + chromaRow;
+			for (int column = 0; column < width - 5; column += 2)
+			{
+				const __m128i rawA = _mm_loadu_si128(reinterpret_cast<const __m128i*>(rowA + column * 3));
+				const __m128i rawB = _mm_loadu_si128(reinterpret_cast<const __m128i*>(rowB + column * 3));
+				const __m128i rgA = _mm_shuffle_epi8(rawA, rg2Mask);
+				const __m128i bA = _mm_shuffle_epi8(rawA, b2Mask);
+				const __m128i rgB = _mm_shuffle_epi8(rawB, rg2Mask);
+				const __m128i bB = _mm_shuffle_epi8(rawB, b2Mask);
+				// u_i/v_i por píxel (BT.601) con el MISMO redondeo por píxel que la
+				// ruta escalar: (grpc+128)>>8+128 por FILA (lane0 = (x,y), lane1 =
+				// (x+1,y); después se suma la fila B en las mismas lanes).
+				__m128i u32 = _mm_add_epi32(_mm_madd_epi16(rgA, uRGPair), _mm_madd_epi16(bA, uBCoeff));
+				u32 = _mm_add_epi32(u32, roundBias);
+				u32 = _mm_srai_epi32(u32, 8); // aritmético: el pre-offset puede ser negativo
+				u32 = _mm_add_epi32(u32, chromaLift);
+				u32 = _mm_add_epi32(u32, _mm_srai_epi32(_mm_add_epi32(
+					_mm_add_epi32(_mm_madd_epi16(rgB, uRGPair), _mm_madd_epi16(bB, uBCoeff)), roundBias), 8));
+				u32 = _mm_add_epi32(u32, chromaLift);
+				__m128i v32 = _mm_add_epi32(_mm_madd_epi16(rgA, vRGPair), _mm_madd_epi16(bA, vBCoeff));
+				v32 = _mm_add_epi32(v32, roundBias);
+				v32 = _mm_srai_epi32(v32, 8);
+				v32 = _mm_add_epi32(v32, chromaLift);
+				v32 = _mm_add_epi32(v32, _mm_srai_epi32(_mm_add_epi32(
+					_mm_add_epi32(_mm_madd_epi16(rgB, vRGPair), _mm_madd_epi16(bB, vBCoeff)), roundBias), 8));
+				v32 = _mm_add_epi32(v32, chromaLift);
+				// Suma horizontal exacta de los 4 valores en lane0: (lane0)+(lane1).
+				const __m128i uSum = _mm_add_epi32(u32, _mm_shuffle_epi32(u32, _MM_SHUFFLE(0, 0, 0, 1)));
+				const __m128i vSum = _mm_add_epi32(v32, _mm_shuffle_epi32(v32, _MM_SHUFFLE(0, 0, 0, 1)));
+				// /4 lógico (cada u_i ∈ 16..239, la suma ∈ 64..956, no negativa);
+				// el dword lane0 cabe en el byte (≤ 239) sin saturación extra.
+				if (nv12)
+				{
+					dstU[column] = static_cast<uint8_t>(_mm_cvtsi128_si32(_mm_srli_epi32(uSum, 2)));
+					dstU[column + 1] = static_cast<uint8_t>(_mm_cvtsi128_si32(_mm_srli_epi32(vSum, 2)));
+				}
+				else
+				{
+					dstU[column / 2] = static_cast<uint8_t>(_mm_cvtsi128_si32(_mm_srli_epi32(uSum, 2)));
+					dstV[column / 2] = static_cast<uint8_t>(_mm_cvtsi128_si32(_mm_srli_epi32(vSum, 2)));
+				}
+			}
+		}
+	}
+	ConvertChromaScalarRange(rgb, width, height, nv12, dst, width >= 6 ? width - 4 : 0, width);
+}
+#endif
+
+void ConvertRgbToYuv(const uint8_t* rgb, int width, int height, bool nv12, std::vector<uint8_t>& dst)
+{
+	dst.resize(static_cast<size_t>(width) * height * 3 / 2);
+#ifdef TWINPAD_YUV_X86
+	static const bool hasSsse3 = HasSsse3Support();
+	if (hasSsse3)
+	{
+		ConvertRgbToYuvSsse3(rgb, width, height, nv12, dst.data());
+		return;
+	}
+#endif
+	if (nv12)
+		ConvertRgbToNv12Scalar(rgb, width, height, dst.data());
+	else
+		ConvertRgbToI420Scalar(rgb, width, height, dst.data());
 }
 
 // CR-041: contrato del stream relajado — Baseline (66, con o sin constraint_set0)
@@ -1153,50 +1423,18 @@ bool TwinpadClient::EncodeGamePadFrame(
 	m_encoderEpochUs = nowUs;
 	}
 
-	const auto i420Started = std::chrono::steady_clock::now();
+	// CR-043: conversión RGB8→YUV acelerada (SSSE3 con fallback escalar
+	// idéntico bit a bit). Encode hardware consume el buffer NV12 directo;
+	// OpenH264 sigue recibiendo I420.
+	const auto yuvStarted = std::chrono::steady_clock::now();
 	const size_t ySize = static_cast<size_t>(width) * height;
-	m_i420Buffer.resize(ySize * 3 / 2);
-	auto& i420 = m_i420Buffer;
-	for (uint32_t row = 0; row < height; ++row)
-	{
-		for (uint32_t column = 0; column < width; ++column)
-		{
-			const size_t source = (static_cast<size_t>(row) * width + column) * 3;
-			const int red = rgb[source];
-			const int green = rgb[source + 1];
-			const int blue = rgb[source + 2];
-			i420[static_cast<size_t>(row) * width + column] = static_cast<uint8_t>(
-				((66 * red + 129 * green + 25 * blue + 128) >> 8) + 16);
-		}
-	}
-	uint8_t* uPlane = i420.data() + ySize;
-	uint8_t* vPlane = uPlane + ySize / 4;
-	for (uint32_t row = 0; row < height; row += 2)
-	{
-		for (uint32_t column = 0; column < width; column += 2)
-		{
-			int sumU = 0;
-			int sumV = 0;
-			for (uint32_t dy = 0; dy < 2; ++dy)
-			{
-				for (uint32_t dx = 0; dx < 2; ++dx)
-				{
-					const size_t source = (static_cast<size_t>(row + dy) * width + column + dx) * 3;
-					const int red = rgb[source];
-					const int green = rgb[source + 1];
-					const int blue = rgb[source + 2];
-					sumU += ((-38 * red - 74 * green + 112 * blue + 128) >> 8) + 128;
-					sumV += ((112 * red - 94 * green - 18 * blue + 128) >> 8) + 128;
-				}
-			}
-			const size_t chroma = static_cast<size_t>(row / 2) * (width / 2) + column / 2;
-			uPlane[chroma] = static_cast<uint8_t>(std::clamp(sumU / 4, 0, 255));
-			vPlane[chroma] = static_cast<uint8_t>(std::clamp(sumV / 4, 0, 255));
-		}
-	}
-
+	const bool hardwareAttempted = m_encoderHardwareActive;
+	ConvertRgbToYuv(rgb.data(), width, height, hardwareAttempted, m_yuvBuffer);
 	RecordVideoMetric(TwinpadVideoMetricStage::I420_CONVERT,
-		std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - i420Started).count());
+		std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - yuvStarted).count());
+	uint8_t* const yPlane = m_yuvBuffer.data();
+	uint8_t* const uPlane = yPlane + ySize;
+	uint8_t* const vPlane = uPlane + ySize / 4;
 
 	output.annexB.clear();
 	bool forceIdr = m_forceNextIdr || nowUs - m_lastIdrTimestampUs >= kIdrIntervalMs * 1000;
@@ -1220,8 +1458,18 @@ bool TwinpadClient::EncodeGamePadFrame(
 	{
 		const auto hardwareStarted = std::chrono::steady_clock::now();
 		auto* encoder = static_cast<TwinpadFfmpegEncoder*>(m_hardwareVideoEncoder);
-		const bool hardwareEncoded = encoder->Encode(i420.data(), uPlane, vPlane, width, height,
+		// CR-043: se entrega el buffer NV12 ya consolidado (Y + UV intercalado).
+		const bool hardwareEncoded = encoder->Encode(yPlane, uPlane, width, height,
 			static_cast<int64_t>(m_encoderFrameIndex), forceIdr, output.annexB);
+		// VAAPI con pipeline interno devuelve EAGAIN: no es fallo, la AU se emite
+		// en ticks posteriores (se avisa solo la primera vez y se conserva el backend).
+		if (!hardwareEncoded && encoder->bufferedOutput)
+		{
+			static std::atomic_bool warnedBufferedOnce{false};
+			if (!warnedBufferedOnce.exchange(true))
+				cemuLog_log(LogType::Force, "[TwinpadVideo] hardware backend {} buffers frames (EAGAIN); AUs will arrive on later ticks", encoder->name);
+			return false;
+		}
 		if (!hardwareEncoded)
 			cemuLog_log(LogType::Force, "[TwinpadVideo] hardware backend {} did not produce an output AU on frame {} (idr_forced={})",
 				encoder->name, m_encoderFrameIndex, forceIdr ? 1 : 0);
@@ -1262,6 +1510,10 @@ bool TwinpadClient::EncodeGamePadFrame(
 		}
 		if (!hardwareEncoded || !m_encoderHardwareActive)
 		{
+			// CR-043: si el frame entrante era NV12 (hardwareAttempted) y caímos a
+			// OpenH264, reconvertir a I420 en el mismo buffer antes del encode CPU.
+			if (hardwareAttempted && !m_encoderHardwareActive)
+				ConvertRgbToYuv(rgb.data(), width, height, false, m_yuvBuffer);
 			SSourcePicture picture{};
 			picture.iColorFormat = videoFormatI420;
 			picture.iPicWidth = width;
@@ -1269,7 +1521,7 @@ bool TwinpadClient::EncodeGamePadFrame(
 			picture.iStride[0] = width;
 			picture.iStride[1] = width / 2;
 			picture.iStride[2] = width / 2;
-			picture.pData[0] = i420.data();
+			picture.pData[0] = yPlane;
 			picture.pData[1] = uPlane;
 			picture.pData[2] = vPlane;
 			picture.uiTimeStamp = static_cast<long long>((nowUs - m_encoderEpochUs) / 1000); // CR-029: tiempo real
@@ -1314,7 +1566,7 @@ bool TwinpadClient::EncodeGamePadFrame(
 		picture.iStride[0] = width;
 		picture.iStride[1] = width / 2;
 		picture.iStride[2] = width / 2;
-		picture.pData[0] = i420.data();
+		picture.pData[0] = yPlane;
 		picture.pData[1] = uPlane;
 		picture.pData[2] = vPlane;
 		picture.uiTimeStamp = static_cast<long long>((nowUs - m_encoderEpochUs) / 1000); // CR-029: tiempo real

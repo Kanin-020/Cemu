@@ -1085,6 +1085,7 @@ bool TwinpadClient::Start(bool captureGamePad)
 	m_audioThread = std::thread(&TwinpadClient::AudioLoop, this);
 	m_frameThread = std::thread(&TwinpadClient::FrameLoop, this);
 	m_inputThread = std::thread(&TwinpadClient::InputLoop, this);
+	m_videoSendThread = std::thread(&TwinpadClient::VideoSendLoop, this);
 	return true;
 }
 
@@ -1099,6 +1100,7 @@ void TwinpadClient::Stop()
 	}
 	m_audioQueueChanged.notify_all();
 	m_frameQueueChanged.notify_all();
+	m_videoSendQueueChanged.notify_all();
 	{
 		std::scoped_lock lock(m_primarySocketMutex);
 		if (m_primarySocket >= 0)
@@ -1127,6 +1129,8 @@ void TwinpadClient::Stop()
 		m_frameThread.join();
 	if (m_inputThread.joinable())
 		m_inputThread.join();
+	if (m_videoSendThread.joinable())
+		m_videoSendThread.join();
 	{
 		std::scoped_lock lock(m_frameQueueMutex);
 		m_pendingFrame.clear();
@@ -1135,6 +1139,10 @@ void TwinpadClient::Stop()
 	{
 		std::scoped_lock lock(m_audioQueueMutex);
 		m_audioQueue.clear();
+	}
+	{
+		std::scoped_lock lock(m_videoSendQueueMutex);
+		m_videoSendQueue.clear();
 	}
 	{
 		std::scoped_lock primaryLock(m_primarySocketMutex);
@@ -2898,20 +2906,52 @@ void TwinpadClient::FrameLoop()
 			+ ",\"data\":\"" + encodedData + "\"}";
 		RecordVideoMetric(TwinpadVideoMetricStage::BASE64_JSON,
 			std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - base64JsonStarted).count());
+		// CR-048: la línea pasa al hilo de envío; el FrameLoop ya no espera
+		// al TCP (la backpressure dejaba la cadencia del encode a merced del
+		// socket). Drop-old en ráfagas: la imagen conserva la firma más fresca.
+		{
+			std::scoped_lock lock(m_videoSendQueueMutex);
+			if (m_videoSendQueue.size() == kVideoSendQueueMaxLines)
+				m_videoSendQueue.pop_front();
+			m_videoSendQueue.push_back(std::move(line));
+		}
+		m_videoSendQueueChanged.notify_one();
+	}
+}
+
+void TwinpadClient::VideoSendLoop()
+{
+	while (m_running.load())
+	{
+		std::string line;
+		{
+			std::unique_lock lock(m_videoSendQueueMutex);
+			m_videoSendQueueChanged.wait(lock, [this] { return !m_running.load() || !m_videoSendQueue.empty(); });
+			if (!m_running.load())
+				break;
+			line = std::move(m_videoSendQueue.front());
+			m_videoSendQueue.pop_front();
+		}
 		const auto ipcSendStarted = std::chrono::steady_clock::now();
 		std::scoped_lock lock(m_primarySocketMutex);
 		if (!m_connected.load() || m_primarySocket < 0)
+		{
+			// Desconectado: no acumular backlog sobre la reconexión.
+			std::scoped_lock queueLock(m_videoSendQueueMutex);
+			m_videoSendQueue.clear();
 			continue;
-		const uint64_t now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+		}
 		if (!SendLine(m_primarySocket, line))
 		{
 			m_connected.store(false);
+			std::scoped_lock queueLock(m_videoSendQueueMutex);
+			m_videoSendQueue.clear();
 			continue;
 		}
 		RecordVideoMetric(TwinpadVideoMetricStage::IPC_SEND,
 			std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - ipcSendStarted).count());
 		RecordVideoEvent(TwinpadVideoMetricEvent::FRAME_SENT);
-		m_lastFrameSentMs.store(now);
+		m_lastFrameSentMs.store(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()));
 	}
 }
 

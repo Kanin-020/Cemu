@@ -258,6 +258,8 @@ private:
 	void AudioLoop();
 	void FrameLoop();
 	void InputLoop();
+	// CR-048: envío de video en hilo dedicado; el FrameLoop solo encola.
+	void VideoSendLoop();
 	bool SendLine(std::intptr_t socket, const std::string& line);
 	static std::string Base64Url(const uint8_t* data, size_t size);
 
@@ -359,6 +361,13 @@ private:
 	uint16_t m_pendingFrameHeight{};
 	TwinpadPixelFormat m_pendingFrameFormat{TwinpadPixelFormat::Rgb8};
 	bool m_hasPendingFrame{};
+	// CR-048: cola (drop-old) de líneas game_frame construidas, pendientes
+	// de envío por el socket IPC primario. Solo absorbe ráfagas de RTT; en
+	// régimen estable queda vacía (el consumidor es más rápido que el encode).
+	static constexpr size_t kVideoSendQueueMaxLines = 4;
+	std::mutex m_videoSendQueueMutex;
+	std::condition_variable m_videoSendQueueChanged;
+	std::deque<std::string> m_videoSendQueue;
 	std::intptr_t m_primarySocket{-1};
 	std::intptr_t m_audioSocket{-1};
 	std::mutex m_primarySocketMutex;
@@ -366,6 +375,8 @@ private:
 	std::thread m_audioThread;
 	std::thread m_frameThread;
 	std::thread m_inputThread;
+	// CR-048: hilo de envío de game_frame; el encode ya no espera al TCP.
+	std::thread m_videoSendThread;
 	std::mutex m_encoderMutex;
 	void* m_videoEncoder{};
 	void* m_hardwareVideoEncoder{};

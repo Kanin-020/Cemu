@@ -2286,6 +2286,30 @@ void TwinpadClient::FlushVideoMetricsIfDue()
 			summary += " " + std::string(eventNames[index]) + "=" + std::to_string(count);
 	}
 	cemuLog_log(LogType::Force, "{}", summary);
+
+	// Telemetría CR-035 sin throttle: tasas crudas por ventana. accepted/s
+	// esperado ≈ 66 (480 muestras @ 32 kHz); consume_ok/s esperado ≈ 336 si
+	// la cola se sostiene. Abrir la brecha lo delata: feed corta o drain doble.
+	struct MicPerfSnapshot
+	{
+		uint64_t accepted = 0;
+		uint64_t consumed = 0;
+	};
+	static MicPerfSnapshot micPrev{};
+	const uint64_t acceptedNow = m_micChunksValid.load(std::memory_order_relaxed);
+	const uint64_t consumedNow = m_micConsumes.load(std::memory_order_relaxed);
+	std::string micSummary = "[TwinpadMicPerf] window_ms=" + std::to_string(kVideoMetricLogIntervalMs);
+	micSummary += " accepted_n=" + std::to_string(acceptedNow - micPrev.accepted);
+	micSummary += " consume_ok_n=" + std::to_string(consumedNow - micPrev.consumed);
+	micSummary += " reject_n=" + std::to_string(m_micRejectCount.exchange(0, std::memory_order_relaxed));
+	micSummary += " consume_fail_n=" + std::to_string(m_micConsumeFailCount.exchange(0, std::memory_order_relaxed));
+	micSummary += " drop_old_n=" + std::to_string(m_micDropOldCount.exchange(0, std::memory_order_relaxed));
+	micSummary += " toggles_n=" + std::to_string(m_micDemandToggleCount.exchange(0, std::memory_order_relaxed));
+	micSummary += " cola_last=" + std::to_string(m_micQueueSizeLast.exchange(0, std::memory_order_relaxed));
+	micSummary += " cola_max=" + std::to_string(m_micQueueSizeMax.exchange(0, std::memory_order_relaxed));
+	micPrev.accepted = acceptedNow;
+	micPrev.consumed = consumedNow;
+	cemuLog_log(LogType::Force, "{}", micSummary);
 }
 
 void TwinpadClient::SetCaptureBitrate(uint32_t bitrateKbps) // CR-027: bitrate en caliente
@@ -2522,6 +2546,8 @@ void TwinpadClient::PublishMicRequest(bool on)
 	// CR-035: bajo demanda — el teléfono no graba sin este estado vigente;
 	// el HLE `mic` lo emite en las transiciones MICOpen/MICClose del juego.
 	m_micDemandOn.store(on);
+	if (m_micDemandOn.exchange(on) != on)
+		m_micDemandToggleCount.fetch_add(1, std::memory_order_relaxed);
 	std::scoped_lock lock(m_primarySocketMutex);
 	if (!m_connected.load() || m_primarySocket < 0)
 		return;
@@ -2625,65 +2651,145 @@ bool TwinpadClient::ConsumeKeyboardInput(TwinpadKeyboardPending& out)
 	return true;
 }
 
+bool TwinpadClient::MicLogThrottled()
+{
+	const auto nowMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count());
+	uint64_t previousMs = m_lastMicLogMs.load();
+	if (nowMs - previousMs < 1000)
+		return false;
+	return m_lastMicLogMs.compare_exchange_weak(previousMs, nowMs);
+}
+
+void TwinpadClient::MicLogReject(const char* reason)
+{
+	m_micRejectCount.fetch_add(1, std::memory_order_relaxed);
+	if (MicLogThrottled())
+		cemuLog_log(LogType::Force, "[TwinpadMic] línea descartada en Cemu (motivo: {})", reason);
+}
+
+void TwinpadClient::RecordMicQueueSample(size_t size)
+{
+	m_micQueueSizeLast.store(size, std::memory_order_relaxed);
+	uint64_t previousMax = m_micQueueSizeMax.load(std::memory_order_relaxed);
+	while (static_cast<uint64_t>(size) > previousMax
+		&& !m_micQueueSizeMax.compare_exchange_weak(previousMax, static_cast<uint64_t>(size), std::memory_order_relaxed))
+	{
+	}
+}
+
 bool TwinpadClient::FeedMicChunk(std::string_view line)
 {
 	// CR-035: `mic_chunk` estricto — samples 32..32000 (1 ms..1 s @ 32 kHz)
 	// y 2 bytes por muestra s16le; lo incoherente se ignora (E4).
+	// Diagnóstico: cada motivo de descarte se audita con log ≤ 1 Hz,
+	// porque un rechazo en silencio es indistinguible desde el socket.
 	rapidjson::Document document;
 	document.Parse(line.data(), line.size());
 	if (document.HasParseError() || !document.IsObject())
+	{
+		MicLogReject("json_invalido");
 		return false;
+	}
 	if (!document.HasMember("type") || !document["type"].IsString()
 		|| std::string_view(document["type"].GetString()) != "mic_chunk")
+	{
+		MicLogReject("tipo");
 		return false;
+	}
 	if (!document.HasMember("samples") || !document["samples"].IsUint())
+	{
+		MicLogReject("sin_samples");
 		return false;
+	}
 	const uint32_t samples = document["samples"].GetUint();
 	if (samples < 32 || samples > 32000)
+	{
+		MicLogReject("samples_fuera_de_rango");
 		return false;
+	}
 	if (!document.HasMember("data") || !document["data"].IsString())
+	{
+		MicLogReject("sin_data");
 		return false;
+	}
 	const char* base64Data = document["data"].GetString();
 	std::vector<uint8_t> decoded;
 	if (!DecodeBase64UrlMic(base64Data, document["data"].GetStringLength(), decoded))
+	{
+		MicLogReject("base64url_invalido");
 		return false;
+	}
 	if (decoded.size() != static_cast<size_t>(samples) * 2)
+	{
+		MicLogReject("bytes_vs_samples_incoherente");
 		return false;
+	}
 	std::deque<int16_t> chunk;
 	for (size_t i = 0; i < decoded.size(); i += 2)
 		chunk.push_back(static_cast<int16_t>(static_cast<uint16_t>(decoded[i]) | (static_cast<uint16_t>(decoded[i + 1]) << 8)));
 	{
 		// Drop-old: si la cola superaría 1 s de audio, se descarta lo más antiguo.
 		std::scoped_lock lock(m_micSamplesMutex);
-		const size_t overflow = m_micSamples.size() + chunk.size() - kMicQueueMaxSamples;
-		if (overflow > 0)
+		// CR-035: drop-old solo cuando la cola EXCEDERÍA 1 s de audio. El
+		// cálculo anterior restaba en unsigned sin preguntar el total primero:
+		// con la cola bajo el techo, size+chunk-32000 daba la vuelta a un
+		// "overflow" enorme que vaciaba la cola a cada chunk (telemetría
+		// TwinpadMicPerf: drop_old_n == accepted_n, cola_max = 1 chunk).
+		const size_t totalSamples = m_micSamples.size() + chunk.size();
+		if (totalSamples > kMicQueueMaxSamples)
+		{
+			const size_t overflow = totalSamples - kMicQueueMaxSamples;
+			m_micDropOldCount.fetch_add(1, std::memory_order_relaxed);
 			m_micSamples.erase(m_micSamples.begin(), m_micSamples.begin() + static_cast<std::ptrdiff_t>(std::min(overflow, m_micSamples.size())));
+		}
 		m_micSamples.insert(m_micSamples.end(), chunk.begin(), chunk.end());
+		RecordMicQueueSample(m_micSamples.size());
 	}
 	m_lastMicChunkMs.store(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
 		std::chrono::steady_clock::now().time_since_epoch()).count()));
+	// Diagnóstico del ritmo de llegada: ~64 bloques de 480 muestras ≈ 1 s.
+	if (m_micChunksValid.fetch_add(1) % 64 == 0 && MicLogThrottled())
+		cemuLog_log(LogType::Force, "[TwinpadMic] mic_chunk aceptado (total={})", m_micChunksValid.load());
 	return true;
 }
 
 bool TwinpadClient::ConsumeMicSamples(int16_t* dst, size_t count)
 {
 	if (!dst || count == 0 || !m_micDemandOn.load())
+	{
+		MicLogReject("demanda_off");
 		return false;
+	}
 	const auto nowMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
 		std::chrono::steady_clock::now().time_since_epoch()).count());
 	// CR-035: sin chunks frescos el HLE vuelve a sus caminos existentes
 	// (dispositivo de entrada del PC / blow mic / silencio).
 	const uint64_t last = m_lastMicChunkMs.load();
 	if (nowMs > last + kMicFreshIntervalMs)
+	{
+		if (MicLogThrottled())
+			cemuLog_log(LogType::Force, "[TwinpadMic] sin chunks frescos (edad_ms={})", nowMs - last);
 		return false;
+	}
 	std::scoped_lock lock(m_micSamplesMutex);
 	if (m_micSamples.size() < count)
+	{
+		m_micConsumeFailCount.fetch_add(1, std::memory_order_relaxed);
+		RecordMicQueueSample(m_micSamples.size());
+		if (MicLogThrottled())
+			cemuLog_log(LogType::Force, "[TwinpadMic] cola insuficiente ({} de {} muestras)", m_micSamples.size(), count);
 		return false;
+	}
 	for (size_t i = 0; i < count; ++i)
 	{
 		dst[i] = m_micSamples.front();
 		m_micSamples.pop_front();
 	}
+	RecordMicQueueSample(m_micSamples.size());
+	// Consumo por AX: ~336 AX frames por segundo alimentan las colas del juego.
+	if (m_micConsumes.fetch_add(1) % 336 == 0 && MicLogThrottled())
+		cemuLog_log(LogType::Force, "[TwinpadMic] consumo por AX activo (cola={})", m_micSamples.size());
 	return true;
 }
 

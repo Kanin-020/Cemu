@@ -321,6 +321,23 @@ private:
 	std::deque<int16_t> m_micSamples;
 	std::atomic<uint64_t> m_lastMicChunkMs{0};
 	bool FeedMicChunk(std::string_view line);
+	// Diagnóstico CR-035: el socket no deja huella en Cemu, así que feed,
+	// consume y ramas del HLE auditan con logs ≤ 1 Hz compartiendo un slot.
+	std::atomic<uint64_t> m_lastMicLogMs{0};
+	// Telemetría CR-035 sin throttle: contadores crudos que se vacían en una
+	// ventana de 5 s ([TwinpadMicPerf]) para medir tasas reales (66 líneas/s
+	// esperadas). Una tasa instantánea no se deduce de logs a 1 Hz.
+	std::atomic<uint64_t> m_micRejectCount{0};
+	std::atomic<uint64_t> m_micConsumeFailCount{0};
+	std::atomic<uint64_t> m_micDropOldCount{0};
+	std::atomic<uint64_t> m_micDemandToggleCount{0};
+	std::atomic<uint64_t> m_micQueueSizeLast{0};
+	std::atomic<uint64_t> m_micQueueSizeMax{0};
+	void RecordMicQueueSample(size_t size);
+	std::atomic<uint32_t> m_micChunksValid{0};
+	std::atomic<uint32_t> m_micConsumes{0};
+	bool MicLogThrottled();
+	void MicLogReject(const char* reason);
 	// CR-044: cola (drop-old) de transiciones pendientes que aplica el HLE
 	// `swkbd` en su hilo de render, y el texto base64url de la demanda vigente.
 	static constexpr size_t kKeyboardPendingMax = 8;

@@ -424,6 +424,21 @@ void mic_updateDevicePlayState(bool isPlaying)
 
 void mic_updateOnAXFrame()
 {
+	// Diagnóstico CR-035: qué rama alimenta el ringbuffer del juego en cada
+	// frame de AX. Throttle ≤ 1 Hz: el ATSC slot revela cuya rama se pierde
+	// el flujo (telefono / dispositivo_pc / tono / silencio / sin_mic_activo).
+	static std::atomic<uint32_t> s_lastBranchLogMs{0};
+	auto logMicBranch = [](const char* branch)
+	{
+		const uint32_t nowMs = GetTickCount();
+		uint32_t previous = s_lastBranchLogMs.load();
+		if (uint32_t(nowMs - previous) < 1000)
+			return;
+		if (!s_lastBranchLogMs.compare_exchange_weak(previous, nowMs))
+			return;
+		cemuLog_log(LogType::Force, "[TwinpadMic] AX frame fuente={}", branch);
+	};
+
 	sint32 drcIndex = 0;
 	if( mic_isActive(0) == false ) 
 	{
@@ -432,25 +447,37 @@ void mic_updateOnAXFrame()
 		{
 			std::shared_lock lock(g_audioInputMutex);
 			mic_updateDevicePlayState(false);
+			logMicBranch("sin_mic_activo");
 			return;
 		}
 	}
 
 	std::shared_lock lock(g_audioInputMutex);
-	mic_updateDevicePlayState(true);
-	// CR-035: las muestras frescas del teléfono tienen precedencia; sin
-	// ellas se usan los caminos Cemu existentes (dispositivo del PC / blow mic).
-	sint16 phoneMicSamples[MIC_SAMPLES_PER_3MS_32KHZ];
-	if (TwinpadClient::Instance().ConsumeMicSamples(phoneMicSamples, MIC_SAMPLES_PER_3MS_32KHZ))
-	{
-		mic_feedSamples(0, phoneMicSamples, MIC_SAMPLES_PER_3MS_32KHZ);
-		return;
-	}
+	mic_updateDevicePlayState(true);		// CR-035: las muestras frescas del teléfono tienen precedencia; sin
+		// ellas se usan los caminos Cemu existentes (dispositivo del PC / blow mic).
+		sint16 phoneMicSamples[MIC_SAMPLES_PER_3MS_32KHZ];
+		if (TwinpadClient::Instance().ConsumeMicSamples(phoneMicSamples, MIC_SAMPLES_PER_3MS_32KHZ))
+		{
+			// CR-035 + sensibilidad: el feed del teléfono respeta el mismo
+			// volumen de entrada del GamePad que el dispositivo del PC
+			// (config.input_volume, slider en Ajustes → Audio, 0–300 %).
+			// Se lee por frame para ajustarlo en caliente.
+			const sint32 volumePercent = std::clamp(GetConfig().input_volume, 0, 300);
+			for (sint32 i = 0; i < MIC_SAMPLES_PER_3MS_32KHZ; ++i)
+			{
+				const sint32 amplified = static_cast<sint32>(phoneMicSamples[i]) * volumePercent / 100;
+				phoneMicSamples[i] = static_cast<sint16>(std::clamp(amplified, -32768, 32767));
+			}
+			mic_feedSamples(0, phoneMicSamples, MIC_SAMPLES_PER_3MS_32KHZ);
+			logMicBranch("telefono");
+			return;
+		}
 	if (g_inputAudio)
 	{
 		sint16 micSampleData[MIC_SAMPLES_PER_3MS_32KHZ];
 		g_inputAudio->ConsumeBlock(micSampleData);
 		mic_feedSamples(0, micSampleData, MIC_SAMPLES_PER_3MS_32KHZ);
+		logMicBranch("dispositivo_pc");
 	}
 	else
 	{
@@ -464,10 +491,12 @@ void mic_updateOnAXFrame()
 			{
 				micSampleData[i] = (sint16)(sin((float)GetTickCount()*0.1f+sin((float)GetTickCount()*0.0001f)*100.0f)*30000.0f);
 			}
+			logMicBranch("tono_blow_mic");
 		}
 		else
 		{
 			memset(micSampleData, 0x00, sizeof(micSampleData));
+			logMicBranch("silencio");
 		}
 		mic_feedSamples(0, micSampleData, micSampleCount);
 	}

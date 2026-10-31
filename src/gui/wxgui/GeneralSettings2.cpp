@@ -664,7 +664,10 @@ wxPanel* GeneralSettings2::AddAudioPage(wxNotebook* notebook)
 		audio_input_row->AddSpacer(0);
 
 		audio_input_row->Add(new wxStaticText(box, wxID_ANY, _("Volume")), 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
-		m_input_volume = new wxSlider(box, wxID_ANY, 100, 0, 100);
+		// 300 %: el mic del teléfono comúnmente llega tenue; el doble o más
+		// es necesario para el mic de soplido del juego. Semántica idéntica
+		// al mic por dispositivo del PC (config.input_volume).
+		m_input_volume = new wxSlider(box, wxID_ANY, 100, 0, 300);
 		audio_input_row->Add(m_input_volume, 0, wxEXPAND | wxALL, 5);
 		auto audio_input_volume_text = new wxStaticText(box, wxID_ANY, "100%");
 		audio_input_row->Add(audio_input_volume_text, 0, wxALIGN_CENTER_VERTICAL | wxALL | wxALIGN_RIGHT, 5);

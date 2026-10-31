@@ -2112,6 +2112,13 @@ void TwinpadClient::InputLoop()
 							SetCaptureResolution(document["w"].GetUint(), document["h"].GetUint());
 					}
 					else if (document.IsObject() && document.HasMember("type") && document["type"].IsString()
+						&& std::string_view(document["type"].GetString()) == "video_force_idr")
+					{
+						// CR-051: el teléfono entró al canal media; IDR inmediata en el
+						// siguiente frame publicado en lugar de la cadencia periódica.
+						RequestKeyframe();
+					}
+					else if (document.IsObject() && document.HasMember("type") && document["type"].IsString()
 						&& std::string_view(document["type"].GetString()) == "camera_frame")
 					{
 						// CR-034: camera_frame H.264 320x240 del teléfono; se decodifica aquí.
@@ -2343,6 +2350,11 @@ void TwinpadClient::FlushVideoMetricsIfDue()
 	micPrev.accepted = acceptedNow;
 	micPrev.consumed = consumedNow;
 	cemuLog_log(LogType::Force, "{}", micSummary);
+}
+
+void TwinpadClient::RequestKeyframe() // CR-051: IDR inmediata para el nuevo suscriptor media
+{
+	m_forceNextIdr.store(true, std::memory_order_release);
 }
 
 void TwinpadClient::SetCaptureBitrate(uint32_t bitrateKbps) // CR-027: bitrate en caliente

@@ -204,6 +204,9 @@ public:
 	// CR-030: resolución de emisión del GamePad (DRC). Solo afecta al frame
 	// publicado; la resolución de render del juego en TV no cambia.
 	void SetCaptureResolution(uint32_t width, uint32_t height);
+	// CR-051: IDR inmediata al (re)entrar un cliente media (SPEC-003 §8.2)
+	// en lugar de esperar la cadencia periódica de ~1 s del encoder.
+	void RequestKeyframe();
 	uint32_t GetCaptureRequestWidth() const { return m_captureWidth.load(); }
 	uint32_t GetCaptureRequestHeight() const { return m_captureHeight.load(); }
 	void SetHardwareAccelerationEnabled(bool enabled) { m_hardwareAccelerationEnabled.store(enabled); }
@@ -386,7 +389,9 @@ private:
 	uint16_t m_encoderHeight{};
 	uint32_t m_encoderBitrateKbps{};
 	uint64_t m_encoderFrameIndex{};
-	bool m_forceNextIdr{true};
+	// CR-051: el hilo de recepción la escribe (video_force_idr) y el de
+	// encode la lee; atómica porque ya cruza hilos.
+	std::atomic<bool> m_forceNextIdr{true};
 	uint64_t m_lastIdrTimestampUs{};
 	uint64_t m_encoderEpochUs{};
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(TwinpadVideoMetricStage::COUNT)> m_videoMetricCounts{};

@@ -324,10 +324,10 @@ void VPADController::update_motion(VPADStatus_t& status, const TwinpadInputState
 	if (!input.motionValid || !TwinpadClient::Instance().HasFreshMotionInput()
 		|| !TwinpadMotionMapper::IsFinite(input))
 	{
-		// CR-021/SPEC-006: without fresh samples the fusion reports "waiting", but the
-		// Mahony state is preserved like in the DSU path (DSUControllerProvider never
-		// re-initializes its handler) so inputs resuming after a hiccup do not jump
-		// to the default pose.
+		// CR-021/SPEC-006: sin muestras frescas la fusión reporta «waiting», pero el
+		// estado Mahony se preserva como en la ruta DSU (DSUControllerProvider nunca
+		// reinicializa su handler), así que inputs tras un hiccup no saltan a la pose
+		// default.
 		m_has_last_twinpad_motion_sample = false;
 		m_last_twinpad_motion_timestamp_us = 0;
 		// CR-045: sin señal fresca las muestras encoladas son viejas; se descartan.
@@ -391,7 +391,15 @@ void VPADController::update_motion(VPADStatus_t& status, const TwinpadInputState
 		processedAny = true;
 	}
 	if (!processedAny)
+	{
+		// CR-047: el frame sin muestras nuevas no puede dejar la matriz identidad
+		// (el juego la interpreta como un salto de cámara: parpadeo arriba↔abajo).
+		// Reaplica el último estado fusionado vigente, como sample-hold del VPAD.
+		const TwinpadFusedMotionState cached = TwinpadClient::Instance().GetFusedMotionState();
+		if (cached.valid)
+			apply_twinpad_fused_motion(status, cached);
 		return;
+	}
 
 	TwinpadFusedMotionState fused{};
 	fused.valid = true;

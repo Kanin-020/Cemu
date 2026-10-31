@@ -31,6 +31,17 @@ public:
 	size_t CopyLatestNv12(uint8_t* dst, size_t dstSize);
 
 	/**
+	 * Escala el último frame NV12 (320x240) al layout NV12 del surface del
+	 * juego según WiiUBrew: `dstPitch` bytes por fila (con padding al final),
+	 * `dstHeight` filas y `dstVisibleWidth` columnas visibles (pitch ≥ ancho).
+	 * El padding de las filas queda en cero. Limpia todo el buffer antes de
+	 * escribir para que no quede basura en planos no cubiertos. Devuelve los
+	 * bytes escritos (0 si no hay frame o la geometría no cuadra).
+	 */
+	size_t ScaleLatestNv12(uint8_t* dst, size_t dstSize, size_t dstPitch, size_t dstHeight,
+		size_t dstVisibleWidth);
+
+	/**
 	 * Convierte planos YUV420P (con stride) a NV12: Y completo seguido de UV
 	 * intercalado. Devuelve false si la geometría no es utilizable.
 	 */

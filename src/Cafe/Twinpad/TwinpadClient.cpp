@@ -2047,6 +2047,27 @@ void TwinpadClient::InputLoop()
 				+ std::chrono::milliseconds(kRetryIntervalMs);
 			continue;
 		}
+		// CR-049: el socket es NONBLOCK (ConnectPrimary), así que la cadencia de
+		// lectura la marca este hilo. Antes era un sleep(10) fijo por iteración:
+		// hasta 10 ms de latencia añadida a cada input_report y ráfagas enteras
+		// enjauladas en el sleep. Ahora solo espera con select SI no hay línea
+		// completa pendiente en el buffer; con datos, drain inmediato.
+		if (m_receiveBuffer.find('\n') == std::string::npos)
+		{
+			fd_set readFds;
+			FD_ZERO(&readFds);
+			FD_SET(static_cast<int>(socket), &readFds);
+			timeval waitTimeout{};
+			waitTimeout.tv_sec = 0;
+			waitTimeout.tv_usec = 2000; // 2 ms: reacción de reconexión intacta
+#if BOOST_OS_WINDOWS
+			const int ready = ::select(0, &readFds, nullptr, nullptr, &waitTimeout);
+#else
+			const int ready = ::select(static_cast<int>(socket) + 1, &readFds, nullptr, nullptr, &waitTimeout);
+#endif
+			if (ready <= 0)
+				continue;
+		}
 		char buffer[8192];
 #if BOOST_OS_WINDOWS
 		const int count = ::recv(static_cast<SocketHandle>(socket), buffer, sizeof(buffer) - 1, 0);
@@ -2238,7 +2259,8 @@ void TwinpadClient::InputLoop()
 			nextConnectionAttempt = std::chrono::steady_clock::now()
 				+ std::chrono::milliseconds(kRetryIntervalMs);
 		}
-		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		// CR-049: sin sleep fijo al final del loop — el select de arriba es el
+		// único punto de espera (≤2 ms sin datos; 0 con datos recientes).
 	}
 }
 

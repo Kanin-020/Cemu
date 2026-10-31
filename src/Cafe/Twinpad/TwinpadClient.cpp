@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <fstream>
+#include <unordered_set>
 #include <thread>
 #include <cerrno>
 #include <cstdio>
@@ -13,6 +15,7 @@
 #include <filesystem>
 #include <cstdlib>
 #include <deque>
+#include <fmt/format.h>
 #include <rapidjson/document.h>
 #include <wels/codec_api.h>
 extern "C"
@@ -2822,9 +2825,65 @@ bool TwinpadClient::ConsumeMicSamples(int16_t* dst, size_t count)
 		cemuLog_log(LogType::Force, "[TwinpadMic] consumo por AX activo (cola={})", m_micSamples.size());
 	return true;
 }
+// CR-050: diagnóstico de colores por juego — nombre del formato y dump
+// opcional del primer RGB convertido por (formato, w, h). El FrameLoop es
+// el único hilo que llama; statics locales sin sincronización extra.
+namespace
+{
+
+const char* TwinpadFormatName(TwinpadPixelFormat format)
+{
+	switch (format)
+	{
+	case TwinpadPixelFormat::Rgb8: return "Rgb8";
+	case TwinpadPixelFormat::Rgb8Srgb: return "Rgb8Srgb";
+	case TwinpadPixelFormat::Rgba8: return "Rgba8";
+	case TwinpadPixelFormat::Rgba8Srgb: return "Rgba8Srgb";
+	case TwinpadPixelFormat::Bgra8: return "Bgra8";
+	case TwinpadPixelFormat::Bgra8Srgb: return "Bgra8Srgb";
+	default: return "?";
+	}
+}
+
+// Vuelca el RGB convertido del primer frame por clave (formato,w,h) con
+// TWINPAD_CAPTURE_DUMP_DIR definida (máx 6 dumps por sesión). La evidencia
+// distingue canal intercambiado vs gamma vs pitch sin tocar producción.
+void TwinpadCaptureDump(const std::vector<uint8_t>& rgb, uint16_t width, uint16_t height, TwinpadPixelFormat format)
+{
+	static std::unordered_set<uint64_t> dumpedKeys;
+	static uint32_t dumpCount = 0;
+	if (dumpCount >= 6)
+		return;
+	const char* dumpDir = std::getenv("TWINPAD_CAPTURE_DUMP_DIR");
+	if (!dumpDir)
+		return;
+	const uint64_t key = (static_cast<uint64_t>(width) << 24) | (static_cast<uint64_t>(height) << 8)
+		| static_cast<uint64_t>(static_cast<uint8_t>(format));
+	if (!dumpedKeys.insert(key).second)
+		return;
+	const std::filesystem::path path = std::filesystem::path(dumpDir)
+		/ (std::string("twinpad-frame-") + TwinpadFormatName(format) + "-" + std::to_string(width) + "x" + std::to_string(height) + ".ppm");
+	std::error_code errorCode;
+	std::filesystem::create_directories(std::filesystem::path(dumpDir), errorCode);
+	std::ofstream file;
+	file.open(path, std::ios::binary);
+	if (!file.is_open())
+	{
+		cemuLog_log(LogType::Force, "[TwinpadDiag] dump PPM no escribible: {}", path.string());
+		return;
+	}
+	file << "P6\n" << width << " " << height << "\n255\n";
+	file.write(reinterpret_cast<const char*>(rgb.data()), static_cast<std::streamsize>(rgb.size()));
+	file.close();
+	++dumpCount;
+	cemuLog_log(LogType::Force, "[TwinpadDiag] dump PPM: {} ({} bytes)", path.string(), rgb.size());
+}
+
+} // namespace
 
 void TwinpadClient::FrameLoop()
 {
+	TwinpadPixelFormat lastDiagFormat = static_cast<TwinpadPixelFormat>(0xFF);
 	while (m_running.load())
 	{
 		FlushVideoMetricsIfDue();
@@ -2866,6 +2925,46 @@ void TwinpadClient::FrameLoop()
 		}
 
 		const auto pixelConvertStarted = std::chrono::steady_clock::now();
+		// CR-050: cada cambio de formato del gamepad se loguea con su tamaño; el
+		// camino CR-036 (directo) y el CR-040 (blit GPU) quedan identificables
+		// por juego en el log (la línea de CR-040 solo se emite una vez por sesión).
+		if (format != lastDiagFormat)
+		{
+			lastDiagFormat = format;
+			cemuLog_log(LogType::Force, "[TwinpadDiag] frame del gamepad: fmt={} ({}x{})", TwinpadFormatName(format), width, height);
+			// CR-050: muestra del RGB convertido (lo que come el encoder) en el
+		// cambio de formato: promedio/banda por canal y 3 píxeles de la fila
+		// media. Canal intercambiado, gamma faltante o sobrante y pitch se
+		// distinguen leyendo estos números (y comparándolos con la vista DRC
+		// de la ventana de Cemu).
+			if (static_cast<size_t>(width) * height * 3 == frameData.size())
+			{
+				uint64_t sumR = 0, sumG = 0, sumB = 0;
+				uint8_t minR = 255, minG = 255, minB = 255, maxR = 0, maxG = 0, maxB = 0;
+				const size_t pixelCount = static_cast<size_t>(width) * height;
+				for (size_t pixel = 0; pixel < pixelCount; ++pixel)
+				{
+					const uint8_t r = frameData[pixel * 3], g = frameData[pixel * 3 + 1], b = frameData[pixel * 3 + 2];
+					sumR += r; sumG += g; sumB += b;
+					minR = std::min(minR, r); minG = std::min(minG, g); minB = std::min(minB, b);
+					maxR = std::max(maxR, r); maxG = std::max(maxG, g); maxB = std::max(maxB, b);
+				}
+				cemuLog_log(LogType::Force,
+					"[TwinpadDiag] fmt={} stats avg=({:.2f},{:.2f},{:.2f}) r=({},{}) g=({},{}) b=({},{})",
+					TwinpadFormatName(format),
+					static_cast<double>(sumR) / pixelCount, static_cast<double>(sumG) / pixelCount,
+					static_cast<double>(sumB) / pixelCount, minR, maxR, minG, maxG, minB, maxB);
+				const size_t row = static_cast<size_t>(height / 2);
+				const auto samplePixel = [&](uint32_t x) {
+					const size_t index = (row * width + x) * 3;
+					return fmt::format("({},{})=({},{},{})", x, row,
+						static_cast<uint32_t>(frameData[index]), static_cast<uint32_t>(frameData[index + 1]),
+						static_cast<uint32_t>(frameData[index + 2]));
+				};
+				cemuLog_log(LogType::Force, "[TwinpadDiag] fila-mid: {} {} {}",
+					samplePixel(width / 4), samplePixel(width / 2), samplePixel(width * 3 / 4));
+			}
+		}
 		if (format == TwinpadPixelFormat::Rgb8Srgb)
 		{
 			std::transform(frameData.begin(), frameData.end(), frameData.begin(), SrgbToRgb);
@@ -2894,6 +2993,10 @@ void TwinpadClient::FrameLoop()
 		}
 		RecordVideoMetric(TwinpadVideoMetricStage::PIXEL_CONVERT,
 			std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - pixelConvertStarted).count());
+		// CR-050: vuelca el RGB convertido (PPM P6) del primer frame por clave
+		// (formato,w,h) con TWINPAD_CAPTURE_DUMP_DIR definida; evidencia para
+		// el fix de color (canal/gamma/pitch) sin tocar la ruta de producción.
+		TwinpadCaptureDump(frameData, width, height, format);
 		// CR-030: aplicar la resolución de emisión del GamePad (DRC). Solo
 		// reduce: si el target >= nativo se publica nativo (sin upscale).
 		const uint32_t targetWidth = m_captureWidth.load(std::memory_order_relaxed);

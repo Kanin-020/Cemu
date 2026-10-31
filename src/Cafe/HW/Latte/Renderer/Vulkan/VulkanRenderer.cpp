@@ -1303,9 +1303,23 @@ void VulkanRenderer::CaptureTwinpadFrameAsync(LatteTextureView* texView)
 	VkImage readbackImage = image->m_image;
 	VkFormat slotFormat = format;
 	VkDeviceSize slotCopySize = copySize;
+	// CR-050 v4: el DRC de títulos con superficie GX2 sRGB (p. ej. Wind
+	// Waker HD, formato packed 10-bit sin variante Vulkan sRGB) deja bytes
+	// LINEALES en la superficie: el juego escribe lineal esperando el
+	// encode del store que el attachment UNORM de 10-bit no aplica. El
+	// encode sRGB ocurre entonces EN EL BLIT (destino R8G8B8A8_SRGB cuando
+	// drcBufferUsesSRGB está activo — mismo patrón que CaptureFrameTexture,
+	// la captura de screenshots upstream, verificada visualmente correcta
+	// en radeonsi) y la etiqueta del slot queda SIEMPRE unorm: los bytes
+	// del slot llegan display-referidos tal como en la ruta directa de
+	// Nintendo Land (attachment 8-bit sRGB que sí codifica en el store) y
+	// el FrameLoop no los toca. Editar ambos a la vez: destino unorm sin
+	// encode (v3) deja wire lineal → oscuro; destino srgb con etiqueta srgb
+	// (CR-040/CR-050 v2) re-decodifica el encode → wire lineal de nuevo.
+	const VkFormat convertedFormat = LatteGPUState.drcBufferUsesSRGB ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+	const VkFormat slotTagFormat = VK_FORMAT_R8G8B8A8_UNORM;
 	if (bytesPerPixel == 0)
 	{
-		const VkFormat convertedFormat = LatteGPUState.drcBufferUsesSRGB ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
 		bool normalized = EnsureTwinpadDrcConvertImage(convertedFormat);
 		if (normalized)
 		{
@@ -1326,10 +1340,11 @@ void VulkanRenderer::CaptureTwinpadFrameAsync(LatteTextureView* texView)
 		}
 		static std::atomic_bool warnedNormalized{false};
 		if (!warnedNormalized.exchange(true))
-			cemuLog_log(LogType::Force, "[TwinpadVideo] READBACK normalizado en GPU: fmt={} w={} h={} → R8G8B8A8({})",
-				static_cast<int>(format), width, height, convertedFormat == VK_FORMAT_R8G8B8A8_SRGB ? "srgb" : "unorm");
+			cemuLog_log(LogType::Force, "[TwinpadVideo] READBACK normalizado en GPU: fmt={} w={} h={} → R8G8B8A8 {} (slot etiqueta: unorm)",
+				static_cast<int>(format), width, height,
+				convertedFormat == VK_FORMAT_R8G8B8A8_SRGB ? "srgb (encode en blit)" : "unorm (raw)");
 		readbackImage = m_twinpadDrcConvertImage;
-		slotFormat = convertedFormat;
+		slotFormat = slotTagFormat;
 		slotCopySize = static_cast<VkDeviceSize>(width) * height * 4;
 	}
 
@@ -1350,7 +1365,7 @@ void VulkanRenderer::CaptureTwinpadFrameAsync(LatteTextureView* texView)
 		VkFormatProperties srcProps{};
 		vkGetPhysicalDeviceFormatProperties(m_physicalDevice, format, &srcProps);
 		// Check if source format supports blit to R8G8B8A8
-		VkFormat dstFormat = LatteGPUState.drcBufferUsesSRGB ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+		VkFormat dstFormat = convertedFormat;
 		VkFormatProperties dstProps{};
 		vkGetPhysicalDeviceFormatProperties(m_physicalDevice, dstFormat, &dstProps);
 		if (srcProps.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT)

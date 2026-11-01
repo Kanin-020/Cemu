@@ -2309,23 +2309,71 @@ void TwinpadClient::FlushVideoMetricsIfDue()
 		"readback_slot_busy", "frame_queued", "frame_encoded", "frame_sent",
 	};
 	std::string summary = "[TwinpadPerf] window_ms=" + std::to_string(kVideoMetricLogIntervalMs);
+	// CR-053: la MISMA pasada de exchange(...,0) alimenta el log y la línea
+	// `video_stage_stats` del HUD (trozo de snapshot único; sin raza de
+	// contadores entre testigos).
+	std::string stagesJson;
 	for (size_t index = 0; index < m_videoMetricCounts.size(); ++index)
 	{
 		const uint64_t count = m_videoMetricCounts[index].exchange(0, std::memory_order_relaxed);
 		const uint64_t totalNs = m_videoMetricNanoseconds[index].exchange(0, std::memory_order_relaxed);
 		const uint64_t maxNs = m_videoMetricMaxNanoseconds[index].exchange(0, std::memory_order_relaxed);
-		if (count != 0)
-			summary += " " + std::string(stageNames[index]) + "_n=" + std::to_string(count)
-				+ "_avg_us=" + std::to_string(totalNs / count / 1000)
-				+ "_max_us=" + std::to_string(maxNs / 1000);
+		if (count == 0)
+			continue;
+		const std::string avgUs = std::to_string(totalNs / count / 1000);
+		const std::string maxUs = std::to_string(maxNs / 1000);
+		summary += " " + std::string(stageNames[index]) + "_n=" + std::to_string(count)
+			+ "_avg_us=" + avgUs
+			+ "_max_us=" + maxUs;
+		if (!stagesJson.empty())
+			stagesJson += ',';
+		stagesJson += "{\"stage\":\"";
+		stagesJson += stageNames[index];
+		stagesJson += "\",\"count\":" + std::to_string(count > 100000 ? 100000 : count);
+		stagesJson += ",\"avg_us\":" + avgUs;
+		stagesJson += ",\"max_us\":" + maxUs;
+		stagesJson += '}';
 	}
+	std::string eventsJson;
 	for (size_t index = 0; index < m_videoMetricEvents.size(); ++index)
 	{
 		const uint64_t count = m_videoMetricEvents[index].exchange(0, std::memory_order_relaxed);
-		if (count != 0)
-			summary += " " + std::string(eventNames[index]) + "=" + std::to_string(count);
+		if (count == 0)
+			continue;
+		summary += " " + std::string(eventNames[index]) + "=" + std::to_string(count);
+		if (!eventsJson.empty())
+			eventsJson += ',';
+		eventsJson += "{\"event\":\"";
+		eventsJson += eventNames[index];
+		eventsJson += "\",\"count\":" + std::to_string(count > 100000 ? 100000 : count);
+		eventsJson += '}';
 	}
 	cemuLog_log(LogType::Force, "{}", summary);
+
+	// CR-053: la ventana cae también al HUD del teléfono vía
+	// `video_stage_stats` por el canal primario; el server solo la reenvía
+	// a la sesión con este juego seleccionado. Telemetría: si la cola
+	// está al tope se descarta la línea MÁS VIEJA (la ventana de 5 s
+	// siguiente repone los datos; nunca bloquea el encode).
+	if (m_connected.load(std::memory_order_relaxed) && m_primarySocket >= 0)
+	{
+		std::string statsLine = "{\"type\":\"video_stage_stats\",";
+		statsLine += "\"window_ms\":" + std::to_string(kVideoMetricLogIntervalMs);
+		statsLine += ",\"stages\":[]";
+		if (!stagesJson.empty())
+			statsLine.insert(statsLine.size() - 1, stagesJson);
+		statsLine += ",\"events\":[]";
+		if (!eventsJson.empty())
+			statsLine.insert(statsLine.size() - 1, eventsJson);
+		statsLine += '}';
+		{
+			std::scoped_lock lock(m_videoSendQueueMutex);
+			if (m_videoSendQueue.size() == kVideoSendQueueMaxLines)
+				m_videoSendQueue.pop_front();
+			m_videoSendQueue.push_back(std::move(statsLine));
+		}
+		m_videoSendQueueChanged.notify_one();
+	}
 
 	// Telemetría CR-035 sin throttle: tasas crudas por ventana. accepted/s
 	// esperado ≈ 66 (480 muestras @ 32 kHz); consume_ok/s esperado ≈ 336 si

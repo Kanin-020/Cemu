@@ -48,6 +48,23 @@ struct TwinpadEncodedFrame
 	bool idr{};
 };
 
+// CR-054: access unit ya codificada más los metadatos de envío. La línea
+// NDJSON de `game_frame` (fallback del canal binario) se construye solo si
+// el canal media no existe; en el camino normal el anexo viaja crudo.
+struct TwinpadQueuedAu
+{
+	// CR-054: anexo crudo del AU. Vacío cuando el elemento es una línea
+	// NDJSON pura (p. ej. `video_stage_stats` de CR-053, que solo viaja por
+	// el canal primario y nunca por el binario).
+	std::vector<uint8_t> annexB;
+	std::string ndjsonLine;
+	uint64_t gfn{};
+	uint64_t timestampUs{};
+	uint16_t width{};
+	uint16_t height{};
+	bool idr{};
+};
+
 struct TwinpadQr
 {
 	std::string uri;
@@ -258,12 +275,19 @@ private:
 	~TwinpadClient();
 	bool ConnectPrimary();
 	bool ConnectAudio();
+	// CR-054: canal media binario (header+anexo, sin base64 ni JSON). Falla
+	// silenciosa contra un server sin listener; el NDJSON queda de fallback.
+	bool ConnectMedia();
+	void CloseMedia();
+	bool SendMediaFrame(const TwinpadQueuedAu& frame);
 	void AudioLoop();
 	void FrameLoop();
 	void InputLoop();
 	// CR-048: envío de video en hilo dedicado; el FrameLoop solo encola.
 	void VideoSendLoop();
 	bool SendLine(std::intptr_t socket, const std::string& line);
+	// CR-054: envío crudo (sin terminador) para el canal media binario.
+	bool SendBytes(std::intptr_t socket, const char* data, size_t size);
 	static std::string Base64Url(const uint8_t* data, size_t size);
 
 	std::atomic_bool m_connected{false};
@@ -370,11 +394,15 @@ private:
 	static constexpr size_t kVideoSendQueueMaxLines = 4;
 	std::mutex m_videoSendQueueMutex;
 	std::condition_variable m_videoSendQueueChanged;
-	std::deque<std::string> m_videoSendQueue;
+	std::deque<TwinpadQueuedAu> m_videoSendQueue;
 	std::intptr_t m_primarySocket{-1};
 	std::intptr_t m_audioSocket{-1};
+	// CR-054: socket del canal media binario al server (127.0.0.1:8426).
+	std::atomic_bool m_mediaConnected{false};
+	std::intptr_t m_mediaSocket{-1};
 	std::mutex m_primarySocketMutex;
 	std::mutex m_audioSocketMutex;
+	std::mutex m_mediaSocketMutex;
 	std::thread m_audioThread;
 	std::thread m_frameThread;
 	std::thread m_inputThread;

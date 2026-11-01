@@ -89,6 +89,11 @@ namespace
 {
 constexpr uint16_t kGameIpcPort = 8421;
 constexpr uint16_t kAudioIpcPort = 8422;
+// CR-054: canal media binario (después de 8425 media del teléfono; 8424 E2E).
+constexpr uint16_t kMediaIpcPort = 8426;
+constexpr size_t kMediaFrameHeaderBytes = 32;
+constexpr uint16_t kMediaFrameMagic = 0x5457; // "TW"
+constexpr uint8_t kMediaFrameFmtH264 = 1;
 constexpr uint16_t kQrIpcPort = 8423;
 #ifdef TWINPAD_E2E_TEST_HOOK
 constexpr uint16_t kE2eCaptureIpcPort = 8424;
@@ -1197,15 +1202,26 @@ void TwinpadClient::SetTitleActive(bool active, bool connectAutomatically)
 				shutdown(static_cast<SocketHandle>(m_primarySocket), SHUT_RDWR);
 #endif
 			}
-		}
-		{
+		}		{
 			std::scoped_lock lock(m_audioSocketMutex);
 			if (m_audioSocket >= 0)
-			{
+				{
 #if BOOST_OS_WINDOWS
 				shutdown(static_cast<SocketHandle>(m_audioSocket), SD_BOTH);
 #else
 				shutdown(static_cast<SocketHandle>(m_audioSocket), SHUT_RDWR);
+#endif
+				}
+		}
+		{
+			// CR-054: idem audio sobre el canal media binario.
+			std::scoped_lock lock(m_mediaSocketMutex);
+			if (m_mediaSocket >= 0)
+			{
+#if BOOST_OS_WINDOWS
+				shutdown(static_cast<SocketHandle>(m_mediaSocket), SD_BOTH);
+#else
+				shutdown(static_cast<SocketHandle>(m_mediaSocket), SHUT_RDWR);
 #endif
 			}
 		}
@@ -1291,16 +1307,107 @@ bool TwinpadClient::ConnectAudio()
 	return true;
 }
 
+// CR-054: abre el canal media binario (127.0.0.1:8426) y ejecuta el
+// handshake NDJSON `game_media_start`. Si el server no tiene listener
+// (versión vieja o puerto en uso), falla silenciosamente: el envío de
+// video sigue por el NDJSON primario hasta la próxima reconexión.
+bool TwinpadClient::ConnectMedia()
+{
+	std::scoped_lock socketLock(m_mediaSocketMutex);
+	if (m_mediaSocket >= 0)
+		return true;
+	m_mediaSocket = static_cast<std::intptr_t>(socket(AF_INET, SOCK_STREAM, 0));
+	if (m_mediaSocket < 0)
+		return false;
+	sockaddr_in endpoint{};
+	endpoint.sin_family = AF_INET;
+	endpoint.sin_port = htons(kMediaIpcPort);
+	inet_pton(AF_INET, "127.0.0.1", &endpoint.sin_addr);
+	if (connect(static_cast<SocketHandle>(m_mediaSocket), reinterpret_cast<sockaddr*>(&endpoint), sizeof(endpoint)) != 0)
+	{
+		CloseSocket(static_cast<SocketHandle>(m_mediaSocket));
+		m_mediaSocket = -1;
+		return false;
+	}
+#if BOOST_OS_WINDOWS
+	u_long nonBlocking = 1;
+	ioctlsocket(static_cast<SocketHandle>(m_mediaSocket), FIONBIO, &nonBlocking);
+#else
+	const int socketFlags = fcntl(static_cast<SocketHandle>(m_mediaSocket), F_GETFL, 0);
+	if (socketFlags >= 0)
+		fcntl(static_cast<SocketHandle>(m_mediaSocket), F_SETFL, socketFlags | O_NONBLOCK);
+#endif
+	if (!SendLine(m_mediaSocket, "{\"type\":\"game_media_start\",\"game_id\":\"cemu\"}"))
+	{
+		CloseSocket(static_cast<SocketHandle>(m_mediaSocket));
+		m_mediaSocket = -1;
+		return false;
+	}
+	m_mediaConnected.store(true);
+	cemuLog_log(LogType::Force, "[Twinpad] canal media binario conectado en 127.0.0.1:{} (CR-054).", kMediaIpcPort);
+	return true;
+}
+
+void TwinpadClient::CloseMedia()
+{
+	std::scoped_lock socketLock(m_mediaSocketMutex);
+	m_mediaConnected.store(false);
+	if (m_mediaSocket >= 0)
+	{
+		CloseSocket(static_cast<SocketHandle>(m_mediaSocket));
+		m_mediaSocket = -1;
+	}
+}
+
+// CR-054: header little-endian de 32 bytes + anexo tal cual. Layout:
+// magic u16=0x5457 | gfn u64 | ts u64 | idr u8 | w u16 | h u16 | len u32 | fmt u8 | reserved[4].
+bool TwinpadClient::SendMediaFrame(const TwinpadQueuedAu& frame)
+{
+	if (m_mediaSocket < 0 || frame.annexB.empty() || frame.annexB.size() > 0xFFFFFFFFull)
+		return false;
+	uint8_t header[kMediaFrameHeaderBytes]{};
+	auto store16 = [&](size_t offset, uint16_t value) {
+		header[offset] = static_cast<uint8_t>(value);
+		header[offset + 1] = static_cast<uint8_t>(value >> 8);
+	};
+	auto store32 = [&](size_t offset, uint32_t value) {
+		for (size_t byte = 0; byte < 4; ++byte)
+			header[offset + byte] = static_cast<uint8_t>(value >> (8 * byte));
+	};
+	auto store64 = [&](size_t offset, uint64_t value) {
+		for (size_t byte = 0; byte < 8; ++byte)
+			header[offset + byte] = static_cast<uint8_t>(value >> (8 * byte));
+	};
+	store16(0, kMediaFrameMagic);
+	store64(2, frame.gfn);
+	store64(10, frame.timestampUs);
+	header[18] = frame.idr ? 1 : 0;
+	store16(19, frame.width);
+	store16(21, frame.height);
+	store32(23, static_cast<uint32_t>(frame.annexB.size()));
+	header[27] = kMediaFrameFmtH264;
+	if (!SendBytes(m_mediaSocket, reinterpret_cast<const char*>(header), kMediaFrameHeaderBytes))
+		return false;
+	return SendBytes(m_mediaSocket, reinterpret_cast<const char*>(frame.annexB.data()), frame.annexB.size());
+}
+
 bool TwinpadClient::SendLine(std::intptr_t socket, const std::string& line)
 {	if (socket < 0)
 		return false;
 	const std::string payload = line + "\n";
+	return SendBytes(socket, payload.data(), payload.size());
+}
 
+// CR-054: envío crudo de bytes (el canal media no puede llevar el `\n`
+// terminal de SendLine: el framing binario no tiene terminador).
+bool TwinpadClient::SendBytes(std::intptr_t socket, const char* data, size_t size)
+{	if (socket < 0)
+		return false;
 	size_t sent = 0;
-	while (sent < payload.size())
+	while (sent < size)
 	{
 #if BOOST_OS_WINDOWS
-		const int count = ::send(static_cast<SocketHandle>(socket), payload.data() + sent, static_cast<int>(payload.size() - sent), 0);
+		const int count = ::send(static_cast<SocketHandle>(socket), data + sent, static_cast<int>(size - sent), 0);
 		if (count == SOCKET_ERROR)
 		{
 			const int error = WSAGetLastError();
@@ -1311,7 +1418,7 @@ bool TwinpadClient::SendLine(std::intptr_t socket, const std::string& line)
 			continue;
 		}
 #else
-		const ssize_t count = ::send(static_cast<SocketHandle>(socket), payload.data() + sent, payload.size() - sent, MSG_NOSIGNAL);
+		const ssize_t count = ::send(static_cast<SocketHandle>(socket), data + sent, size - sent, MSG_NOSIGNAL);
 		if (count < 0)
 		{
 			if (errno == EINTR)
@@ -1943,6 +2050,7 @@ void TwinpadClient::InputLoop()
 						CloseSocket(static_cast<SocketHandle>(m_audioSocket));
 					m_audioSocket = -1;
 				}
+				CloseMedia();
 				m_receiveBuffer.clear();
 
 				{
@@ -1990,7 +2098,13 @@ void TwinpadClient::InputLoop()
 					CloseSocket(static_cast<SocketHandle>(m_audioSocket));
 				m_audioSocket = -1;
 			}
+			CloseMedia();
 			const bool connected = ConnectPrimary() && m_titleActive.load() && ConnectAudio();
+			// CR-054: el canal media binario se intenta por cada ciclo de
+			// reconexión; fallar (server viejo) es barato y el fallback NDJSON
+			// lleva el video mientras tanto.
+			if (connected)
+				ConnectMedia();
 			if (connected && m_titleActive.load() && m_connectionRequested.load())
 			{
 				m_frameNumber.store(0);
@@ -2029,11 +2143,11 @@ void TwinpadClient::InputLoop()
 				}
 				{
 					std::scoped_lock lock(m_audioSocketMutex);
-					if (m_audioSocket >= 0)
-						CloseSocket(static_cast<SocketHandle>(m_audioSocket));
-					m_audioSocket = -1;
-				}
-				nextConnectionAttempt = std::chrono::steady_clock::now()
+					if (m_audioSocket >= 0)						CloseSocket(static_cast<SocketHandle>(m_audioSocket));
+						m_audioSocket = -1;
+					}
+					CloseMedia();
+					nextConnectionAttempt = std::chrono::steady_clock::now()
 					+ std::chrono::milliseconds(kRetryIntervalMs);
 				continue;
 			}
@@ -2211,6 +2325,7 @@ void TwinpadClient::InputLoop()
 					CloseSocket(static_cast<SocketHandle>(m_audioSocket));
 				m_audioSocket = -1;
 			}
+			CloseMedia();
 			{
 				std::scoped_lock lock(m_inputMutex);
 				m_inputState = TwinpadInputState{};
@@ -2248,6 +2363,7 @@ void TwinpadClient::InputLoop()
 					CloseSocket(static_cast<SocketHandle>(m_audioSocket));
 				m_audioSocket = -1;
 			}
+			CloseMedia();
 			{
 				std::scoped_lock lock(m_inputMutex);
 				m_inputState = TwinpadInputState{};
@@ -2370,7 +2486,9 @@ void TwinpadClient::FlushVideoMetricsIfDue()
 			std::scoped_lock lock(m_videoSendQueueMutex);
 			if (m_videoSendQueue.size() == kVideoSendQueueMaxLines)
 				m_videoSendQueue.pop_front();
-			m_videoSendQueue.push_back(std::move(statsLine));
+			TwinpadQueuedAu stats;
+			stats.ndjsonLine = std::move(statsLine);
+			m_videoSendQueue.push_back(std::move(stats));
 		}
 		m_videoSendQueueChanged.notify_one();
 	}
@@ -3079,18 +3197,15 @@ void TwinpadClient::FrameLoop()
 		if (!EncodeGamePadFrame(frameData, width, height, encodedFrame))
 			continue;
 		RecordVideoEvent(TwinpadVideoMetricEvent::FRAME_ENCODED);
-		const uint64_t frame = m_frameNumber.fetch_add(1);
-		const auto base64JsonStarted = std::chrono::steady_clock::now();
-		const std::string encodedData = Base64Url(encodedFrame.annexB.data(), encodedFrame.annexB.size());
-		std::string line;
-		line.reserve(encodedData.size() + 192);
-		line = "{\"type\":\"game_frame\",\"gfn\":" + std::to_string(frame)
-			+ ",\"w\":" + std::to_string(width) + ",\"h\":" + std::to_string(height)
-			+ ",\"fmt\":\"h264\",\"ts_capture_us\":" + std::to_string(encodedFrame.timestampUs)
-			+ ",\"idr\":" + (encodedFrame.idr ? "true" : "false")
-			+ ",\"data\":\"" + encodedData + "\"}";
-		RecordVideoMetric(TwinpadVideoMetricStage::BASE64_JSON,
-			std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - base64JsonStarted).count());
+		// CR-054: el AU va a la cola sin base64 ni JSON; la serialización
+		// (binaria o NDJSON de fallback) corre en el hilo de envío.
+		TwinpadQueuedAu queued;
+		queued.annexB = std::move(encodedFrame.annexB);
+		queued.gfn = m_frameNumber.fetch_add(1);
+		queued.timestampUs = encodedFrame.timestampUs;
+		queued.width = width;
+		queued.height = height;
+		queued.idr = encodedFrame.idr;
 		// CR-048: la línea pasa al hilo de envío; el FrameLoop ya no espera
 		// al TCP (la backpressure dejaba la cadencia del encode a merced del
 		// socket). Drop-old en ráfagas: la imagen conserva la firma más fresca.
@@ -3098,7 +3213,7 @@ void TwinpadClient::FrameLoop()
 			std::scoped_lock lock(m_videoSendQueueMutex);
 			if (m_videoSendQueue.size() == kVideoSendQueueMaxLines)
 				m_videoSendQueue.pop_front();
-			m_videoSendQueue.push_back(std::move(line));
+			m_videoSendQueue.push_back(std::move(queued));
 		}
 		m_videoSendQueueChanged.notify_one();
 	}
@@ -3108,16 +3223,56 @@ void TwinpadClient::VideoSendLoop()
 {
 	while (m_running.load())
 	{
-		std::string line;
+		TwinpadQueuedAu queued;
 		{
 			std::unique_lock lock(m_videoSendQueueMutex);
 			m_videoSendQueueChanged.wait(lock, [this] { return !m_running.load() || !m_videoSendQueue.empty(); });
 			if (!m_running.load())
 				break;
-			line = std::move(m_videoSendQueue.front());
+			queued = std::move(m_videoSendQueue.front());
 			m_videoSendQueue.pop_front();
 		}
+		// CR-054: camino binario preferente (sin base64/JSON). Si el canal
+		// media no está vivo, el fallback NDJSON conserva el flujo viejo.
+		bool sent = false;
+		if (m_mediaConnected.load() && queued.ndjsonLine.empty())
+		{
+			const auto ipcSendStarted = std::chrono::steady_clock::now();
+			std::scoped_lock lock(m_mediaSocketMutex);
+			sent = m_mediaSocket >= 0 && SendMediaFrame(queued);
+			if (!sent)
+			{
+				// Canal muerto: volver al NDJSON en los frames siguientes.
+				m_mediaConnected.store(false);
+				if (m_mediaSocket >= 0)
+				{
+					CloseSocket(static_cast<SocketHandle>(m_mediaSocket));
+					m_mediaSocket = -1;
+				}
+				cemuLog_log(LogType::Force, "[Twinpad] canal media binario cayó; fallback a NDJSON (CR-054).");
+			}
+			else
+			{
+				RecordVideoMetric(TwinpadVideoMetricStage::IPC_SEND,
+					std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - ipcSendStarted).count());
+				RecordVideoEvent(TwinpadVideoMetricEvent::FRAME_SENT);
+				m_lastFrameSentMs.store(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()));
+				continue;
+			}
+		}
+		// Fallback NDJSON: serializa aquí solo cuando el binario no está.
 		const auto ipcSendStarted = std::chrono::steady_clock::now();
+		const auto base64JsonStarted = std::chrono::steady_clock::now();
+		const std::string encodedData = Base64Url(queued.annexB.data(), queued.annexB.size());
+		std::string line;
+		line.reserve(encodedData.size() + 192);
+		line = "{\"type\":\"game_frame\",\"gfn\":" + std::to_string(queued.gfn)
+			+ ",\"w\":" + std::to_string(queued.width) + ",\"h\":" + std::to_string(queued.height)
+			+ ",\"fmt\":\"h264\",\"ts_capture_us\":" + std::to_string(queued.timestampUs)
+			+ ",\"idr\":" + (queued.idr ? "true" : "false")
+			+ ",\"data\":\"" + encodedData + "\"}";
+		RecordVideoMetric(TwinpadVideoMetricStage::BASE64_JSON,
+			std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - base64JsonStarted).count());
 		std::scoped_lock lock(m_primarySocketMutex);
 		if (!m_connected.load() || m_primarySocket < 0)
 		{

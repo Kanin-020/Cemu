@@ -1506,6 +1506,11 @@ bool TwinpadClient::EncodeGamePadFrame(
 	const bool hardwarePreferenceChanged = hardwareRequested != m_encoderHardwarePreference;
 	if (!encoderExists || encoderConfigChanged || hardwarePreferenceChanged)
 	{
+		// TEMPORAL CR-065-diag: razón exacta de la recreación del encoder.
+		cemuLog_log(LogType::Force,
+			"[TwinpadVideo] encoder recreate: exists={} dim_changed={} hw_pref_changed={} ({}x{} kb={})",
+			encoderExists ? 1 : 0, encoderConfigChanged ? 1 : 0, hardwarePreferenceChanged ? 1 : 0,
+			width, height, bitrateKbps);
 		if (m_hardwareVideoEncoder)
 		{
 			delete static_cast<TwinpadFfmpegEncoder*>(m_hardwareVideoEncoder);
@@ -1566,6 +1571,24 @@ bool TwinpadClient::EncodeGamePadFrame(
 
 	output.annexB.clear();
 	bool forceIdr = m_forceNextIdr || nowUs - m_lastIdrTimestampUs >= kIdrIntervalMs * 1000;
+	// TEMPORAL CR-065-diag: estado IDR visible en el log de Cemu cada 2 s.
+	// El dropeo de una AU forzada sin IDR no consume fn ni frame: sin esta
+	// línea la sequía de IDR es invisible salvo por la ausencia en el stream.
+	static std::atomic<uint64_t> sIdrDiagNextMs{0};
+	const uint64_t idrDiagMs = nowUs / 1000;
+	uint64_t idrDiagNext = sIdrDiagNextMs.load(std::memory_order_relaxed);
+	if (idrDiagMs >= idrDiagNext
+		&& sIdrDiagNextMs.compare_exchange_weak(idrDiagNext, idrDiagMs + 2000,
+			std::memory_order_relaxed, std::memory_order_relaxed))
+	{
+		cemuLog_log(LogType::Force,
+			"[TwinpadVideo] idr_diag want={} force_next={} since_last_idr_ms={} hw_active={} index={}",
+			forceIdr ? 1 : 0,
+			m_forceNextIdr.load(std::memory_order_relaxed) ? 1 : 0,
+			m_lastIdrTimestampUs != 0 ? (nowUs - m_lastIdrTimestampUs) / 1000 : -1,
+			m_encoderHardwareActive ? 1 : 0,
+			m_encoderFrameIndex);
+	}
 	auto fallbackToOpenH264 = [&]() {
 		delete static_cast<TwinpadFfmpegEncoder*>(m_hardwareVideoEncoder);
 		m_hardwareVideoEncoder = nullptr;
@@ -1733,7 +1756,18 @@ bool TwinpadClient::EncodeGamePadFrame(
 	if (forceIdr && (!output.idr || !ContainsH264Nal(output.annexB.data(), output.annexB.size(), kH264SpsNalType)
 		|| !ContainsH264Nal(output.annexB.data(), output.annexB.size(), kH264PpsNalType)
 		|| !HasH264ContractProfile(output.annexB)))
+	{
+		// TEMPORAL CR-065-diag: cada dropeo por forceIdr fallido visible.
+		cemuLog_log(LogType::Force,
+			"[TwinpadVideo] idr_drop index={} idr_flag={} contains_idr={} sps={} pps={} contract={}",
+			m_encoderFrameIndex,
+			bool(output.idr) ? 1 : 0,
+			ContainsIdrNal(output.annexB) ? 1 : 0,
+			ContainsH264Nal(output.annexB.data(), output.annexB.size(), kH264SpsNalType) ? 1 : 0,
+			ContainsH264Nal(output.annexB.data(), output.annexB.size(), kH264PpsNalType) ? 1 : 0,
+			HasH264ContractProfile(output.annexB) ? 1 : 0);
 		return false;
+	}
 	if (output.idr)
 	{
 		m_lastIdrTimestampUs = nowUs;
@@ -2521,6 +2555,8 @@ void TwinpadClient::FlushVideoMetricsIfDue()
 void TwinpadClient::RequestKeyframe() // CR-051: IDR inmediata para el nuevo suscriptor media
 {
 	m_forceNextIdr.store(true, std::memory_order_release);
+	// TEMPORAL CR-065-diag: rastro de la solicitud del server.
+	cemuLog_log(LogType::Force, "[TwinpadVideo] idr_request video_force_idr recibido");
 }
 
 void TwinpadClient::SetCaptureBitrate(uint32_t bitrateKbps) // CR-027: bitrate en caliente

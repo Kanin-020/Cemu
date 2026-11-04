@@ -410,8 +410,10 @@ void TwinpadClient_keyboard_test()
 	const uint8_t hona_utf8[] = {'h', 'o', 0xC3, 0xB1, 'a'};
 	client.PublishKeyboardRequest(true, form, 4, 4096);
 	cemu_assert_debug(client.m_keyboardDemandOn.load() == true);
-	cemu_assert_debug(client.m_keyboardDemandMaxLength.load() == 4096);
-	cemu_assert_debug(client.m_keyboardDemandTextBase64Url
+	// CR-044: la instantanea de la demanda (techo y texto base64url) vive en
+	// el canal de teclado del modulo; el reenvio de ConnectPrimary la lee.
+	cemu_assert_debug(client.m_keyboardChannel.GetKeyboardDemandMaxLength() == 4096);
+	cemu_assert_debug(client.m_keyboardChannel.GetKeyboardDemandTextBase64Url()
 		== TwinpadClient::Base64Url(hona_utf8, sizeof(hona_utf8)));
 	client.PublishKeyboardRequest(false, nullptr, 0, 0);
 	cemu_assert_debug(client.m_keyboardDemandOn.load() == false);

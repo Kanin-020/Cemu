@@ -5,18 +5,18 @@
 
 #include "Common/precompiled.h"
 
+#include <rapidjson/document.h>
+
 #include <algorithm>
 #include <chrono>
 #include <string>
 
 namespace twinpad_mic_channel
-{
+{	void TwinpadMicChannel::SetDemandPredicate(std::function<bool()> predicate)
+	{
+		m_demandPredicate = std::move(predicate);
+	}
 
-bool TwinpadMicChannel::SetDemandPredicate(std::function<bool()> predicate)
-{
-	m_demandPredicate = std::move(predicate);
-	return true;
-}
 
 void TwinpadMicChannel::SetToggleCounter(std::atomic<uint64_t>* toggles)
 {

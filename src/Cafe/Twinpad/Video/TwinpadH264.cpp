@@ -195,6 +195,7 @@ struct TwinpadHardwareEncoder::Impl
 	bool hardwareFrames{};
 	bool nv12{};
 	bool annexBFilterEnabled{};
+	AVBSFContext* annexBFilter{};
 	AVPacket* packet{};
 	bool bufferedOutput{}; // el ultimo Encode() devolvio EAGAIN: el frame sigue en pipeline (saldra mas tarde)
 	std::vector<uint8_t> annexBParameterSets;

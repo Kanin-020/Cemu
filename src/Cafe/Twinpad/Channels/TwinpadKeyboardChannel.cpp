@@ -4,6 +4,8 @@
 
 #include "Common/precompiled.h"
 
+#include <rapidjson/document.h>
+
 #include <algorithm>
 #include <string_view>
 

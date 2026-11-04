@@ -41,7 +41,7 @@ public:
 	bool ConsumeKeyboardInput(TwinpadKeyboardPending& out);
 
 private:
-	std::mutex m_mutex;
+	mutable std::mutex m_mutex;
 	std::atomic<bool> m_demandOn{false};
 	std::atomic<uint16_t> m_demandMaxLength{0};
 	std::string m_demandTextBase64Url; // protegido por m_mutex

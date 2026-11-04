@@ -42,12 +42,14 @@ bool HasH264ContractProfile(const std::vector<uint8_t>& annexB);
 class TwinpadHardwareEncoder
 {
 public:
+	struct Impl; // PIMPL: estado FFmpeg completo, definido en el TU.
+
 	// Intento de creacion del primer candidato disponible (NVENC/QSV/AMF/
 	// VAAPI/VideoToolbox); nullptr si ninguno pasa el contrato CR-041.
 	static std::unique_ptr<TwinpadHardwareEncoder> TryCreate(uint16_t width, uint16_t height,
 		uint8_t fps, uint32_t bitrateKbps);
 
-	explicit TwinpadHardwareEncoder(struct Impl* impl, std::string name, bool nv12, bool hardwareFrames);
+	explicit TwinpadHardwareEncoder(Impl* impl, std::string name, bool nv12, bool hardwareFrames);
 	~TwinpadHardwareEncoder();
 	TwinpadHardwareEncoder(const TwinpadHardwareEncoder&) = delete;
 	TwinpadHardwareEncoder& operator=(const TwinpadHardwareEncoder&) = delete;

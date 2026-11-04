@@ -1,6 +1,9 @@
 #include "Cafe/Twinpad/Client/TwinpadClient.h"
+#include "Cafe/Twinpad/Video/TwinpadCameraDecoder.h"
 
 #include "Common/precompiled.h"
+
+#include <rapidjson/document.h>
 
 #include <chrono>
 #include <string>

@@ -95,21 +95,21 @@ class TwinpadClient
 
 	// --- Video metrics ---------------------------------------------------------
 	//! State of the hardware encoder (true while the HW path is in use).
-	static bool IsHardwareEncoderActive();
+	bool IsHardwareEncoderActive();
 	//! Reset both encoders; next frame builds a new one from scratch.
-	static void ResetVideoEncoder();
+	void ResetVideoEncoder();
 	//! (Re)establish the target bitrate in kbps (CR-027) or run fallback.
-	static void SetCaptureBitrate(uint32_t bitrateKbps);
+	void SetCaptureBitrate(uint32_t bitrateKbps);
 	//! (Re)instate the target resolution of the DRC stream (CR-030).
-	static void SetCaptureResolution(uint32_t width, uint32_t height);
+	void SetCaptureResolution(uint32_t width, uint32_t height);
 	//! Force a new IDR on the next frame encoded (CR-051).
-	static void RequestKeyframe();
+	void RequestKeyframe();
 
 	// --- Camera request --------------------------------------------------------
 	//! Canonical request line for the camera demand. Also used at reconnect.
 	static std::string CameraRequestLine(bool on);
 	//! Store + forward the current camera demand to the host; safe pre-connect.
-	static void PublishCameraRequest(bool on);
+	void PublishCameraRequest(bool on);
 
 	// --- Mic request -----------------------------------------------------------
 	//! Canonical request line of the mic demand (CR-035). Also used at reconnect.
@@ -130,11 +130,12 @@ class TwinpadClient
 	bool ConsumeMicSamples(int16_t* dst, size_t count) { return m_micChannel.ConsumeMicSamples(dst, count); }
 	//! Validates one `keyboard_input` line into the pending FIFO.
 	bool FeedKeyboardInput(std::string_view line) { return m_keyboardChannel.FeedKeyboardInput(line); }
-	//! Reads the camera QR from port 8423 (GET_QR handshake), safe pre-connect.
-	bool GetCurrentQr(TwinpadQr& qr);
-
 	// --- Rumble (NDJSON primary) ----------------------------------------------
-	static void PublishRumble(const uint8_t* pattern, uint8_t length);
+	void PublishRumble(const uint8_t* pattern, uint8_t length);
+
+	// --- Camera QR (port 8423) --------------------------------------------------
+	//! Reads the camera QR from port 8423 (GET_QR handshake), safe pre-connect.
+	static bool GetCurrentQr(TwinpadQr& qr);
 
 	// --- Shared codec helpers (delegate to modules) ----------------------------
 	//! base64url (no padding) shared by demands/frames (CR-035/CR-044/CR-054).
@@ -142,6 +143,11 @@ class TwinpadClient
 	//! CR-030 SRGB frame nearest-neighbor rescale; no upscale; empty on size error.
 	static std::vector<uint8_t> ScaleRgb(const std::vector<uint8_t>& rgb, uint16_t width,
 		uint16_t height, uint16_t targetWidth, uint16_t targetHeight);
+
+	// --- Encoder entry (DRC pipeline) -------------------------------------------
+	//! Encodes one RGB8 frame to a H.264 access unit (CR-020/CR-041 contract).
+	bool EncodeGamePadFrame(const std::vector<uint8_t>& rgb, uint16_t width, uint16_t height,
+		TwinpadEncodedFrame& output);
 
 	// --- Input consumers (VPAD HLE) -------------------------------------------
 	//! Latest input state snapshot. Period 0.2 s stale window for motion.
@@ -153,8 +159,22 @@ class TwinpadClient
 	void SetFusedMotionState(const TwinpadFusedMotionState& state);
 	//! Drains this frame's pending motion samples (CR-045, one call per frame).
 	std::vector<TwinpadMotionSample> DrainPendingMotionSamples();
+
+	// --- Connection state (menu / HLE consumers) --------------------------------
+	bool IsConnected() const { return m_connected.load(); }
+	bool IsConnectionRequested() const { return m_connectionRequested.load(); }
+	bool IsCaptureEnabled() const { return m_captureGamePad.load(); }
+	uint64_t GetLastFrameSentMs() const { return m_lastFrameSentMs.load(); }
+	void SetCaptureGamePad(bool enabled) { m_captureGamePad.store(enabled); }
+	uint32_t GetCaptureBitrate() const { return m_captureBitrate.load(); }
+	uint32_t GetCaptureRequestWidth() const { return m_captureWidth.load(); }
+	uint32_t GetCaptureRequestHeight() const { return m_captureHeight.load(); }
+	void SetHardwareAccelerationEnabled(bool enabled) { m_hardwareAccelerationEnabled.store(enabled); }
+	bool IsHardwareAccelerationEnabled() const { return m_hardwareAccelerationEnabled.load(); }
 	//! Motion samples captured by the input loop while the game polls motion.
 	TwinpadInputState GetGyroMonitorState() const;
+	//! TwinpadGyroMonitor activity state (CR-016/CR-017); opt-in.
+	bool IsGyroMonitorEnabled() const { return m_gyroMonitorEnabled.load(); }
 	//! Gyro monitor activity demand; enabled while the game polls motion.
 	static void SetGyroMonitorEnabled(bool enabled)
 	{
@@ -162,9 +182,13 @@ class TwinpadClient
 	}
 
 	// --- Publishers (game data -> queues consumed by the loops) ---------------
-	void PublishGamePadFrame(std::vector<uint8_t> pixels, uint16_t width, uint16_t height,
-		TwinpadPixelFormat format);
+	void PublishGamePadFrame(std::vector<uint8_t>&& pixels, uint16_t width, uint16_t height,
+		TwinpadPixelFormat format = TwinpadPixelFormat::Rgb8);
 	void PublishAudioBlock(const int16_t* samples, size_t samplesPerChannel, uint8_t channels);
+
+	// --- Video metrics (CR-053; callers of the pipeline) -------------------------
+	void RecordVideoMetric(TwinpadVideoMetricStage stage, uint64_t elapsedNanoseconds);
+	void RecordVideoEvent(TwinpadVideoMetricEvent event);
 
 	//! Camera QR decoder singleton, bound to port 8423 on the host side.
 
@@ -180,17 +204,13 @@ class TwinpadClient
 	// Connection helpers -------------------------------------------------------
 	bool ConnectPrimary(); //!< socket + game_announce + camera/mic/keyboard request resend
 	bool ConnectAudio();   //!< Secondary socket on 8422.
-	void ConnectMedia();   //!< Binary 8426 (CR-054); optional (rich server only).
+	bool ConnectMedia();   //!< Binary 8426 (CR-054); optional (rich server only).
 	void CloseMedia();     //!< Closes 8426 (idempotent).
 	bool SendMediaFrame(const TwinpadQueuedAu& au); //!< One AU over the binary channel.
 	bool SendLine(std::intptr_t socket, const std::string& line); //!< NDJSON single line + LF.
 	bool SendBytes(std::intptr_t socket, const char* data, size_t size); //!< Raw bytes (media channel).
 
 	// Encoder / pipeline helpers ------------------------------------------------
-	bool EncodeGamePadFrame(const std::vector<uint8_t>& frameData, uint16_t width, uint16_t height,
-		TwinpadEncodedFrame& output);
-	void RecordVideoMetric(TwinpadVideoMetricStage stage, uint64_t elapsedNanoseconds);
-	void RecordVideoEvent(TwinpadVideoMetricEvent event);
 	void FlushVideoMetricsIfDue();
 	//! Common motion state reset for disconnect/reconnect paths (CR-045).
 	void ResetInputMotionState();
@@ -202,6 +222,7 @@ class TwinpadClient
 	std::thread m_videoSendThread;
 
 	std::atomic<bool> m_running{false};
+	std::mutex m_lifecycleMutex;
 
 	// Verdad del titulo HLE activo; nulo = asumir activo (modo tests).
 	bool TitleRunning() const { return !m_titleRunningPredicate || m_titleRunningPredicate(); }
@@ -230,7 +251,7 @@ class TwinpadClient
 	// CR-045: la cola motion vive con el resto del estado de input.
 	mutable std::mutex m_inputMutex;
 	TwinpadInputState m_inputState;
-	std::deque<TwinpadMotionSample> m_pendingMotionSamples;
+	std::vector<TwinpadMotionSample> m_pendingMotionSamples;
 	TwinpadInputState m_gyroMonitorState;
 	TwinpadFusedMotionState m_fusedMotionState;
 	std::chrono::steady_clock::time_point m_lastMotionReceived{};
@@ -307,6 +328,9 @@ class TwinpadClient
 
 // Free-function tests (white-box friends). They live outside the class so
 // they can reach both the client and its module members.
+void TwinpadClient_base64url_test();
+void TwinpadClient_h264_encoder_test();
+void TwinpadClient_hardware_encoder_test();
 void TwinpadGyroMonitor_test();
 void TwinpadMotionMapper_test();
 void TwinpadMotionQueue_test();

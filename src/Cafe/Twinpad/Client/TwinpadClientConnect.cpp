@@ -2,6 +2,8 @@
 
 #include "Common/precompiled.h"
 
+#include <rapidjson/document.h>
+
 #include <cstring>
 #include <string>
 

@@ -1,4 +1,6 @@
 #include "Cafe/Twinpad/Client/TwinpadClient.h"
+#include "Cafe/Twinpad/Video/TwinpadH264.h"
+#include "Cafe/Twinpad/Video/TwinpadYuvConvert.h"
 
 #include "Common/precompiled.h"
 

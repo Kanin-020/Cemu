@@ -1,6 +1,15 @@
 #include "Cafe/Twinpad/Client/TwinpadClient.h"
 #include "Cafe/CafeSystem.h"
 
+// Modulos internos que el TU nucleo instancia e invoca (el header del
+// facade solo los declara por adelantado).
+#include "Cafe/Twinpad/Channels/TwinpadMicChannel.h"
+#include "Cafe/Twinpad/Channels/TwinpadKeyboardChannel.h"
+#include "Cafe/Twinpad/Core/TwinpadVideoMetrics.h"
+#include "Cafe/Twinpad/Video/TwinpadH264.h"
+#include "Cafe/Twinpad/Core/TwinpadTransport.h"
+#include "Cafe/Twinpad/Video/TwinpadYuvConvert.h"
+
 #include "Common/precompiled.h"
 
 #include <algorithm>
@@ -20,11 +29,16 @@ TwinpadClient& TwinpadClient::Instance()
 
 TwinpadClient::TwinpadClient()
 {
+	// Modulos internos portados al facade (SRP): se instancian aqui para
+	// que el header publique solo tipos, no detalles de canal.
+	m_micChannel = std::make_unique<twinpad_mic_channel::TwinpadMicChannel>();
+	m_keyboardChannel = std::make_unique<twinpad_keyboard_channel::TwinpadKeyboardChannel>();
+	m_videoMetrics = std::make_unique<twinpad_video_metrics::TwinpadVideoMetrics>();
 	// CR-035: la demanda del mic vive en el cliente (m_micDemandOn); el canal
 	// consulta el predicado en cada consumo y comparte el contador de toggles
 	// para su resumen de telemetria por ventana.
-	m_micChannel.SetDemandPredicate([this] { return m_micDemandOn.load(std::memory_order_relaxed); });
-	m_micChannel.SetToggleCounter(&m_micDemandToggleCount);
+	m_micChannel->SetDemandPredicate([this] { return m_micDemandOn.load(std::memory_order_relaxed); });
+	m_micChannel->SetToggleCounter(&m_micDemandToggleCount);
 	// CR-1a: unico punto de contacto con CafeSystem del modulo; inyectado.
 	SetTitleRunningPredicate([] { return CafeSystem::IsTitleRunning(); });
 }
@@ -112,14 +126,14 @@ void TwinpadClient::PublishKeyboardRequest(bool on, const uint16_t* text, uint16
 	// CR-044: el último estado se recuerda en el canal (texto base64url y
 	// techo vigentes) para que ConnectPrimary lo reenvíe al reconectar, como
 	// cámara/micrófono.
-	m_keyboardChannel.SetDemand(on, text, count, maxLength);
+	m_keyboardChannel->SetDemand(on, text, count, maxLength);
 	std::scoped_lock lock(m_primarySocketMutex);
 	if (!m_connected.load() || m_primarySocket < 0)
 		return;
 	const std::string textBase64Url
-		= on ? m_keyboardChannel.GetKeyboardDemandTextBase64Url() : std::string();
+		= on ? m_keyboardChannel->GetKeyboardDemandTextBase64Url() : std::string();
 	if (!SendLine(m_primarySocket,
-			KeyboardRequestLine(on, textBase64Url, m_keyboardChannel.GetKeyboardDemandMaxLength())))
+			KeyboardRequestLine(on, textBase64Url, m_keyboardChannel->GetKeyboardDemandMaxLength())))
 		m_connected.store(false);
 }
 
@@ -127,7 +141,24 @@ bool TwinpadClient::ConsumeKeyboardInput(TwinpadKeyboardPending& out)
 {
 	// CR-044: transiciones FIFO del swkbd; el cap de pendientes viejas vive
 	// en el canal (drop-old al encolar).
-	return m_keyboardChannel.ConsumeKeyboardInput(out);
+	return m_keyboardChannel->ConsumeKeyboardInput(out);
+}
+
+bool TwinpadClient::FeedKeyboardInput(std::string_view line)
+{
+	return m_keyboardChannel->FeedKeyboardInput(line);
+}
+
+// --- Mic (CR-035) ------------------------------------------------------------
+
+bool TwinpadClient::FeedMicChunk(std::string_view line)
+{
+	return m_micChannel->FeedMicChunk(line);
+}
+
+bool TwinpadClient::ConsumeMicSamples(int16_t* dst, size_t count)
+{
+	return m_micChannel->ConsumeMicSamples(dst, count);
 }
 
 // --- Rumble (NDJSON primario) -----------------------------------------------
@@ -151,12 +182,12 @@ void TwinpadClient::PublishRumble(const uint8_t* pattern, uint8_t length)
 
 void TwinpadClient::RecordVideoMetric(TwinpadVideoMetricStage stage, uint64_t elapsedNanoseconds)
 {
-	m_videoMetrics.RecordStage(stage, elapsedNanoseconds);
+	m_videoMetrics->RecordStage(stage, elapsedNanoseconds);
 }
 
 void TwinpadClient::RecordVideoEvent(TwinpadVideoMetricEvent event)
 {
-	m_videoMetrics.RecordEvent(event);
+	m_videoMetrics->RecordEvent(event);
 }
 
 void TwinpadClient::FlushVideoMetricsIfDue()
@@ -164,7 +195,7 @@ void TwinpadClient::FlushVideoMetricsIfDue()
 	// Ventana de 5 s: la MISMA pasada de exchange alimenta el log de Cemu y
 	// la linea `video_stage_stats` del HUD (modulo TwinpadVideoMetrics).
 	twinpad_video_metrics::FlushResult result;
-	if (!m_videoMetrics.FlushIfDue(result))
+	if (!m_videoMetrics->FlushIfDue(result))
 		return;
 	cemuLog_log(LogType::Force, "{}", result.summary);
 
@@ -175,8 +206,17 @@ void TwinpadClient::FlushVideoMetricsIfDue()
 	// siguiente repone los datos; nunca bloquea el encode).
 	if (m_connected.load(std::memory_order_relaxed) && m_primarySocket >= 0)
 	{
+		// CR-075: diagnóstico del HUD — backend del encoder activo y resoluciones
+		// de entrada (fuente del juego, pre-escala) y de salida (post-escala,
+		// lo que viaja por el stream). 0 = sin fuente de video en la ventana.
+		const bool hardwareActive = IsHardwareEncoderActive();
 		std::string statsLine = "{\"type\":\"video_stage_stats\",";
 		statsLine += "\"window_ms\":" + std::to_string(twinpad_video_metrics::kReportIntervalMs);
+		statsLine += ",\"hw\":" + std::string(hardwareActive ? "true" : "false");
+		statsLine += ",\"in_w\":" + std::to_string(m_lastSourceWidth);
+		statsLine += ",\"in_h\":" + std::to_string(m_lastSourceHeight);
+		statsLine += ",\"out_w\":" + std::to_string(m_lastFrameWidth);
+		statsLine += ",\"out_h\":" + std::to_string(m_lastFrameHeight);
 		statsLine += ",\"stages\":[]";
 		if (!result.stagesJson.empty())
 			statsLine.insert(statsLine.size() - 1, result.stagesJson);
@@ -199,7 +239,7 @@ void TwinpadClient::FlushVideoMetricsIfDue()
 	// el canal mic (accepted/consume/reject/drop/toggles/cola). Abrir la
 	// brecha accepted vs consume delata feed corto o drain doble.
 	const std::string micSummary
-		= m_micChannel.BuildPerfSummary(twinpad_video_metrics::kReportIntervalMs);
+		= m_micChannel->BuildPerfSummary(twinpad_video_metrics::kReportIntervalMs);
 	if (!micSummary.empty())
 		cemuLog_log(LogType::Force, "{}", micSummary);
 }

@@ -1,4 +1,6 @@
 #include "Cafe/Twinpad/Client/TwinpadClient.h"
+#include "Cafe/Twinpad/Channels/TwinpadKeyboardChannel.h"
+#include "Cafe/Twinpad/Core/TwinpadTransport.h"
 
 #include "Common/precompiled.h"
 
@@ -232,8 +234,8 @@ bool TwinpadClient::ConnectPrimary()
 	if (m_micDemandOn.load())
 		SendLine(m_primarySocket, MicRequestLine(true));
 	// CR-044: idem teclado; el texto base64url vigente viaja con la demanda.
-	if (m_keyboardChannel.IsKeyboardDemandOn())
-		SendLine(m_primarySocket, KeyboardRequestLine(true, m_keyboardChannel.GetKeyboardDemandTextBase64Url(), m_keyboardChannel.GetKeyboardDemandMaxLength()));
+	if (m_keyboardChannel->IsKeyboardDemandOn())
+		SendLine(m_primarySocket, KeyboardRequestLine(true, m_keyboardChannel->GetKeyboardDemandTextBase64Url(), m_keyboardChannel->GetKeyboardDemandMaxLength()));
 	return true;
 }
 

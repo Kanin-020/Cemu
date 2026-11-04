@@ -1,5 +1,6 @@
 #include "Common/precompiled.h"
 #include "Cafe/Twinpad/Client/TwinpadClient.h"
+#include "Cafe/Twinpad/Channels/TwinpadKeyboardChannel.h"
 #include "Cafe/Twinpad/Video/TwinpadCameraDecoder.h"
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h"
 
@@ -421,8 +422,8 @@ void TwinpadClient_keyboard_test()
 	cemu_assert_debug(client.m_keyboardDemandOn.load() == true);
 	// CR-044: la instantanea de la demanda (techo y texto base64url) vive en
 	// el canal de teclado del modulo; el reenvio de ConnectPrimary la lee.
-	cemu_assert_debug(client.m_keyboardChannel.GetKeyboardDemandMaxLength() == 4096);
-	cemu_assert_debug(client.m_keyboardChannel.GetKeyboardDemandTextBase64Url()
+	cemu_assert_debug(client.m_keyboardChannel->GetKeyboardDemandMaxLength() == 4096);
+	cemu_assert_debug(client.m_keyboardChannel->GetKeyboardDemandTextBase64Url()
 		== TwinpadClient::Base64Url(hona_utf8, sizeof(hona_utf8)));
 	client.PublishKeyboardRequest(false, nullptr, 0, 0);
 	cemu_assert_debug(client.m_keyboardDemandOn.load() == false);

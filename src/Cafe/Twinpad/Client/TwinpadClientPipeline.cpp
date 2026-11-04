@@ -139,6 +139,10 @@ void TwinpadClient::FrameLoop()
 				height = m_pendingFrameHeight;
 				format = m_pendingFrameFormat;
 				m_hasPendingFrame = false;
+				// CR-075: resolución de entrada del pipeline (fuente del juego,
+				// antes de la etapa SCALE); solo frame fresco la actualiza.
+				m_lastSourceWidth = width;
+				m_lastSourceHeight = height;
 			}
 			else
 			{
@@ -314,18 +318,29 @@ void TwinpadClient::VideoSendLoop()
 			}
 		}
 		// Fallback NDJSON: serializa aquí solo cuando el binario no está.
+		// CR-053: los ítems NDJSON puros (`video_stage_stats`) salen tal
+		// cual por el canal primario; solo los AU binarios se envuelven en
+		// `game_frame`. En CR-054 el fallback re-serializaba el ítem de
+		// stats como frame con `data`:"" y el HUD nunca recibía la línea.
 		const auto ipcSendStarted = std::chrono::steady_clock::now();
-		const auto base64JsonStarted = std::chrono::steady_clock::now();
-		const std::string encodedData = Base64Url(queued.annexB.data(), queued.annexB.size());
 		std::string line;
-		line.reserve(encodedData.size() + 192);
-		line = "{\"type\":\"game_frame\",\"gfn\":" + std::to_string(queued.gfn)
-			+ ",\"w\":" + std::to_string(queued.width) + ",\"h\":" + std::to_string(queued.height)
-			+ ",\"fmt\":\"h264\",\"ts_capture_us\":" + std::to_string(queued.timestampUs)
-			+ ",\"idr\":" + (queued.idr ? "true" : "false")
-			+ ",\"data\":\"" + encodedData + "\"}";
-		RecordVideoMetric(TwinpadVideoMetricStage::BASE64_JSON,
-			std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - base64JsonStarted).count());
+		if (!queued.ndjsonLine.empty())
+		{
+			line = std::move(queued.ndjsonLine);
+		}
+		else
+		{
+			const auto base64JsonStarted = std::chrono::steady_clock::now();
+			const std::string encodedData = Base64Url(queued.annexB.data(), queued.annexB.size());
+			line.reserve(encodedData.size() + 192);
+			line = "{\"type\":\"game_frame\",\"gfn\":" + std::to_string(queued.gfn)
+				+ ",\"w\":" + std::to_string(queued.width) + ",\"h\":" + std::to_string(queued.height)
+				+ ",\"fmt\":\"h264\",\"ts_capture_us\":" + std::to_string(queued.timestampUs)
+				+ ",\"idr\":" + (queued.idr ? "true" : "false")
+				+ ",\"data\":\"" + encodedData + "\"}";
+			RecordVideoMetric(TwinpadVideoMetricStage::BASE64_JSON,
+				std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - base64JsonStarted).count());
+		}
 		std::scoped_lock lock(m_primarySocketMutex);
 		if (!m_connected.load() || m_primarySocket < 0)
 		{

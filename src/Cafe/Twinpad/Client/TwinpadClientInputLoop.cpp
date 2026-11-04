@@ -1,4 +1,5 @@
 #include "Cafe/Twinpad/Client/TwinpadClient.h"
+#include "Cafe/Twinpad/Core/TwinpadTransport.h"
 #include "Cafe/Twinpad/Video/TwinpadCameraDecoder.h"
 
 #include "Common/precompiled.h"

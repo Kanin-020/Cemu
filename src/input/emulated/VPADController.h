@@ -3,7 +3,7 @@
 #include "input/emulated/EmulatedController.h"
 #include "input/motion/MotionHandler.h"
 #include "Cafe/OS/libs/vpad/vpad.h"
-#include "Cafe/Twinpad/TwinpadClient.h"
+#include "Cafe/Twinpad/Client/TwinpadClient.h"
 
 
 class VPADController : public EmulatedController

@@ -1,13 +1,30 @@
 add_library(CemuCafe
   Account/Account.cpp
   Account/AccountError.h
-  Twinpad/TwinpadClient.cpp
-  Twinpad/TwinpadClient.h
-  Twinpad/TwinpadCameraDecoder.cpp
-  Twinpad/TwinpadCameraDecoder.h
-  Twinpad/Base64UrlTest.cpp
-  Twinpad/GyroMonitorTest.cpp
-  Twinpad/TwinpadMotionTest.cpp
+  Twinpad/Client/TwinpadClient.cpp
+  Twinpad/Client/TwinpadClient.h
+  Twinpad/Client/TwinpadClientConnect.cpp
+  Twinpad/Client/TwinpadClientInputLoop.cpp
+  Twinpad/Client/TwinpadClientEncoder.cpp
+  Twinpad/Client/TwinpadClientPipeline.cpp
+  Twinpad/Core/TwinpadTypes.h
+  Twinpad/Core/TwinpadTransport.h
+  Twinpad/Core/TwinpadTransport.cpp
+  Twinpad/Video/TwinpadYuvConvert.h
+  Twinpad/Video/TwinpadYuvConvert.cpp
+  Twinpad/Video/TwinpadH264.h
+  Twinpad/Video/TwinpadH264.cpp
+  Twinpad/Channels/TwinpadMicChannel.h
+  Twinpad/Channels/TwinpadMicChannel.cpp
+  Twinpad/Channels/TwinpadKeyboardChannel.h
+  Twinpad/Channels/TwinpadKeyboardChannel.cpp
+  Twinpad/Core/TwinpadVideoMetrics.h
+  Twinpad/Core/TwinpadVideoMetrics.cpp
+  Twinpad/Video/TwinpadCameraDecoder.cpp
+  Twinpad/Video/TwinpadCameraDecoder.h
+  Twinpad/Tests/Base64UrlTest.cpp
+  Twinpad/Tests/GyroMonitorTest.cpp
+  Twinpad/Tests/TwinpadMotionTest.cpp
   Account/Account.h
   CafeSystem.cpp
   CafeSystem.h

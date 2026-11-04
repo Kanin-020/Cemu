@@ -1,5 +1,5 @@
 #include "Common/precompiled.h"
-#include "Cafe/Twinpad/TwinpadClient.h"
+#include "Cafe/Twinpad/Client/TwinpadClient.h"
 
 void TwinpadMotionMapper_test()
 {

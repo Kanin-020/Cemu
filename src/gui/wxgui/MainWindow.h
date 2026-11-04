@@ -15,7 +15,7 @@
 #include <future>
 #include "Cafe/HW/Espresso/Debugger/GDBStub.h"
 #include "Cafe/CafeSystem.h"
-#include "Cafe/Twinpad/TwinpadClient.h"
+#include "Cafe/Twinpad/Client/TwinpadClient.h"
 
 class DebuggerWindow2;
 struct GameEntry;

@@ -1,5 +1,5 @@
 #include "Common/precompiled.h"
-#include "Cafe/Twinpad/TwinpadCameraDecoder.h"
+#include "Cafe/Twinpad/Video/TwinpadCameraDecoder.h"
 
 #include <rapidjson/document.h>
 

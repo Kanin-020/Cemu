@@ -5,8 +5,8 @@
 #include "Cafe/OS/libs/coreinit/coreinit_Alarm.h"
 #include "Cafe/OS/libs/coreinit/coreinit_Time.h"
 #include "Cafe/HW/Espresso/PPCCallback.h"
-#include "Cafe/Twinpad/TwinpadCameraDecoder.h"
-#include "Cafe/Twinpad/TwinpadClient.h"
+#include "Cafe/Twinpad/Video/TwinpadCameraDecoder.h"
+#include "Cafe/Twinpad/Client/TwinpadClient.h"
 
 namespace camera
 {

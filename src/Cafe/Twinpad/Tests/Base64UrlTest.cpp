@@ -1,6 +1,6 @@
 #include "Common/precompiled.h"
-#include "Cafe/Twinpad/TwinpadClient.h"
-#include "Cafe/Twinpad/TwinpadCameraDecoder.h"
+#include "Cafe/Twinpad/Client/TwinpadClient.h"
+#include "Cafe/Twinpad/Video/TwinpadCameraDecoder.h"
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h"
 
 #include <initializer_list>

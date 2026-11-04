@@ -1,5 +1,5 @@
 #include "Cafe/HW/Latte/Renderer/Renderer.h"
-#include "Cafe/Twinpad/TwinpadClient.h"
+#include "Cafe/Twinpad/Client/TwinpadClient.h"
 #include <chrono>
 #include "WindowSystem.h"
 

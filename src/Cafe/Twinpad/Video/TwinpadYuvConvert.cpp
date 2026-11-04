@@ -279,8 +279,10 @@ std::vector<uint8_t> ScaleRgb(const std::vector<uint8_t>& rgb, uint16_t width, u
 {
 	if (!width || !height || !targetWidth || !targetHeight || rgb.size() != static_cast<size_t>(width) * height * 3)
 		return {};
-	if (targetWidth >= width && targetHeight >= height)
-		return rgb; // sin upscale (CR-030)
+	// CR-074: nearest-neighbor en ambas direcciones; identidad solo si el
+	// target coincide (devuelve el buffer sin copiar).
+	if (targetWidth == width && targetHeight == height)
+		return rgb;
 	std::vector<uint8_t> target(static_cast<size_t>(targetWidth) * targetHeight * 3);
 	for (uint32_t targetY = 0; targetY < targetHeight; ++targetY)
 	{

@@ -348,8 +348,9 @@ void TwinpadClient_mic_test()
 
 void TwinpadClient_drc_scale_test()
 {
-	// TEST-088 — verifies SPEC-003/CR-030: the GamePad (DRC) emission resolution
-	// is applied by nearest-neighbor scaling before the encoder, without upscale.
+	// TEST-088/TEST-0150 — verifies SPEC-003/CR-030/CR-074: the GamePad (DRC)
+	// emission resolution is applied by nearest-neighbor scaling before the
+	// encoder, in both directions (upscale allowed), and 0/0 stays native.
 	auto& client = TwinpadClient::Instance();
 	std::vector<uint8_t> source(2 * 2 * 3);
 	// Cuadrantes: izquierda azul, derecha roja (verificables por canal).
@@ -358,7 +359,7 @@ void TwinpadClient_drc_scale_test()
 	source[6] = 0; source[7] = 0; source[8] = 255; // píxel (0,1)
 	source[9] = 255; source[10] = 0; source[11] = 0; // píxel (1,1)
 
-	// Escala 2×2 → 2×2: identidad (los targets >= nativos no escalan).
+	// Escala 2×2 → 2×2: identidad (target igual, sin copia).
 	const auto identity = TwinpadClient::ScaleRgb(source, 2, 2, 2, 2);
 	cemu_assert_debug(identity.size() == source.size());
 	cemu_assert_debug(identity == source);
@@ -373,9 +374,17 @@ void TwinpadClient_drc_scale_test()
 		cemu_assert_debug(shrunk[2] == 255);
 	}
 
-	// Sin upscale: pedir mayor conserva nativo.
-	const auto unchanged = TwinpadClient::ScaleRgb(source, 2, 2, 4, 4);
-	cemu_assert_debug(unchanged == source);
+	// CR-074: upscale 2×2 → 4×4 (nearest muestrea la esquina de cada
+	// bloque 2×2; mismo mecanismo que la reducción).
+	const auto upscaled = TwinpadClient::ScaleRgb(source, 2, 2, 4, 4);
+	cemu_assert_debug(upscaled.size() == 4 * 4 * 3);
+	if (upscaled.size() == 4 * 4 * 3)
+	{
+		cemu_assert_debug(upscaled[0] == 0 && upscaled[1] == 0 && upscaled[2] == 255); // (0,0) azul
+		cemu_assert_debug(upscaled[(2 * 4 + 2) * 3] == 255
+			&& upscaled[(2 * 4 + 2) * 3 + 1] == 0
+			&& upscaled[(2 * 4 + 2) * 3 + 2] == 0); // (2,2) rojo
+	}
 
 	// Entrada inválida: buffer que no corresponde a w×h×3 → vacío.
 	cemu_assert_debug(TwinpadClient::ScaleRgb(source, 4, 4, 2, 2).empty());

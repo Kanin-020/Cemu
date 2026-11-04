@@ -227,13 +227,13 @@ void TwinpadClient::FrameLoop()
 		// (formato,w,h) con TWINPAD_CAPTURE_DUMP_DIR definida; evidencia para
 		// el fix de color (canal/gamma/pitch) sin tocar la ruta de producción.
 		TwinpadCaptureDump(frameData, width, height, format);
-		// CR-030: aplicar la resolución de emisión del GamePad (DRC). Solo
-		// reduce: si el target >= nativo se publica nativo (sin upscale).
+		// CR-030/CR-074: aplicar la resolución de emisión del GamePad (DRC) en
+		// ambas direcciones (upscale permitido); «Nativa» (0/0) no escala.
 		const uint32_t targetWidth = m_captureWidth.load(std::memory_order_relaxed);
 		const uint32_t targetHeight = m_captureHeight.load(std::memory_order_relaxed);
 		if (targetWidth > 0 && targetHeight > 0
-			&& (targetWidth < static_cast<uint32_t>(width)
-				|| targetHeight < static_cast<uint32_t>(height)))
+			&& (targetWidth != static_cast<uint32_t>(width)
+				|| targetHeight != static_cast<uint32_t>(height)))
 		{
 			const auto scaleStarted = std::chrono::steady_clock::now();
 			frameData = twinpad_yuv::ScaleRgb(frameData, width, height, static_cast<uint16_t>(targetWidth), static_cast<uint16_t>(targetHeight));

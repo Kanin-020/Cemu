@@ -88,8 +88,8 @@ class TwinpadClient
 	uint32_t GetCaptureBitrate() const { return m_captureBitrate.load(); }
 	//! (Re)instates the target resolution of the DRC stream (CR-030; 0 = native).
 	void SetCaptureResolution(uint32_t width, uint32_t height);
-	uint32_t GetCaptureRequestWidth() const { return m_captureWidth.load(); }
-	uint32_t GetCaptureRequestHeight() const { return m_captureHeight.load(); }
+	uint32_t GetCaptureRequestWidth() const { return static_cast<uint32_t>(m_captureResolution.load()); }
+	uint32_t GetCaptureRequestHeight() const { return static_cast<uint32_t>(m_captureResolution.load() >> 32); }
 	//! Hardware acceleration preference; consumed by the next encoder build.
 	void SetHardwareAccelerationEnabled(bool enabled) { m_hardwareAccelerationEnabled.store(enabled); }
 	bool IsHardwareAccelerationEnabled() const { return m_hardwareAccelerationEnabled.load(); }
@@ -246,8 +246,8 @@ class TwinpadClient
 	std::atomic<bool> m_gyroMonitorEnabled{false};
 	std::atomic<bool> m_hardwareAccelerationEnabled{true};
 	std::atomic<uint32_t> m_captureBitrate{4000}; // CR-027; server can override
-	std::atomic<uint32_t> m_captureWidth{0};      // CR-030 native when 0
-	std::atomic<uint32_t> m_captureHeight{0};     // CR-030 native when 0
+	// Atomic packed pair: width and height always switch as one resolution.
+	std::atomic<uint64_t> m_captureResolution{0}; // CR-030 native when 0
 
 	// Sockets (transport module); the transport owns socket semantics.
 	std::intptr_t m_primarySocket = -1;

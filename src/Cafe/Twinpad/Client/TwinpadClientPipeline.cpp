@@ -233,8 +233,9 @@ void TwinpadClient::FrameLoop()
 		TwinpadCaptureDump(frameData, width, height, format);
 		// CR-030/CR-074: aplicar la resolución de emisión del GamePad (DRC) en
 		// ambas direcciones (upscale permitido); «Nativa» (0/0) no escala.
-		const uint32_t targetWidth = m_captureWidth.load(std::memory_order_relaxed);
-		const uint32_t targetHeight = m_captureHeight.load(std::memory_order_relaxed);
+		const uint64_t targetResolution = m_captureResolution.load(std::memory_order_relaxed);
+		const uint32_t targetWidth = static_cast<uint32_t>(targetResolution);
+		const uint32_t targetHeight = static_cast<uint32_t>(targetResolution >> 32);
 		if (targetWidth > 0 && targetHeight > 0
 			&& (targetWidth != static_cast<uint32_t>(width)
 				|| targetHeight != static_cast<uint32_t>(height)))

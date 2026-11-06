@@ -391,13 +391,24 @@ void TwinpadClient_drc_scale_test()
 	cemu_assert_debug(TwinpadClient::ScaleRgb(source, 4, 4, 2, 2).empty());
 	cemu_assert_debug(TwinpadClient::ScaleRgb(source, 2, 2, 0, 2).empty());
 
-	// SetCaptureResolution: target impar se reduce al par inferior; 0/0 → nativo.
+	// SetCaptureResolution: target impar baja al par inferior; las transiciones
+	// de 720p/1080p/nativo cambian como pares completos, sin dimensión obsoleta.
+	client.SetCaptureResolution(1280, 720);
+	cemu_assert_debug(client.GetCaptureRequestWidth() == 1280);
+	cemu_assert_debug(client.GetCaptureRequestHeight() == 720);
+	client.SetCaptureResolution(1920, 1080);
+	cemu_assert_debug(client.GetCaptureRequestWidth() == 1920);
+	cemu_assert_debug(client.GetCaptureRequestHeight() == 1080);
 	client.SetCaptureResolution(1919, 1079);
 	cemu_assert_debug(client.GetCaptureRequestWidth() == 1918);
 	cemu_assert_debug(client.GetCaptureRequestHeight() == 1078);
 	client.SetCaptureResolution(0, 0);
 	cemu_assert_debug(client.GetCaptureRequestWidth() == 0);
 	cemu_assert_debug(client.GetCaptureRequestHeight() == 0);
+	client.SetCaptureResolution(1920, 1080);
+	cemu_assert_debug(client.GetCaptureRequestWidth() == 1920);
+	cemu_assert_debug(client.GetCaptureRequestHeight() == 1080);
+	client.SetCaptureResolution(0, 0);
 }
 
 // TEST-0110 — verifies SPEC-006 (CR-044): the `keyboard_request` demand has

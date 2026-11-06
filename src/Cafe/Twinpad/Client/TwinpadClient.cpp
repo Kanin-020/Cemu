@@ -267,15 +267,14 @@ void TwinpadClient::SetCaptureResolution(uint32_t width, uint32_t height) // CR-
 	// se reduce al par inferior. 0/0 desactiva la escala (nativo).
 	width = (width >> 1) << 1;
 	height = (height >> 1) << 1;
-	if (width == 0 || height == 0)
+	uint64_t resolution = 0;
+	if (width != 0 && height != 0)
 	{
-		m_captureWidth.store(0);
-		m_captureHeight.store(0);
-		return;
+		width = std::clamp(width, 16u, 3840u);
+		height = std::clamp(height, 16u, 2160u);
+		resolution = (static_cast<uint64_t>(height) << 32) | width;
 	}
-	width = std::clamp(width, 16u, 3840u);
-	height = std::clamp(height, 16u, 2160u);
-	if (m_captureWidth.exchange(width) == width && m_captureHeight.exchange(height) == height)
+	if (m_captureResolution.exchange(resolution) == resolution)
 		return;
 	// La siguiente AU con dimensión efectiva distinta reinicia el encoder
 	// (encoderConfigChanged); no hace falta rearmarlo aquí.

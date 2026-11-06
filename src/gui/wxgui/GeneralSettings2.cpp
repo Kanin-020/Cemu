@@ -636,7 +636,7 @@ wxPanel* GeneralSettings2::AddAudioPage(wxNotebook* notebook)
 	}
 
 	{
-		auto box = new wxStaticBox(audio_panel, wxID_ANY, _("Microphone (Experimental)"));
+		auto box = new wxStaticBox(audio_panel, wxID_ANY, _("Microphone"));
 		auto box_sizer = new wxStaticBoxSizer(box, wxVERTICAL);
 
 		auto audio_input_row = new wxFlexGridSizer(0, 3, 0, 0);
@@ -664,10 +664,10 @@ wxPanel* GeneralSettings2::AddAudioPage(wxNotebook* notebook)
 		audio_input_row->AddSpacer(0);
 
 		audio_input_row->Add(new wxStaticText(box, wxID_ANY, _("Volume")), 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
-		// 300 %: el mic del teléfono comúnmente llega tenue; el doble o más
-		// es necesario para el mic de soplido del juego. Semántica idéntica
-		// al mic por dispositivo del PC (config.input_volume).
-		m_input_volume = new wxSlider(box, wxID_ANY, 100, 0, 300);
+		// 0-100 %: volumen del dispositivo del PC. La ganancia del mic del
+		// teléfono la fija el juego (MICSetState GAIN_DB/MUTE) y no se
+		// amplifica desde aqui, para no quedar con la sensibilidad al maximo.
+		m_input_volume = new wxSlider(box, wxID_ANY, 100, 0, 100);
 		audio_input_row->Add(m_input_volume, 0, wxEXPAND | wxALL, 5);
 		auto audio_input_volume_text = new wxStaticText(box, wxID_ANY, "100%");
 		audio_input_row->Add(audio_input_volume_text, 0, wxALIGN_CENTER_VERTICAL | wxALL | wxALIGN_RIGHT, 5);

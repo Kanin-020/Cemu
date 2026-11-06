@@ -18,6 +18,12 @@ enum class MIC_RESULT
 
 const int MIC_SAMPLES_PER_3MS_32KHZ = (96);  // 32000*3/1000
 
+// Ganancia del micro en formato S7.8 (1 entero + 8 fracciones: 0x0100 = 1.0).
+// 0x0100 es la sensibilidad normal: el ringbuffer recibe la senal tal cual, que
+// es lo que el juego espera si no ha pedido otra ganancia.
+constexpr sint32 MIC_GAIN_UNITY_S7_8 = 0x0100;
+constexpr sint32 MIC_GAIN_MAX_S7_8 = 0x0200; // 2.0
+
 enum class MIC_STATUS_FLAGS : uint32
 {
 	FORMAT_PCM16	= (1 << 0),
@@ -55,7 +61,8 @@ struct
 		// state
 		uint32 echoCancellation;
 		uint32 autoSelection;
-		uint32 gainDB;
+		sint32 gainDB; // S7.8, 0x0100 = sensibilidad normal
+		uint32 mute;
 	}drc[2];
 }MICStatus = {0};
 
@@ -94,18 +101,31 @@ bool mic_isActive(uint32 drcIndex)
 
 void mic_feedSamples(uint32 drcIndex, sint16* sampleData, sint32 numSamples)
 {
+	if (drcIndex > 1 || MICStatus.drc[drcIndex].ringbufferSampleData == nullptr
+		|| MICStatus.drc[drcIndex].ringbufferSize == 0)
+		return;
+	// CR-036: la sensibilidad la decide el juego (MICSetState GAIN_DB/MUTE, en
+	// S7.8). Antes se ignoraba y el ringbuffer recibia la senal a escala
+	// completa, asi que el juego no podia atenuarla y el micro quedaba con la
+	// sensibilidad al maximo. Sin estado del juego vale 0x0100 (normal).
+	const sint32 gainS7_8 = MICStatus.drc[drcIndex].mute != 0
+		? 0
+		: std::clamp(MICStatus.drc[drcIndex].gainDB, 0, MIC_GAIN_MAX_S7_8);
 	uint16* sampleDataU16 = (uint16*)sampleData;
-	sint32 ringBufferSize = MICStatus.drc[0].ringbufferSize;
-	sint32 writeIndex = MICStatus.drc[0].writeIndex;
-	uint16* ringBufferBase = (uint16*)MICStatus.drc[0].ringbufferSampleData;
+	sint32 ringBufferSize = (sint32)MICStatus.drc[drcIndex].ringbufferSize;
+	sint32 writeIndex = (sint32)MICStatus.drc[drcIndex].writeIndex;
+	uint16* ringBufferBase = (uint16*)MICStatus.drc[drcIndex].ringbufferSampleData;
 	do
 	{
-		ringBufferBase[writeIndex] = _swapEndianU16(*sampleDataU16);
+		sint16 sample = (sint16)*sampleDataU16;
+		if (gainS7_8 != MIC_GAIN_UNITY_S7_8)
+			sample = (sint16)std::clamp((sint32)sample * gainS7_8 / MIC_GAIN_UNITY_S7_8, -32768, 32767);
+		ringBufferBase[writeIndex] = _swapEndianU16((uint16)sample);
 		sampleDataU16++;
 		writeIndex++;
 		writeIndex %= ringBufferSize;
 	}while( (--numSamples) > 0 );
-	MICStatus.drc[0].writeIndex = writeIndex;
+	MICStatus.drc[drcIndex].writeIndex = writeIndex;
 }
 
 void micExport_MICInit(PPCInterpreter_t* hCPU)
@@ -140,6 +160,8 @@ void micExport_MICInit(PPCInterpreter_t* hCPU)
 	// init default states
 	MICStatus.drc[drcIndex].echoCancellation = 1; // guessed
 	MICStatus.drc[drcIndex].autoSelection = 1; // guessed
+	MICStatus.drc[drcIndex].gainDB = MIC_GAIN_UNITY_S7_8;
+	MICStatus.drc[drcIndex].mute = 0;
 	// return status
 	memory_writeU32(hCPU->gpr[6], 0); // no error
 	osLib_returnFromFunction(hCPU, (drcIndex==0)?MIC_HANDLE_DRC0:MIC_HANDLE_DRC1); // success
@@ -309,18 +331,19 @@ void micExport_MICGetState(PPCInterpreter_t* hCPU)
 	}
 	else if (stateId == MIC_STATEID::GAIN_MIN)
 	{
-		// value guessed
 		memory_writeU32(hCPU->gpr[5], 0x0000); // S7.8
 	}
 	else if (stateId == MIC_STATEID::GAIN_MAX)
 	{
-		// value guessed
-		memory_writeU32(hCPU->gpr[5], 0x0200); // S7.8
+		memory_writeU32(hCPU->gpr[5], (uint32)MIC_GAIN_MAX_S7_8); // S7.8
 	}
 	else if (stateId == MIC_STATEID::GAIN_STEP)
 	{
-		// value guessed
 		memory_writeU32(hCPU->gpr[5], 0x0001); // S7.8
+	}
+	else if (stateId == MIC_STATEID::MUTE)
+	{
+		memory_writeU32(hCPU->gpr[5], MICStatus.drc[drcIndex].mute);
 	}
 	else if (stateId == MIC_STATEID::ECHO_CANCELLATION)
 	{
@@ -328,11 +351,14 @@ void micExport_MICGetState(PPCInterpreter_t* hCPU)
 	}
 	else if (stateId == MIC_STATEID::GAIN_DB)
 	{
-		// value guessed
-		memory_writeU32(hCPU->gpr[5], MICStatus.drc[drcIndex].gainDB); // S7.8
+		memory_writeU32(hCPU->gpr[5], (uint32)MICStatus.drc[drcIndex].gainDB); // S7.8
 	}
 	else
-		cemu_assert_unimplemented();
+	{
+		// CR-036: un estado desconocido se rechaza en vez de tumbar el HLE.
+		osLib_returnFromFunction(hCPU, (uint32)MIC_RESULT::BAD_PARAM);
+		return;
+	}
 	osLib_returnFromFunction(hCPU, (uint32)MIC_RESULT::SUCCESS);
 	return;
 }
@@ -364,10 +390,21 @@ void micExport_MICSetState(PPCInterpreter_t* hCPU)
 	}
 	else if( stateId == MIC_STATEID::GAIN_DB )
 	{
-		MICStatus.drc[drcIndex].gainDB = newValue;
+		// CR-036: la ganancia del juego se aplica al alimentar el ringbuffer
+		// (mic_feedSamples), no solo se guarda; fuera de [0, 2.0] se recorta.
+		const sint32 gain = std::clamp((sint32)newValue, 0, MIC_GAIN_MAX_S7_8);
+		MICStatus.drc[drcIndex].gainDB = gain;
+	}
+	else if( stateId == MIC_STATEID::MUTE )
+	{
+		MICStatus.drc[drcIndex].mute = (newValue!=0)?1:0;
 	}
 	else
-		assert_dbg();
+	{
+		// CR-036: estado no soportado -> error, sin assert ni excepcion.
+		osLib_returnFromFunction(hCPU, (uint32)MIC_RESULT::BAD_PARAM);
+		return;
+	}
 	osLib_returnFromFunction(hCPU, (uint32)MIC_RESULT::SUCCESS);
 	return;
 }
@@ -458,16 +495,12 @@ void mic_updateOnAXFrame()
 		sint16 phoneMicSamples[MIC_SAMPLES_PER_3MS_32KHZ];
 		if (TwinpadClient::Instance().ConsumeMicSamples(phoneMicSamples, MIC_SAMPLES_PER_3MS_32KHZ))
 		{
-			// CR-035 + sensibilidad: el feed del teléfono respeta el mismo
-			// volumen de entrada del GamePad que el dispositivo del PC
-			// (config.input_volume, slider en Ajustes → Audio, 0–300 %).
-			// Se lee por frame para ajustarlo en caliente.
-			const sint32 volumePercent = std::clamp(GetConfig().input_volume, 0, 300);
-			for (sint32 i = 0; i < MIC_SAMPLES_PER_3MS_32KHZ; ++i)
-			{
-				const sint32 amplified = static_cast<sint32>(phoneMicSamples[i]) * volumePercent / 100;
-				phoneMicSamples[i] = static_cast<sint16>(std::clamp(amplified, -32768, 32767));
-			}
+			// CR-035 / CR-036: el feed del teléfono entra a la sensibilidad
+			// normal (0x0100). La ganancia del juego (MICSetState GAIN_DB/MUTE)
+			// la aplica mic_feedSamples y el slider de volumen de Cemu queda
+			// para el micro del dispositivo del PC: antes se multiplicaba aqui
+			// por ese slider (hasta 300 %) y el micro quedaba al maximo,
+			// recortando la senal.
 			mic_feedSamples(0, phoneMicSamples, MIC_SAMPLES_PER_3MS_32KHZ);
 			logMicBranch("telefono");
 			return;

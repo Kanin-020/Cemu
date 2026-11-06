@@ -514,7 +514,11 @@ void mic_updateOnAXFrame()
 	}
 	else
 	{
-		const sint32 micSampleCount = 32000 / 32;
+		// CR-036: el frame de AX son 96 muestras (3 ms). Antes se alimentaban
+		// 1000 (32000/32) por frame, diez veces la tasa real: cada frame que caia
+		// en esta rama inundaba el ringbuffer del juego con silencio/tono y
+		// tapaba el audio del telefono (se oia cortado).
+		const sint32 micSampleCount = MIC_SAMPLES_PER_3MS_32KHZ;
 		sint16 micSampleData[micSampleCount];
 
 		auto controller = InputManager::instance().get_vpad_controller(drcIndex);

@@ -21,6 +21,15 @@ namespace twinpad_mic_channel
 constexpr size_t kMicQueueMaxSamples = 32000;
 constexpr uint64_t kMicFreshIntervalMs = 250;
 
+// CR-036: colchon de jitter. El telefono entrega bloques de 480 muestras cada
+// ~15 ms mientras el AX pide 96 muestras cada 3 ms; sin colchon la cola se
+// vacia en cada frontera de bloque y el frame que no encontraba muestras
+// devolvia el micro al dispositivo del PC (silencios de 3 ms = cortes). Se
+// arranca con 30 ms de colchon y se recorta a ese nivel por encima de 60 ms
+// para acotar la latencia y la deriva de reloj.
+constexpr size_t kMicJitterTargetSamples = 960;
+constexpr size_t kMicJitterMaxSamples = 1920;
+
 class TwinpadMicChannel
 {
 public:
@@ -37,7 +46,9 @@ public:
 	bool FeedMicChunk(std::string_view line);
 
 	// CR-035: consumo por AX (~336 llamadas/s); exige demanda vigente y
-	// chunks frescos (<= 250 ms); no entrega parciales.
+	// chunks frescos (<= 250 ms). CR-036: mantiene un colchon de 30 ms y
+	// rellena con silencio el tramo que falte, de forma que una cola corta no
+	// devuelve el micro a la fuente del PC a mitad de frase.
 	bool ConsumeMicSamples(int16_t* dst, size_t count);
 
 	// Telemetria CR-035 sin throttle: tasas crudas por ventana (la usa el
@@ -58,6 +69,8 @@ private:
 	std::atomic<uint64_t> m_lastChunkMs{};
 	std::atomic<uint64_t> m_rejectCount{};
 	std::atomic<uint64_t> m_consumeFailCount{};
+	std::atomic<uint64_t> m_padSamples{};
+	std::atomic<bool> m_primed{};
 	std::atomic<uint64_t> m_dropOldCount{};
 	std::atomic<uint64_t> m_chunksValid{};
 	std::atomic<uint64_t> m_consumes{};

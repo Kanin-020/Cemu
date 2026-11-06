@@ -130,6 +130,7 @@ bool TwinpadMicChannel::ConsumeMicSamples(int16_t* dst, size_t count)
 {
 	if (!dst || count == 0 || (m_demandPredicate && !m_demandPredicate()))
 	{
+		m_primed.store(false, std::memory_order_relaxed);
 		MicLogReject("demanda_off");
 		return false;
 	}
@@ -140,23 +141,50 @@ bool TwinpadMicChannel::ConsumeMicSamples(int16_t* dst, size_t count)
 	const uint64_t last = m_lastChunkMs.load();
 	if (nowMs > last + kMicFreshIntervalMs)
 	{
+		m_primed.store(false, std::memory_order_relaxed);
 		if (MicLogThrottled())
 			cemuLog_log(LogType::Force, "[TwinpadMic] sin chunks frescos (edad_ms={})", nowMs - last);
 		return false;
 	}
 	std::scoped_lock lock(m_samplesMutex);
-	if (m_samples.size() < count)
+	// CR-036: antes de arrancar se acumula el colchon. Los bloques del telefono
+	// llegan de golpe cada ~15 ms y el AX pide 96 muestras cada 3 ms, asi que
+	// sin colchon la cola llegaba a cero en cada frontera de bloque y ese frame
+	// caia en el micro del PC: el resultado eran cortes cada pocos milisegundos.
+	if (!m_primed.load(std::memory_order_relaxed))
 	{
-		m_consumeFailCount.fetch_add(1, std::memory_order_relaxed);
-		RecordMicQueueSample(m_samples.size());
-		if (MicLogThrottled())
-			cemuLog_log(LogType::Force, "[TwinpadMic] cola insuficiente ({} de {} muestras)", m_samples.size(), count);
-		return false;
+		if (m_samples.size() < kMicJitterTargetSamples)
+		{
+			m_consumeFailCount.fetch_add(1, std::memory_order_relaxed);
+			RecordMicQueueSample(m_samples.size());
+			if (MicLogThrottled())
+				cemuLog_log(LogType::Force, "[TwinpadMic] colchon inicial ({} de {} muestras)", m_samples.size(), kMicJitterTargetSamples);
+			return false;
+		}
+		m_primed.store(true, std::memory_order_relaxed);
 	}
-	for (size_t i = 0; i < count; ++i)
+	// CR-036: si el reloj del telefono y el del AX divergen, la cola crece
+	// hasta 1 s (latencia audible + drop-old del Feed). Se recorta al colchon
+	// objetivo en vez de esperar al drop-old de 1 s.
+	if (m_samples.size() > kMicJitterMaxSamples)
+	{
+		const size_t excess = m_samples.size() - kMicJitterTargetSamples;
+		m_samples.erase(m_samples.begin(), m_samples.begin() + static_cast<std::ptrdiff_t>(excess));
+		m_dropOldCount.fetch_add(1, std::memory_order_relaxed);
+	}
+	const size_t copied = std::min(count, m_samples.size());
+	for (size_t i = 0; i < copied; ++i)
 	{
 		dst[i] = m_samples.front();
 		m_samples.pop_front();
+	}
+	if (copied < count)
+	{
+		// CR-036: cola corta -> silencio en el tramo que falta. Nunca se cambia
+		// de fuente por una cola corta: eso era lo que partia el audio en
+		// tramos alternos del telefono y del dispositivo del PC.
+		std::fill(dst + copied, dst + count, int16_t{0});
+		m_padSamples.fetch_add(static_cast<uint64_t>(count - copied), std::memory_order_relaxed);
 	}
 	RecordMicQueueSample(m_samples.size());
 	// Consumo por AX: ~336 AX frames por segundo alimentan las colas del juego.
@@ -180,6 +208,7 @@ std::string TwinpadMicChannel::BuildPerfSummary(uint64_t windowMs)
 	summary += " consume_ok_n=" + std::to_string(consumedNow - micPrev.consumed);
 	summary += " reject_n=" + std::to_string(m_rejectCount.exchange(0, std::memory_order_relaxed));
 	summary += " consume_fail_n=" + std::to_string(m_consumeFailCount.exchange(0, std::memory_order_relaxed));
+	summary += " pad_n=" + std::to_string(m_padSamples.exchange(0, std::memory_order_relaxed));
 	summary += " drop_old_n=" + std::to_string(m_dropOldCount.exchange(0, std::memory_order_relaxed));
 	summary += " toggles_n=" + std::to_string(m_toggles == nullptr ? 0 : m_toggles->exchange(0, std::memory_order_relaxed));
 	summary += " cola_last=" + std::to_string(m_queueSizeLast.exchange(0, std::memory_order_relaxed));

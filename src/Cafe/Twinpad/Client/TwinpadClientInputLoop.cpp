@@ -326,12 +326,17 @@ void TwinpadClient::InputLoop()
 				}
 			}
 			CloseMedia();
-			const bool connected = ConnectPrimary() && m_titleActive.load() && ConnectAudio();
+			const bool primaryOk = ConnectPrimary();
+			const bool titleOk = m_titleActive.load();
+			const bool audioOk = primaryOk && titleOk && ConnectAudio();
+			const bool connected = primaryOk && titleOk && audioOk;
 			// CR-054: el canal media binario se intenta por cada ciclo de
 			// reconexión; fallar (server viejo) es barato y el fallback NDJSON
 			// lleva el video mientras tanto.
 			if (connected)
+			{
 				ConnectMedia();
+			}
 			if (connected && m_titleActive.load() && m_connectionRequested.load())
 			{
 				m_frameNumber.store(0);

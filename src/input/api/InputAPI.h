@@ -13,6 +13,7 @@ namespace InputAPI
 		DSUClient,
 		GameCube,
 		Wiimote,
+		Twinpad,
 
 		WGIGamepad,
 		WGIRawController,
@@ -42,6 +43,8 @@ namespace InputAPI
 			return "WGIRawController";
 		case SDLController:
 			return "SDLController";
+		case Twinpad:
+			return "Twinpad";
 		default:
 			break;
 		}
@@ -65,6 +68,8 @@ namespace InputAPI
 			return DSUClient;
 		else if (str == to_string(SDLController))
 			return SDLController;
+		else if (str == to_string(Twinpad))
+			return Twinpad;
 		else if (str == "DSU") // legacy
 			return DSUClient;
 		

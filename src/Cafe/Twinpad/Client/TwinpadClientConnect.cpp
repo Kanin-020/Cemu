@@ -338,9 +338,8 @@ bool TwinpadClient::SendMediaFrame(const TwinpadQueuedAu& frame)
 	store16(21, frame.height);
 	store32(23, static_cast<uint32_t>(frame.annexB.size()));
 	header[27] = twinpad_transport::kMediaFrameFmtH264;
-	if (!SendBytes(m_mediaSocket, reinterpret_cast<const char*>(header), twinpad_transport::kMediaFrameHeaderBytes))
-		return false;
-	return SendBytes(m_mediaSocket, reinterpret_cast<const char*>(frame.annexB.data()), frame.annexB.size());
+	return SendBytes(m_mediaSocket, reinterpret_cast<const char*>(header), twinpad_transport::kMediaFrameHeaderBytes)
+		&& SendBytes(m_mediaSocket, reinterpret_cast<const char*>(frame.annexB.data()), frame.annexB.size());
 }
 
 bool TwinpadClient::SendLine(std::intptr_t socket, const std::string& line)

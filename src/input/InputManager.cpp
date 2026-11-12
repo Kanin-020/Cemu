@@ -5,6 +5,7 @@
 #include <pugixml.hpp>
 #include "Cafe/GameProfile/GameProfile.h"
 #include "Cafe/Twinpad/Client/TwinpadClient.h"
+#include "input/api/Twinpad/TwinpadControllerProvider.h"
 #include "util/EventService.h"
 
 namespace
@@ -126,6 +127,7 @@ InputManager::InputManager()
 #if HAS_WIIMOTE
 	create_provider<WiimoteControllerProvider>();
 #endif
+	create_provider<TwinpadControllerProvider>();
 
 	m_update_thread_shutdown.store(false);
 	m_update_thread = std::thread(&InputManager::update_thread, this);
@@ -167,7 +169,25 @@ bool InputManager::load(size_t player_index, std::string_view filename)
 		migrate_config(old_file);
 
 	if (!fs::exists(file_path))
+	{
+		// Sin perfil guardado: Controller 1 arranca con Twinpad mapeado (Wii U Gamepad).
+		if (player_index == 0 && filename.empty())
+		{
+			for (const auto& p : m_api_available[InputAPI::Twinpad])
+			{
+				for (const auto& controller : p->get_controllers())
+				{
+					auto emulated_controller = ControllerFactory::CreateEmulatedController(player_index, EmulatedController::Type::VPAD);
+					emulated_controller->add_controller(controller);
+					emulated_controller->set_default_mapping(controller);
+					set_controller(emulated_controller);
+					cemuLog_log(LogType::Force, "[TwinpadAutoProfile] Controller 1 Twinpad mapeado");
+					return true;
+				}
+			}
+		}
 		return false;
+	}
 
 	try
 	{

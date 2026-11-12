@@ -8,6 +8,7 @@
 #include "input/api/Keyboard/KeyboardController.h"
 #include "input/api/DSU/DSUController.h"
 #include "input/api/GameCube/GameCubeController.h"
+#include "input/api/Twinpad/TwinpadControllerProvider.h"
 
 #if BOOST_OS_WINDOWS
 #include "input/api/XInput/XInputController.h"
@@ -176,6 +177,8 @@ ControllerProviderPtr ControllerFactory::CreateControllerProvider(InputAPI::Type
 	case InputAPI::Wiimote:
 		return std::make_shared<WiimoteControllerProvider>();
 #endif
+	case InputAPI::Twinpad:
+		return std::make_shared<TwinpadControllerProvider>();
 	default:
 		cemu_assert_debug(false);
 		return {};

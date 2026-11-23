@@ -539,16 +539,6 @@ void TwinpadClient::InputLoop()
 									report->accel[0], report->accel[1], report->accel[2],
 									report->gyro[0], report->gyro[1], report->gyro[2]);
 						}
-						else
-						{
-							// DBG-INPUT-SEQ (temporal): reporte descartado por seq no creciente.
-							// Se limita a las primeras 50 y luego 1 de cada 500 para no inundar el log.
-							static uint32_t dbgDiscards = 0;
-							if (++dbgDiscards <= 50 || dbgDiscards % 500 == 0)
-								cemuLog_log(LogType::Force,
-									"[DBG-INPUT-SEQ] descartado seq={} guardado={} n={}",
-									report->seq, m_inputState.seq, dbgDiscards);
-						}
 					}
 				}
 				m_receiveBuffer.erase(0, lineEnd + 1);

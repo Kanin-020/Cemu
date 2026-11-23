@@ -499,3 +499,30 @@ void TwinpadClient_keyboard_test()
 	}
 	cemu_assert_debug(!client.ConsumeKeyboardInput(drained));
 }
+
+void TwinpadClient_cadence_test()
+{
+	// TEST-0201 — verifies CR-105: the cadence handed to the encoder as its
+	// framerate (bits_per_frame source in h264_vaapi) is a median, so a single
+	// hiccup cannot halve it, and the encoder is only recreated on sustained drift.
+	std::deque<uint64_t> regular;
+	for (uint64_t index = 0; index < 6; ++index)
+		regular.push_back(index * 33333);
+	cemu_assert_debug(twinpad_cadence::EstimateFps(regular, 60) == 30);
+
+	// Un tiron de 66 ms entre frames de 33 ms no puede fijar la cadencia en 15.
+	std::deque<uint64_t> hiccup{0, 33333, 66666, 133332, 166665, 199998, 233331, 266664};
+	cemu_assert_debug(twinpad_cadence::EstimateFps(hiccup, 60) == 30);
+
+	// Ventana insuficiente: se conserva el valor previo en vez de una muestra aislada.
+	std::deque<uint64_t> young{0, 66000};
+	cemu_assert_debug(twinpad_cadence::EstimateFps(young, 28) == 28);
+
+	// Deriva >25%: recrea solo tras 90 frames sostenidos y 10 s de enfriamiento.
+	cemu_assert_debug(twinpad_cadence::CadenceOff(30, 15));
+	cemu_assert_debug(!twinpad_cadence::CadenceOff(30, 27));
+	cemu_assert_debug(!twinpad_cadence::DriftNeedsRecreate(30, 15, 89, 10000000));
+	cemu_assert_debug(!twinpad_cadence::DriftNeedsRecreate(30, 15, 90, 9999999));
+	cemu_assert_debug(twinpad_cadence::DriftNeedsRecreate(30, 15, 90, 10000000));
+	cemu_assert_debug(!twinpad_cadence::DriftNeedsRecreate(30, 29, 500, 10000000));
+}

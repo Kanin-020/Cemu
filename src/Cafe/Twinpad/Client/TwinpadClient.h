@@ -325,6 +325,9 @@ class TwinpadClient
 	std::atomic<bool> m_forceNextIdr{true};
 	uint64_t m_lastIdrTimestampUs = 0;
 	uint64_t m_encoderEpochUs = 0;
+	// CR-105: correccion del rate-control si el framerate del encoder deriva.
+	uint64_t m_lastEncoderRecreateUs = 0;
+	uint32_t m_cadenceDriftFrames = 0;
 
 	// Receive state ---------------------------------------------------------------
 	std::string m_receiveBuffer;
@@ -340,8 +343,25 @@ class TwinpadClient
 	std::unique_ptr<twinpad_video_metrics::TwinpadVideoMetrics> m_videoMetrics;
 };
 
+// CR-105: la cadencia que abre el encoder es, en h264_vaapi, el presupuesto
+// por frame (bits_per_frame = bit_rate / framerate). Se estima con mediana para
+// que un tiron aislado no la fije, y se corrige solo si deriva de forma
+// sostenida y fuera del enfriamiento.
+namespace twinpad_cadence
+{
+	constexpr size_t kMinSamples = 5;
+	constexpr uint32_t kDriftFrames = 90;
+	constexpr uint64_t kRecreateCooldownUs = 10000000;
+
+	uint16_t EstimateFps(const std::deque<uint64_t>& stampsUs, uint16_t fallbackFps);
+	bool CadenceOff(uint32_t encoderFps, uint16_t cadenceFps);
+	bool DriftNeedsRecreate(uint32_t encoderFps, uint16_t cadenceFps, uint32_t driftFrames,
+		uint64_t sinceRecreateUs);
+}
+
 // Free-function tests (white-box friends). They live outside the class so
 // they can reach both the client and its module members.
+void TwinpadClient_cadence_test();
 void TwinpadClient_base64url_test();
 void TwinpadClient_h264_encoder_test();
 void TwinpadClient_hardware_encoder_test();

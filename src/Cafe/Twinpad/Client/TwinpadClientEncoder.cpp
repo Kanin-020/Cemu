@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <algorithm>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // TU del encoder del cliente Twinpad: ResetVideoEncoder (ambos backends) y
@@ -16,6 +17,39 @@
 // conversion RGB->YUV CR-043 (modulo twinpad_yuv) y caminos hardware CR-039/
 // CR-041/OpenH264 (modulo twinpad_h264); el codigo del monolito original.
 // ---------------------------------------------------------------------------
+
+namespace twinpad_cadence
+{
+uint16_t EstimateFps(const std::deque<uint64_t>& stampsUs, uint16_t fallbackFps)
+{
+	if (stampsUs.size() < kMinSamples)
+		return fallbackFps;
+	std::vector<uint64_t> intervals;
+	intervals.reserve(stampsUs.size() - 1);
+	for (size_t index = 1; index < stampsUs.size(); ++index)
+		intervals.push_back(stampsUs[index] - stampsUs[index - 1]);
+	std::sort(intervals.begin(), intervals.end());
+	const uint64_t medianUs = intervals[intervals.size() / 2];
+	if (medianUs == 0)
+		return fallbackFps;
+	return static_cast<uint16_t>(std::clamp<uint64_t>(1000000 / medianUs, 5, 120));
+}
+
+bool CadenceOff(uint32_t encoderFps, uint16_t cadenceFps)
+{
+	if (encoderFps == 0)
+		return false;
+	return cadenceFps * 4 > encoderFps * 5 || cadenceFps * 5 < encoderFps * 4; // >25%
+}
+
+bool DriftNeedsRecreate(uint32_t encoderFps, uint16_t cadenceFps, uint32_t driftFrames,
+	uint64_t sinceRecreateUs)
+{
+	if (driftFrames < kDriftFrames || sinceRecreateUs < kRecreateCooldownUs)
+		return false;
+	return CadenceOff(encoderFps, cadenceFps);
+}
+}
 
 bool TwinpadClient::IsHardwareEncoderActive()
 {
@@ -69,37 +103,31 @@ bool TwinpadClient::EncodeGamePadFrame(
 	m_encodeStampsUs.push_back(nowUs);
 	if (m_encodeStampsUs.size() > kCadenceWindowFrames)
 		m_encodeStampsUs.erase(m_encodeStampsUs.begin());
-	uint16_t cadenceFps = kEncoderNominalFps;
-	if (m_encodeStampsUs.size() >= 2)
-	{
-		const uint64_t spanUs = nowUs - m_encodeStampsUs.front();
-		if (spanUs > 0)
-		{
-			cadenceFps = static_cast<uint16_t>(std::clamp<uint64_t>(
-				(m_encodeStampsUs.size() - 1) * 1000000 / spanUs, 5, 120));
-		}
-	}
-	// Histeresis: reconfigura solo si la cadencia varía >30% del nominal
-	// configurado y han pasado ≥2 s desde la última reconfiguración (evita
-	// palpitación de reset/IDR).
-	const bool cadenceChanged = m_encoderNominalFps != 0
-		&& nowUs - m_encoderEpochUs >= 2000000
-		&& (cadenceFps * 10 > m_encoderNominalFps * 13
-			|| cadenceFps * 13 < m_encoderNominalFps * 10);
+	// CR-105: mediana de los intervalos, no (n-1)/span. Un tiron aislado de
+	// 66 ms en una ventana joven daba 15 fps y ese valor, al ser metadata del
+	// rate-control, duplicaba el bitrate hasta la siguiente recreacion.
+	const uint16_t fallbackFps = m_encoderNominalFps != 0
+		? static_cast<uint16_t>(m_encoderNominalFps) : static_cast<uint16_t>(kEncoderNominalFps);
+	const uint16_t cadenceFps = twinpad_cadence::EstimateFps(m_encodeStampsUs, fallbackFps);
+	const bool encoderExists = m_videoEncoder || m_hardwareVideoEncoder;
+	m_cadenceDriftFrames = encoderExists && twinpad_cadence::CadenceOff(m_encoderNominalFps, cadenceFps)
+		? m_cadenceDriftFrames + 1 : 0;
+	const bool cadenceStale = twinpad_cadence::DriftNeedsRecreate(m_encoderNominalFps, cadenceFps,
+		m_cadenceDriftFrames, nowUs - m_lastEncoderRecreateUs);
 	const uint8_t fps = static_cast<uint8_t>(std::min<uint64_t>(cadenceFps, 120u)); // metadata del rate-control; sin pacing (CR-029)
 	const bool hardwareRequested = m_hardwareAccelerationEnabled.load();
-	const bool encoderExists = m_videoEncoder || m_hardwareVideoEncoder;
-	// CR-036: la cadencia medida ya no reinicia el encoder (solo metadata de rate-control).
+	// CR-036: la cadencia medida no reinicia el encoder; CR-105 la vuelve a
+	// tener en cuenta solo cuando deriva de forma sostenida (cadenceStale).
 	const bool encoderConfigChanged = m_encoderWidth != width || m_encoderHeight != height
 		|| m_encoderBitrateKbps != bitrateKbps;
 	const bool hardwarePreferenceChanged = hardwareRequested != m_encoderHardwarePreference;
-	if (!encoderExists || encoderConfigChanged || hardwarePreferenceChanged)
+	if (!encoderExists || encoderConfigChanged || hardwarePreferenceChanged || cadenceStale)
 	{
-		// TEMPORAL CR-065-diag: razón exacta de la recreación del encoder.
+		// TEMPORAL CR-065-diag: razon exacta de la recreacion del encoder.
 		cemuLog_log(LogType::Force,
-			"[TwinpadVideo] encoder recreate: exists={} dim_changed={} hw_pref_changed={} ({}x{} kb={})",
+			"[TwinpadVideo] encoder recreate: exists={} dim_changed={} hw_pref_changed={} cadence_stale={} cadence={} ({}x{} kb={})",
 			encoderExists ? 1 : 0, encoderConfigChanged ? 1 : 0, hardwarePreferenceChanged ? 1 : 0,
-			width, height, bitrateKbps);
+			cadenceStale ? 1 : 0, cadenceFps, width, height, bitrateKbps);
 		if (m_hardwareVideoEncoder)
 			m_hardwareVideoEncoder.reset();
 		if (m_videoEncoder)
@@ -140,6 +168,8 @@ bool TwinpadClient::EncodeGamePadFrame(
 		m_forceNextIdr = true;
 		m_lastIdrTimestampUs = 0;
 		m_encoderEpochUs = nowUs;
+		m_lastEncoderRecreateUs = nowUs;
+		m_cadenceDriftFrames = 0;
 	}
 
 	// CR-043: conversión RGB8→YUV acelerada (SSSE3 con fallback escalar
@@ -168,12 +198,14 @@ bool TwinpadClient::EncodeGamePadFrame(
 			std::memory_order_relaxed, std::memory_order_relaxed))
 	{
 		cemuLog_log(LogType::Force,
-			"[TwinpadVideo] idr_diag want={} force_next={} since_last_idr_ms={} hw_active={} index={}",
+			"[TwinpadVideo] idr_diag want={} force_next={} since_last_idr_ms={} hw_active={} index={} cadence={} enc_fps={}",
 			forceIdr ? 1 : 0,
 			m_forceNextIdr.load(std::memory_order_relaxed) ? 1 : 0,
 			m_lastIdrTimestampUs != 0 ? (nowUs - m_lastIdrTimestampUs) / 1000 : -1,
 			m_encoderHardwareActive ? 1 : 0,
-			m_encoderFrameIndex);
+			m_encoderFrameIndex,
+			cadenceFps,
+			m_encoderNominalFps);
 	}
 	auto fallbackToOpenH264 = [&]() {
 		m_hardwareVideoEncoder.reset();

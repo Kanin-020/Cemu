@@ -465,6 +465,13 @@ void TwinpadClient::InputLoop()
 						RequestKeyframe();
 					}
 					else if (document.IsObject() && document.HasMember("type") && document["type"].IsString()
+						&& std::string_view(document["type"].GetString()) == "input_reset")
+					{
+						// CR-106: nueva sesión de input; el siguiente input_report define el estado.
+						std::scoped_lock lock(m_inputMutex);
+						m_hasInputSeq = false;
+					}
+					else if (document.IsObject() && document.HasMember("type") && document["type"].IsString()
 						&& std::string_view(document["type"].GetString()) == "camera_frame")
 					{
 						// CR-034: camera_frame H.264 320x240 del teléfono; se decodifica aquí.
@@ -531,6 +538,16 @@ void TwinpadClient::InputLoop()
 									report->seq, report->motionTimestampUs,
 									report->accel[0], report->accel[1], report->accel[2],
 									report->gyro[0], report->gyro[1], report->gyro[2]);
+						}
+						else
+						{
+							// DBG-INPUT-SEQ (temporal): reporte descartado por seq no creciente.
+							// Se limita a las primeras 50 y luego 1 de cada 500 para no inundar el log.
+							static uint32_t dbgDiscards = 0;
+							if (++dbgDiscards <= 50 || dbgDiscards % 500 == 0)
+								cemuLog_log(LogType::Force,
+									"[DBG-INPUT-SEQ] descartado seq={} guardado={} n={}",
+									report->seq, m_inputState.seq, dbgDiscards);
 						}
 					}
 				}

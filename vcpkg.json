@@ -72,8 +72,20 @@
     {
       "name": "ffmpeg",
       "default-features": false,
+      "features": ["avcodec", "amf", "nvcodec", "qsv"],
+      "platform": "windows"
+    },
+    {
+      "name": "ffmpeg",
+      "default-features": false,
       "features": ["avcodec", "amf", "nvcodec", "qsv", "vaapi"],
-      "platform": "windows | linux"
+      "platform": "linux & x64"
+    },
+    {
+      "name": "ffmpeg",
+      "default-features": false,
+      "features": ["avcodec", "amf", "nvcodec", "vaapi"],
+      "platform": "linux & arm64"
     },
     {
       "name": "ffmpeg",

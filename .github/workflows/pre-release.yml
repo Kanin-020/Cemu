@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Pre-release version (for example, 2.7 or 2.7-rc1)'
+        description: 'Pre-release version (for example, 2.7, 2.7.0, or 2.7-rc1)'
         required: true
         type: string
 
@@ -30,14 +30,14 @@ jobs:
         run: |
           set -euo pipefail
           version="${INPUT_VERSION#v}"
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
-            echo "Invalid pre-release version: $INPUT_VERSION (expected MAJOR.MINOR or MAJOR.MINOR-suffix)" >&2
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "Invalid pre-release version: $INPUT_VERSION (expected MAJOR.MINOR[.PATCH] or MAJOR.MINOR[.PATCH]-suffix)" >&2
             exit 1
           fi
-          minor="${version#*.}"
-          minor="${minor%%-*}"
+          base="${version%%-*}"
+          IFS='.' read -r major minor _patch <<< "$base"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "major=${version%%.*}" >> "$GITHUB_OUTPUT"
+          echo "major=$major" >> "$GITHUB_OUTPUT"
           echo "minor=$minor" >> "$GITHUB_OUTPUT"
 
   call-release-build:

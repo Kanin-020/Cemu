@@ -30,9 +30,8 @@ void wxCemuConfig::Load(XMLConfigParser& parser)
 	use_discord_presence = parser.get("use_discord_presence", true);
 	fullscreen_menubar = parser.get("fullscreen_menubar", false);
 	feral_gamemode = parser.get("feral_gamemode", false);
-	twinpad_auto_connect = parser.get("twinpad_auto_connect", false);
 	twinpad_show_gyro_monitor = parser.get("twinpad_show_gyro_monitor", false);
-	twinpad_hardware_acceleration = parser.get("twinpad_hardware_acceleration", false);
+	twinpad_hardware_acceleration = parser.get("twinpad_hardware_acceleration", true);
 	check_update = parser.get("check_update", check_update);
 	receive_untested_updates = parser.get("receive_untested_updates", receive_untested_updates);
 	save_screenshot = parser.get("save_screenshot", save_screenshot);
@@ -132,7 +131,6 @@ void wxCemuConfig::Save(XMLConfigParser& config)
 	config.set<bool>("use_discord_presence", use_discord_presence);
 	config.set<bool>("fullscreen_menubar", fullscreen_menubar);
 	config.set<bool>("feral_gamemode", feral_gamemode);
-	config.set<bool>("twinpad_auto_connect", twinpad_auto_connect);
 	config.set<bool>("twinpad_show_gyro_monitor", twinpad_show_gyro_monitor);
 	config.set<bool>("twinpad_hardware_acceleration", twinpad_hardware_acceleration);
 	config.set<bool>("check_update", check_update);

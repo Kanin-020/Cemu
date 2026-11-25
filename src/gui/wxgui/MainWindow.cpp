@@ -825,11 +825,8 @@ void MainWindow::OnNFCMenu(wxCommandEvent& event)
 
 void MainWindow::OnTwinpadMenu(wxCommandEvent& event)
 {
-	auto& twinpad = TwinpadClient::Instance();
 	if (event.GetId() == MAINFRAME_MENU_ID_TWINPAD_CONNECT)
 	{
-		if (!CafeSystem::IsTitleRunning() || twinpad.IsConnectionRequested())
-			return;
 		TwinpadQr qr;
 		if (!TwinpadClient::GetCurrentQr(qr))
 		{
@@ -842,7 +839,7 @@ void MainWindow::OnTwinpadMenu(wxCommandEvent& event)
 			}
 			m_twinpadServerPid = startedServerPid;
 			bool qrAvailable = false;
-			for (int attempt = 0; attempt < 30; ++attempt)
+			for (int attempt = 0; attempt < 100; ++attempt)
 			{
 				if (TwinpadClient::GetCurrentQr(qr))
 				{
@@ -861,74 +858,53 @@ void MainWindow::OnTwinpadMenu(wxCommandEvent& event)
 				return;
 			}
 		}
-		twinpad.RequestConnection();
-		if (g_renderer)
-			g_renderer->SetTwinpadCaptureEnabled(true);
-		if (!qr.cemuLive)
+		for (;;)
 		{
-			bool cemuAvailable = false;
-			for (int attempt = 0; attempt < 40; ++attempt)
+			const size_t qrWidth = qr.modules.front().size();
+			const int moduleSize = std::max(3, 360 / static_cast<int>(qrWidth + 8));
+			const int quietZone = moduleSize * 4;
+			wxBitmap qrBitmap(static_cast<int>(qrWidth) * moduleSize + quietZone * 2,
+				static_cast<int>(qr.modules.size()) * moduleSize + quietZone * 2);
 			{
-				if (TwinpadClient::GetCurrentQr(qr) && qr.cemuLive)
-				{
-					cemuAvailable = true;
-					break;
-				}
-				wxMilliSleep(50);
+				wxMemoryDC dc(qrBitmap);
+				dc.SetBackground(*wxWHITE_BRUSH);
+				dc.Clear();
+				dc.SetPen(*wxBLACK_PEN);
+				dc.SetBrush(*wxBLACK_BRUSH);
+				for (size_t y = 0; y < qr.modules.size(); ++y)
+					for (size_t x = 0; x < qrWidth; ++x)
+						if (qr.modules[y][x] == '1')
+							dc.DrawRectangle(quietZone + static_cast<int>(x) * moduleSize,
+								quietZone + static_cast<int>(y) * moduleSize, moduleSize, moduleSize);
+				dc.SelectObject(wxNullBitmap);
 			}
-			if (!cemuAvailable)
+			wxDialog qrDialog(this, wxID_ANY, wxString::FromUTF8("Escanea el QR de conexión"),
+				wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE);
+			auto* qrSizer = new wxBoxSizer(wxVERTICAL);
+			qrSizer->Add(new wxStaticBitmap(&qrDialog, wxID_ANY, qrBitmap), 0, wxALL | wxALIGN_CENTER, 12);
+			qrSizer->Add(new wxStaticText(&qrDialog, wxID_ANY, wxString::FromUTF8(qr.uri)), 0, wxLEFT | wxRIGHT | wxBOTTOM | wxALIGN_CENTER, 12);
+			auto* rotateQrButton = new wxButton(&qrDialog, wxID_ANY, wxString::FromUTF8("Generar nuevo QR"));
+			rotateQrButton->Bind(wxEVT_BUTTON, [&qrDialog](wxCommandEvent&) {
+				qrDialog.EndModal(wxID_RETRY);
+			});
+			qrSizer->Add(rotateQrButton, 0, wxALIGN_CENTER | wxBOTTOM, 12);
+			qrSizer->Add(qrDialog.CreateStdDialogButtonSizer(wxOK), 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
+			qrDialog.SetSizerAndFit(qrSizer);
+			qrDialog.CentreOnParent();
+			if (qrDialog.ShowModal() != wxID_RETRY)
+				break;
+			if (!TwinpadClient::RotateCurrentQr(qr))
 			{
-				twinpad.CancelConnectionRequest();
-				if (g_renderer)
-					g_renderer->SetTwinpadCaptureEnabled(false);
-				wxMessageBox(wxString::FromUTF8("El servidor Twinpad no confirmó el adaptador Cemu."),
+				wxMessageBox(wxString::FromUTF8("No se pudo generar un QR nuevo del Servidor Twinpad."),
 					wxString::FromUTF8("Twinpad"), wxOK | wxICON_ERROR, this);
-				return;
+				break;
 			}
 		}
-		const size_t qrWidth = qr.modules.front().size();
-		const int moduleSize = std::max(3, 360 / static_cast<int>(qrWidth + 8));
-		const int quietZone = moduleSize * 4;
-		wxBitmap qrBitmap(static_cast<int>(qrWidth) * moduleSize + quietZone * 2,
-			static_cast<int>(qr.modules.size()) * moduleSize + quietZone * 2);
-		{
-			wxMemoryDC dc(qrBitmap);
-			dc.SetBackground(*wxWHITE_BRUSH);
-			dc.Clear();
-			dc.SetPen(*wxBLACK_PEN);
-			dc.SetBrush(*wxBLACK_BRUSH);
-			for (size_t y = 0; y < qr.modules.size(); ++y)
-				for (size_t x = 0; x < qrWidth; ++x)
-					if (qr.modules[y][x] == '1')
-						dc.DrawRectangle(quietZone + static_cast<int>(x) * moduleSize,
-							quietZone + static_cast<int>(y) * moduleSize, moduleSize, moduleSize);
-			dc.SelectObject(wxNullBitmap);
-		}
-		wxDialog qrDialog(this, wxID_ANY, wxString::FromUTF8("Escanea el QR de conexión"),
-			wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE);
-		auto* qrSizer = new wxBoxSizer(wxVERTICAL);
-		qrSizer->Add(new wxStaticBitmap(&qrDialog, wxID_ANY, qrBitmap), 0, wxALL | wxALIGN_CENTER, 12);
-		qrSizer->Add(new wxStaticText(&qrDialog, wxID_ANY, wxString::FromUTF8(qr.uri)), 0, wxLEFT | wxRIGHT | wxBOTTOM | wxALIGN_CENTER, 12);
-		qrSizer->Add(qrDialog.CreateStdDialogButtonSizer(wxOK), 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
-		qrDialog.SetSizerAndFit(qrSizer);
-		qrDialog.CentreOnParent();
-		if (qrDialog.ShowModal() != wxID_OK)
-		{
-			twinpad.CancelConnectionRequest();
-			if (g_renderer)
-				g_renderer->SetTwinpadCaptureEnabled(false);
-			RecreateMenu();
-			return;
-		}
-		RecreateMenu();
 		return;
 	}
 
 	wxDialog settings(this, wxID_ANY, wxString::FromUTF8("Configuraciones"), wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE);
 	auto* sizer = new wxBoxSizer(wxVERTICAL);
-	auto* autoConnect = new wxCheckBox(&settings, wxID_ANY, wxString::FromUTF8("Conexión automática"));
-	autoConnect->SetValue(GetWxGUIConfig().twinpad_auto_connect);
-	sizer->Add(autoConnect, 0, wxALL, 12);
 	auto* gyroMonitor = new wxCheckBox(&settings, wxID_ANY, wxString::FromUTF8("Monitor de giroscopio"));
 	gyroMonitor->SetValue(GetWxGUIConfig().twinpad_show_gyro_monitor);
 	sizer->Add(gyroMonitor, 0, wxLEFT | wxRIGHT | wxBOTTOM, 12);
@@ -944,25 +920,10 @@ void MainWindow::OnTwinpadMenu(wxCommandEvent& event)
 	if (settings.ShowModal() != wxID_OK)
 		return;
 
-	const bool wasAutoConnect = GetWxGUIConfig().twinpad_auto_connect;
-	const bool autoConnectEnabled = autoConnect->GetValue();
 	GetWxGUIConfig().twinpad_hardware_acceleration = hardwareAcceleration->GetValue();
 	TwinpadClient::Instance().SetHardwareAccelerationEnabled(hardwareAcceleration->GetValue());
 	SetTwinpadGyroMonitorEnabled(gyroMonitor->GetValue());
 	g_wxConfig.Save();
-	if (wasAutoConnect == autoConnectEnabled)
-	{
-		RecreateMenu();
-		return;
-	}
-	GetWxGUIConfig().twinpad_auto_connect = autoConnectEnabled;
-	g_wxConfig.Save();
-	if (autoConnectEnabled && CafeSystem::IsTitleRunning() && !twinpad.IsConnectionRequested())
-	{
-		twinpad.SetTitleActive(true, true);
-		if (g_renderer)
-			g_renderer->SetTwinpadCaptureEnabled(true);
-	}
 	RecreateMenu();
 }
 
@@ -1795,7 +1756,7 @@ void MainWindow::OnGesturePan(wxPanGestureEvent& event)
 
 void MainWindow::OnGameLoaded()
 {
-	TwinpadClient::Instance().SetTitleActive(true, GetWxGUIConfig().twinpad_auto_connect);
+	TwinpadClient::Instance().SetTitleActive(true);
 	if (g_renderer)
 		g_renderer->SetTwinpadCaptureEnabled(TwinpadClient::Instance().IsCaptureEnabled());
 	if (m_debugger_window)
@@ -2523,7 +2484,7 @@ void MainWindow::RecreateMenu()
 
 	m_twinpadMenu = new wxMenu();
 	m_twinpadConnectItem = m_twinpadMenu->Append(MAINFRAME_MENU_ID_TWINPAD_CONNECT, wxString::FromUTF8("Iniciar conexión"));
-	m_twinpadConnectItem->Enable(CafeSystem::IsTitleRunning() && !TwinpadClient::Instance().IsConnectionRequested());
+	m_twinpadConnectItem->Enable(true);
 	m_twinpadMenu->Append(MAINFRAME_MENU_ID_TWINPAD_SETTINGS, wxString::FromUTF8("Configuraciones"));
 	m_menuBar->Append(m_twinpadMenu, _("&Twinpad"));
 

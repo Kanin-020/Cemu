@@ -69,9 +69,9 @@ class TwinpadClient
 	bool Start(bool captureGamePad);
 	//! Joins every loop and closes every socket. Blocking; idempotent.
 	void Stop();
-	//! Called when the host app connects / disconnects a specific game. If
-	//! connectAutomatically, boots the client on demand.
-	void SetTitleActive(bool active, bool connectAutomatically = false);
+	//! Called when the host app connects / disconnects a specific game.
+	//! Starting a title always boots the client and requests the connection.
+	void SetTitleActive(bool active);
 	//! Request a connection with the host once the game has been announced
 	//! to the Twinpad host over the primary port 8421.
 	void RequestConnection();
@@ -156,6 +156,8 @@ class TwinpadClient
 	uint64_t GetLastFrameSentMs() const { return m_lastFrameSentMs.load(); }
 	//! Reads the camera QR from port 8423 (GET_QR handshake), safe pre-connect.
 	static bool GetCurrentQr(TwinpadQr& qr);
+	//! Invalidates the current QR and reads the newly issued one (ROTATE_QR).
+	static bool RotateCurrentQr(TwinpadQr& qr);
 
 	// --- Shared codec helpers + encoder entry (DRC pipeline) ---------------------
 	//! base64url (no padding) shared by demands/frames (CR-035/CR-044/CR-054).

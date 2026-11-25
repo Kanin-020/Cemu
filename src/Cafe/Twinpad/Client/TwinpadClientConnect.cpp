@@ -157,23 +157,23 @@ void TwinpadClient::Stop()
 	ResetVideoEncoder();
 }
 
-void TwinpadClient::SetTitleActive(bool active, bool connectAutomatically)
+void TwinpadClient::SetTitleActive(bool active)
 {
 	{
 		std::scoped_lock lifecycleLock(m_lifecycleMutex);
 		m_titleActive.store(active);
-		if (active && connectAutomatically)
+		if (active)
 		{
 			m_connectionRequested.store(true);
 			m_captureGamePad.store(true);
 		}
-		if (!active)
+		else
 		{
 			m_connectionRequested.store(false);
 			m_captureGamePad.store(false);
 		}
 	}
-	if (active && connectAutomatically && !m_running.load())
+	if (active && !m_running.load())
 		Start(true);
 	if (!active)
 	{
@@ -354,10 +354,13 @@ bool TwinpadClient::SendBytes(std::intptr_t socket, const char* data, size_t siz
 	return twinpad_transport::SendBytes(socket, data, size);
 }
 
-// CR-023: lee el QR de la app (GET_QR/JSON en 8423); usado por el HUD
-// (separa el QR canvas del backend de arriba). Limite de response y
-// validacion estricta de filas de 01 son verbatim del original.
-bool TwinpadClient::GetCurrentQr(TwinpadQr& qr)
+namespace
+{
+
+// CR-023: lee el QR de la app (GET_QR/ROTATE_QR + JSON en 8423); usado por
+// el menu y el HUD (separa el QR canvas del backend de arriba). Limite de
+// response y validacion estricta de filas de 01 son verbatim del original.
+bool ReadQr(const char* command, TwinpadQr& qr)
 {
 #if BOOST_OS_WINDOWS
 	static const bool winsockReady = [] { WSADATA data{}; return WSAStartup(MAKEWORD(2, 2), &data) == 0; }();
@@ -383,7 +386,7 @@ bool TwinpadClient::GetCurrentQr(TwinpadQr& qr)
 	timeval timeout{2, 0};
 	setsockopt(socketHandle, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 #endif
-	const std::string request = "GET_QR\n";
+	const std::string request = std::string(command) + "\n";
 #if BOOST_OS_WINDOWS
 	const int requestSent = ::send(socketHandle, request.data(), static_cast<int>(request.size()), 0);
 #else
@@ -445,4 +448,16 @@ bool TwinpadClient::GetCurrentQr(TwinpadQr& qr)
 	}
 	qr = std::move(parsed);
 	return true;
+}
+
+} // namespace
+
+bool TwinpadClient::GetCurrentQr(TwinpadQr& qr)
+{
+	return ReadQr("GET_QR", qr);
+}
+
+bool TwinpadClient::RotateCurrentQr(TwinpadQr& qr)
+{
+	return ReadQr("ROTATE_QR", qr);
 }

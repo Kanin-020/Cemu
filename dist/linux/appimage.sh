@@ -34,7 +34,9 @@ cp -r bin/* AppDir/usr/share/Cemu
 mv AppDir/usr/share/Cemu/Cemu AppDir/usr/bin/
 chmod +x AppDir/usr/bin/Cemu
 
-cp /usr/lib/"${CPU_ARCH}"-linux-gnu/{libsepol.so.1,libffi.so.7,libpcre.so.3,libGLU.so.1,libthai.so.0} AppDir/usr/lib
+for lib in libsepol.so.1 libsepol.so.2 libffi.so.7 libffi.so.8 libpcre.so.3 libGLU.so.1 libthai.so.0; do
+	cp "/usr/lib/${CPU_ARCH}-linux-gnu/${lib}" AppDir/usr/lib/ 2>/dev/null || true
+done
 
 export UPD_INFO="gh-releases-zsync|cemu-project|Cemu|ci|Cemu.AppImage.zsync"
 export NO_STRIP=1
@@ -51,8 +53,12 @@ if ! GITVERSION="$(git rev-parse --short HEAD 2>/dev/null)"; then
 fi
 echo "Cemu Version Cemu-${GITVERSION}"
 
-rm AppDir/usr/lib/libwayland-client.so.0
-echo -e "export LC_ALL=C\nexport FONTCONFIG_PATH=/etc/fonts" >> AppDir/apprun-hooks/linuxdeploy-plugin-gtk.sh
+rm -f AppDir/usr/lib/libwayland-client.so.0
+mkdir -p AppDir/apprun-hooks
+gtk_hook=AppDir/apprun-hooks/linuxdeploy-plugin-gtk.sh
+if [[ -f "$gtk_hook" ]]; then
+	echo -e "export LC_ALL=C\nexport FONTCONFIG_PATH=/etc/fonts" >> "$gtk_hook"
+fi
 VERSION="${GITVERSION}" ./mkappimage.AppImage --appimage-extract-and-run "${GITHUB_WORKSPACE}"/AppDir
 
 mkdir -p "${GITHUB_WORKSPACE}"/artifacts/

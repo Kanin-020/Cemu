@@ -1,0 +1,135 @@
+name: Pre-release
+
+# Mismo pipeline que Deploy release, pero sin changelog: solo la versión.
+# La release se publica con la marca de pre-release de GitHub.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Pre-release version (for example, 2.7 or 2.7-rc1)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    name: Validate version
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.parse.outputs.version }}
+      major: ${{ steps.parse.outputs.major }}
+      minor: ${{ steps.parse.outputs.minor }}
+    steps:
+      - name: Parse version
+        id: parse
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${INPUT_VERSION#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "Invalid pre-release version: $INPUT_VERSION (expected MAJOR.MINOR or MAJOR.MINOR-suffix)" >&2
+            exit 1
+          fi
+          minor="${version#*.}"
+          minor="${minor%%-*}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "major=${version%%.*}" >> "$GITHUB_OUTPUT"
+          echo "minor=$minor" >> "$GITHUB_OUTPUT"
+
+  call-release-build:
+    name: Build release artifacts
+    needs: validate
+    uses: ./.github/workflows/build.yml
+    with:
+      next_version_major: ${{ needs.validate.outputs.major }}
+      next_version_minor: ${{ needs.validate.outputs.minor }}
+
+  deploy:
+    name: Publish pre-release
+    runs-on: ubuntu-22.04
+    needs: [call-release-build, validate]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: cemu-bin-linux-x64
+          path: cemu-bin-linux-x64
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: cemu-appimage-x64
+          path: cemu-appimage-x64
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: cemu-bin-windows-x64
+          path: cemu-bin-windows-x64
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: cemu-installer-windows-x64
+          path: cemu-installer-windows-x64
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: cemu-bin-macos*
+          path: cemu-macos
+
+      - name: Initialize
+        run: |
+          mkdir upload
+          sudo apt install zip
+
+      - name: Set version dependent vars
+        run: |
+          echo "CEMU_VERSION=${{ needs.validate.outputs.version }}" >> $GITHUB_ENV
+          echo "CEMU_FOLDER_NAME=Cemu_${{ needs.validate.outputs.version }}" >> $GITHUB_ENV
+
+      - name: Create release from windows-bin
+        run: |
+          cp -R ./bin ./${{ env.CEMU_FOLDER_NAME }}
+          mv cemu-bin-windows-x64/Cemu.exe ./${{ env.CEMU_FOLDER_NAME }}/Cemu.exe
+          zip -9 -r upload/cemu-${{ env.CEMU_VERSION }}-windows-x64.zip ${{ env.CEMU_FOLDER_NAME }}
+          rm -r ./${{ env.CEMU_FOLDER_NAME }}
+
+      - name: Create release from windows-installer
+        run: |
+          installer=$(ls cemu-installer-windows-x64/cemu-*-windows-x64-installer.exe)
+          cp "$installer" upload/cemu-${{ env.CEMU_VERSION }}-windows-x64-installer.exe
+
+      - name: Create appimage
+        run: |
+          VERSION=${{ env.CEMU_VERSION }}
+          mv cemu-appimage-x64/Cemu-*-x86_64.AppImage upload/Cemu-$VERSION-x86_64.AppImage
+
+      - name: Create release from linux-bin
+        run: |
+          cp -R ./bin ./${{ env.CEMU_FOLDER_NAME }}
+          mv cemu-bin-linux-x64/Cemu ./${{ env.CEMU_FOLDER_NAME }}/Cemu
+          zip -9 -r upload/cemu-${{ env.CEMU_VERSION }}-ubuntu-22.04-x64.zip ${{ env.CEMU_FOLDER_NAME }}
+          rm -r ./${{ env.CEMU_FOLDER_NAME }}
+
+      - name: Create release from macos-bin
+        run: |
+          cd cemu-macos
+          for bin_dir in cemu-bin-macos-*; do
+            arch="${bin_dir##cemu-bin-macos-}"
+            cp $bin_dir/Cemu.dmg ../upload/cemu-${{ env.CEMU_VERSION }}-macos-12-$arch.dmg
+          done
+
+      - name: Create pre-release
+        run: |
+          wget -O ghr.tar.gz https://github.com/tcnksm/ghr/releases/download/v0.15.0/ghr_v0.15.0_linux_amd64.tar.gz
+          tar xvzf ghr.tar.gz; rm ghr.tar.gz
+          echo "[INFO] Pre-release tag: v${{ env.CEMU_VERSION }}"
+          ghr_v0.15.0_linux_amd64/ghr -prerelease -t ${{ secrets.GITHUB_TOKEN }} \
+            -n "Cemu ${{ env.CEMU_VERSION }}" \
+            -b "Pre-release build of Cemu ${{ env.CEMU_VERSION }}." \
+            "v${{ env.CEMU_VERSION }}" ./upload

@@ -47,7 +47,7 @@ class TwinpadGyroMonitor;
 //! 2. Every publisher stores + forwards its demand or data pre-connect,
 //!    so ordering between host code and the connection lifetime is free.
 //! 3. Consumers poll snapshots; nothing blocks the game/render threads.
-//! Ports: 8421 input / 8422 audio / 8423 QR / 8426 media binary / 8424 e2e.
+//! Ports: 8421 input / 8422 audio / 8426 media binary / 8424 e2e.
 class TwinpadClient
 {
 	friend void TwinpadGyroMonitor_test();
@@ -149,15 +149,11 @@ class TwinpadClient
 	//! HLE `mic` consumer: fresh demand + fresh chunk window required (CR-035).
 	bool ConsumeMicSamples(int16_t* dst, size_t count);
 
-	// --- Connection state + pairing QR (menu / render threads) -------------------
+	// --- Connection state (menu / render threads) -------------------------------
 	bool IsConnected() const { return m_connected.load(); }
 	bool IsConnectionRequested() const { return m_connectionRequested.load(); }
 	//! Last DRC frame delivery, for the UI "phone alive" indicator (ms epoch).
 	uint64_t GetLastFrameSentMs() const { return m_lastFrameSentMs.load(); }
-	//! Reads the camera QR from port 8423 (GET_QR handshake), safe pre-connect.
-	static bool GetCurrentQr(TwinpadQr& qr);
-	//! Invalidates the current QR and reads the newly issued one (ROTATE_QR).
-	static bool RotateCurrentQr(TwinpadQr& qr);
 
 	// --- Shared codec helpers + encoder entry (DRC pipeline) ---------------------
 	//! base64url (no padding) shared by demands/frames (CR-035/CR-044/CR-054).

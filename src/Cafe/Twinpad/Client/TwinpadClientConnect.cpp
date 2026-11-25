@@ -4,8 +4,6 @@
 
 #include "Common/precompiled.h"
 
-#include <rapidjson/document.h>
-
 #include <cstring>
 #include <string>
 
@@ -34,7 +32,7 @@ using ClientSocketHandle = int;
 // ---------------------------------------------------------------------------
 // TU de ciclo de vida y conectores del cliente Twinpad: Start/Stop,
 // SetTitleActive, los tres canales (primario 8421, audio 8422, media 8426),
-// los senders compartidos y la lectura del QR (8423).
+// los senders compartidos.
 // ---------------------------------------------------------------------------
 
 namespace
@@ -352,112 +350,4 @@ bool TwinpadClient::SendLine(std::intptr_t socket, const std::string& line)
 bool TwinpadClient::SendBytes(std::intptr_t socket, const char* data, size_t size)
 {
 	return twinpad_transport::SendBytes(socket, data, size);
-}
-
-namespace
-{
-
-// CR-023: lee el QR de la app (GET_QR/ROTATE_QR + JSON en 8423); usado por
-// el menu y el HUD (separa el QR canvas del backend de arriba). Limite de
-// response y validacion estricta de filas de 01 son verbatim del original.
-bool ReadQr(const char* command, TwinpadQr& qr)
-{
-#if BOOST_OS_WINDOWS
-	static const bool winsockReady = [] { WSADATA data{}; return WSAStartup(MAKEWORD(2, 2), &data) == 0; }();
-	if (!winsockReady)
-		return false;
-#endif
-	const ClientSocketHandle socketHandle = socket(AF_INET, SOCK_STREAM, 0);
-	if (socketHandle < 0)
-		return false;
-	sockaddr_in endpoint{};
-	endpoint.sin_family = AF_INET;
-	endpoint.sin_port = htons(twinpad_transport::kQrIpcPort);
-	inet_pton(AF_INET, "127.0.0.1", &endpoint.sin_addr);
-	if (connect(socketHandle, reinterpret_cast<sockaddr*>(&endpoint), sizeof(endpoint)) != 0)
-	{
-		CloseSocketHandle(socketHandle);
-		return false;
-	}
-#if BOOST_OS_WINDOWS
-	DWORD timeout = 2000;
-	setsockopt(socketHandle, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
-#else
-	timeval timeout{2, 0};
-	setsockopt(socketHandle, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-#endif
-	const std::string request = std::string(command) + "\n";
-#if BOOST_OS_WINDOWS
-	const int requestSent = ::send(socketHandle, request.data(), static_cast<int>(request.size()), 0);
-#else
-	const ssize_t requestSent = ::send(socketHandle, request.data(), request.size(), MSG_NOSIGNAL);
-#endif
-	if (requestSent != static_cast<decltype(requestSent)>(request.size()))
-	{
-		CloseSocketHandle(socketHandle);
-		return false;
-	}
-	std::string response;
-	char buffer[2048];
-	for (;;)
-	{
-#if BOOST_OS_WINDOWS
-		const int count = ::recv(socketHandle, buffer, sizeof(buffer), 0);
-#else
-		const ssize_t count = ::recv(socketHandle, buffer, sizeof(buffer), 0);
-#endif
-		if (count <= 0)
-			break;
-		response.append(buffer, static_cast<size_t>(count));
-		if (response.size() > twinpad_transport::kMaxQrResponseBytes)
-		{
-			CloseSocketHandle(socketHandle);
-			return false;
-		}
-		if (response.find('\n') != std::string::npos)
-			break;
-	}
-	CloseSocketHandle(socketHandle);
-	const size_t lineEnd = response.find('\n');
-	if (lineEnd == std::string::npos)
-		return false;
-	rapidjson::Document document;
-	document.Parse(response.data(), lineEnd);
-	if (document.HasParseError() || !document.IsObject() || !document.HasMember("uri")
-		|| !document["uri"].IsString() || !document.HasMember("modules") || !document["modules"].IsArray()
-		|| !document.HasMember("cemu_live") || !document["cemu_live"].IsBool())
-		return false;
-	TwinpadQr parsed;
-	parsed.uri = document["uri"].GetString();
-	parsed.cemuLive = document["cemu_live"].GetBool();
-	const auto& rows = document["modules"];
-	if (rows.Empty() || rows.Size() > 177)
-		return false;
-	const rapidjson::SizeType width = rows[0].IsString() ? rows[0].GetStringLength() : 0;
-	if (width == 0 || width > 177)
-		return false;
-	parsed.modules.reserve(rows.Size());
-	for (const auto& row : rows.GetArray())
-	{
-		if (!row.IsString() || row.GetStringLength() != width)
-			return false;
-		std::string modules(row.GetString(), row.GetStringLength());
-		if (modules.find_first_not_of("01") != std::string::npos)
-			return false;
-		parsed.modules.push_back(std::move(modules));
-	}
-	qr = std::move(parsed);
-	return true;
-}
-
-} // namespace
-
-bool TwinpadClient::GetCurrentQr(TwinpadQr& qr)
-{
-	return ReadQr("GET_QR", qr);
-}
-
-bool TwinpadClient::RotateCurrentQr(TwinpadQr& qr)
-{
-	return ReadQr("ROTATE_QR", qr);
 }

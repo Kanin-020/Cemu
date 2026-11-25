@@ -246,8 +246,6 @@ private:
 
 	// Twinpad experimental integration
 	wxMenu* m_twinpadMenu{};
-	wxMenuItem* m_twinpadConnectItem{};
-	long m_twinpadServerPid{-1};
 
 	// debug
 	wxMenu* m_debugMenu{};

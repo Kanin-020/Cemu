@@ -15,16 +15,14 @@
 namespace twinpad_transport
 {
 
-// Puertos del servidor local (game/audio/QR/E2E/media CR-054).
+// Puertos del servidor local (game/audio/E2E/media CR-054).
 constexpr uint16_t kGameIpcPort = 8421;
 constexpr uint16_t kAudioIpcPort = 8422;
 constexpr uint16_t kMediaIpcPort = 8426; // CR-054: canal media binario
-constexpr uint16_t kQrIpcPort = 8423;
 #ifdef TWINPAD_E2E_TEST_HOOK
 constexpr uint16_t kE2eCaptureIpcPort = 8424;
 constexpr size_t kE2eRequestLimit = 128;
 #endif
-constexpr size_t kMaxQrResponseBytes = 16 * 1024;
 // CR-054: framing del canal media binario (header LE de 32 bytes).
 constexpr size_t kMediaFrameHeaderBytes = 32;
 constexpr uint16_t kMediaFrameMagic = 0x5457; // "TW"

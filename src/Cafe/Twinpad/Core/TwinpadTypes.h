@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-// Tipos compartidos del módulo Twinpad: métricas, frame/encoder, QR, input,
+// Tipos compartidos del módulo Twinpad: métricas, frame/encoder, input,
 // motion, teclado y el mapper de unidades. Los consumidores externos
 // (gui, HLE, adaptadores de input/capture) solo necesitan este header más
 // TwinpadClient.h; los detalles de transporte/encode son internos.
@@ -61,13 +61,6 @@ struct TwinpadQueuedAu
 	uint16_t width{};
 	uint16_t height{};
 	bool idr{};
-};
-
-struct TwinpadQr
-{
-	std::string uri;
-	std::vector<std::string> modules;
-	bool cemuLive{};
 };
 
 struct TwinpadInputState

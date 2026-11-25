@@ -48,6 +48,9 @@ jobs:
     name: Calculate Version
     uses: ./.github/workflows/determine_release_version.yml
   call-release-build:
+    permissions:
+      contents: read
+      packages: write
     uses: ./.github/workflows/build.yml
     needs: calculate-version
     with:

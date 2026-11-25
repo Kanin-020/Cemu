@@ -43,6 +43,9 @@ jobs:
   call-release-build:
     name: Build release artifacts
     needs: validate
+    permissions:
+      contents: read
+      packages: write
     uses: ./.github/workflows/build.yml
     with:
       next_version_major: ${{ needs.validate.outputs.major }}

@@ -8,6 +8,7 @@
 #include "input/api/Keyboard/KeyboardController.h"
 #include "input/api/DSU/DSUController.h"
 #include "input/api/GameCube/GameCubeController.h"
+#include "input/api/Twinpad/TwinpadController.h"
 #include "input/api/Twinpad/TwinpadControllerProvider.h"
 
 #if BOOST_OS_WINDOWS
@@ -106,6 +107,16 @@ ControllerPtr ControllerFactory::CreateController(InputAPI::Type api, std::strin
 			return std::make_shared<NativeWiimoteController>(index);
 		}
 #endif
+	case InputAPI::Twinpad:
+		{
+			// uuid: "twinpad-<index>" (TwinpadControllerProvider)
+			const auto separator = uuid.find_first_of('-');
+			if (separator == std::string_view::npos)
+				throw std::invalid_argument(fmt::format("invalid twinpad uuid format: {}", uuid));
+
+			const auto index = ConvertString<uint32>(uuid.substr(separator + 1));
+			return std::make_shared<TwinpadController>(index);
+		}
 	default:
 		throw std::invalid_argument(fmt::format("unhandled controller api: {}", api));
 	}

@@ -754,6 +754,16 @@ bool nnNfp_isInitialized()
 	return nfp_data.nfpIsInitialized;
 }
 
+// CR-126: el tag virtual del telefono sigue "tocando" mientras la lectura
+// siga presente; refresca el instante que nnNfp_update compara con 1500 ms.
+void nnNfp_refreshAmiiboTouch()
+{
+	nnNfpLock();
+	if (nfp_data.hasActiveAmiibo)
+		nfp_data.amiiboTouchTime = GetTickCount();
+	nnNfpUnlock();
+}
+
 // CEMU NFC error codes
 #define NFC_ERROR_NONE					(0)
 #define NFC_ERROR_NO_ACCESS				(1)

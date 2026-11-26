@@ -167,6 +167,7 @@ void TwinpadClient_base64url_test();
 void TwinpadClient_camera_request_test();
 void TwinpadClient_mic_test();
 void TwinpadClient_keyboard_test();
+void TwinpadAmiiboChannel_test();
 void TwinpadClient_h264_encoder_test();
 void TwinpadClient_hardware_encoder_test();
 void TwinpadClient_drc_scale_test();
@@ -189,6 +190,7 @@ void UnitTests()
 	TwinpadClient_camera_request_test();
 	TwinpadClient_mic_test();
 	TwinpadClient_keyboard_test();
+	TwinpadAmiiboChannel_test();
 	TwinpadClient_h264_encoder_test();
 	TwinpadClient_hardware_encoder_test();
 	TwinpadClient_drc_scale_test();

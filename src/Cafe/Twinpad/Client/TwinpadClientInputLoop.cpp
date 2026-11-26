@@ -220,6 +220,7 @@ void TwinpadClient::CancelConnectionRequest()
 	m_connectionRequested.store(false);
 	m_captureGamePad.store(false);
 	m_connected.store(false);
+	ResetAmiibo();
 	{
 		std::scoped_lock lock(m_primarySocketMutex);
 		if (m_primarySocket >= 0)
@@ -247,12 +248,16 @@ void TwinpadClient::InputLoop()
 	bool titleWasActive = false;
 	while (m_running.load())
 	{
+		// CR-126: mantiene vivo el tag virtual mientras el telefono lo reporta presente.
+		if (m_connected.load())
+			RefreshAmiiboPresence();
 		if (!m_titleActive.load() || !m_connectionRequested.load() || !TitleRunning())
 		{
 			const bool disconnectRequested = !m_titleActive.load() || !TitleRunning();
 			if (titleWasActive || disconnectRequested)
 			{
 				m_connected.store(false);
+	ResetAmiibo();
 				{
 					std::scoped_lock lock(m_primarySocketMutex);
 					if (m_primarySocket >= 0)
@@ -392,6 +397,7 @@ void TwinpadClient::InputLoop()
 		if (socket < 0)
 		{
 			m_connected.store(false);
+	ResetAmiibo();
 			nextConnectionAttempt = std::chrono::steady_clock::now()
 				+ std::chrono::milliseconds(kRetryIntervalMs);
 			continue;
@@ -491,6 +497,13 @@ void TwinpadClient::InputLoop()
 						// y queda pendiente para el hilo de render del HLE `swkbd`.
 						FeedKeyboardInput(std::string_view(m_receiveBuffer.data(), lineEnd));
 					}
+					else if (document.IsObject() && document.HasMember("type") && document["type"].IsString()
+						&& std::string_view(document["type"].GetString()) == "amiibo_tag")
+					{
+						// CR-126: lectura NFC del telefono; monta/desmonta el tag virtual
+						// con copia persistente por UID.
+						FeedAmiiboTag(std::string_view(m_receiveBuffer.data(), lineEnd));
+					}
 					const auto report = ParseInputReport(document);
 					if (report)
 					{
@@ -553,6 +566,7 @@ void TwinpadClient::InputLoop()
 		{
 			m_receiveBuffer.clear();
 			m_connected.store(false);
+	ResetAmiibo();
 			{
 				std::scoped_lock lock(m_primarySocketMutex);
 				if (m_primarySocket >= 0)
@@ -590,6 +604,7 @@ void TwinpadClient::InputLoop()
 		{
 			m_receiveBuffer.clear();
 			m_connected.store(false);
+	ResetAmiibo();
 			{
 				std::scoped_lock lock(m_primarySocketMutex);
 				if (m_primarySocket >= 0)

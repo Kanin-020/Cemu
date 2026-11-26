@@ -18,6 +18,8 @@ add_library(CemuCafe
   Twinpad/Channels/TwinpadMicChannel.cpp
   Twinpad/Channels/TwinpadKeyboardChannel.h
   Twinpad/Channels/TwinpadKeyboardChannel.cpp
+  Twinpad/Channels/TwinpadAmiiboChannel.h
+  Twinpad/Channels/TwinpadAmiiboChannel.cpp
   Twinpad/Core/TwinpadVideoMetrics.h
   Twinpad/Core/TwinpadVideoMetrics.cpp
   Twinpad/Video/TwinpadCameraDecoder.cpp
@@ -25,6 +27,7 @@ add_library(CemuCafe
   Twinpad/Tests/Base64UrlTest.cpp
   Twinpad/Tests/GyroMonitorTest.cpp
   Twinpad/Tests/TwinpadMotionTest.cpp
+  Twinpad/Tests/TwinpadAmiiboChannelTest.cpp
   Account/Account.h
   CafeSystem.cpp
   CafeSystem.h

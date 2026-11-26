@@ -13,6 +13,10 @@ void nnNfp_update();
 
 bool nnNfp_isInitialized();
 bool nnNfp_touchNfcTagFromFile(const fs::path& filePath, uint32* nfcError);
+// CR-126: desmonta el tag activo (tag virtual del telefono) conservando su archivo.
+void nnNfp_unloadAmiibo();
+// CR-126: re-toque del tag virtual mientras el telefono lo mantiene presente.
+void nnNfp_refreshAmiiboTouch();
 
 #define NFP_STATE_NONE			(0)
 #define NFP_STATE_INIT			(1)

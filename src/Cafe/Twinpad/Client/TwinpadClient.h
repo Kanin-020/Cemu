@@ -143,6 +143,13 @@ class TwinpadClient
 	bool ConsumeKeyboardInput(TwinpadKeyboardPending& out);
 	//! Validates one `keyboard_input` line into the pending FIFO.
 	bool FeedKeyboardInput(std::string_view line);
+	// --- Amiibo virtual (CR-126) ------------------------------------------------------
+	//! Validates one `amiibo_tag` line and mounts/unmounts the virtual tag.
+	bool FeedAmiiboTag(std::string_view line);
+	//! Keeps the mounted virtual tag alive while the phone reports it present.
+	void RefreshAmiiboPresence();
+	//! Unmounts the virtual tag on disconnect; the per-UID copy is kept.
+	void ResetAmiibo();
 	// --- Mic (CR-035) ----------------------------------------------------------------
 	//! Validates one `mic_chunk` line and pushes s16 samples into the queue.
 	bool FeedMicChunk(std::string_view line);
